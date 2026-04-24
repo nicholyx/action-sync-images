@@ -40,5 +40,5 @@ jobs:
         
         echo "源镜像：${{ inputs.images_src }}"
         echo "目标镜像：registry.cn-shenzhen.aliyuncs.com/nicholyx/${new_images}"
-        skopeo copy docker://${{ inputs.images_src }} docker://registry.cn-shenzhen.aliyuncs.com/nicholyx/${new_images}
+        skopeo copy --all docker://${{ inputs.images_src }} docker://registry.cn-shenzhen.aliyuncs.com/nicholyx/${new_images}
  
