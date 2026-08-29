@@ -70,6 +70,6 @@ jobs:
         echo "目标镜像：registry.cn-shenzhen.aliyuncs.com/nicholyx/${new_images}"
         # 只拷贝 amd64/arm64，attestation manifest（platform 为空）会被自动剔除，
         # 规避阿里云 ACR 对 OCI 1.1 空 blob 的 "unknown manifest class" 拒绝
-        regctl image copy --platforms linux/amd64,linux/arm64 \
+        regctl image copy --platforms linux/amd64 --platforms linux/arm64 \
           "$src" "registry.cn-shenzhen.aliyuncs.com/nicholyx/${new_images}"
 
