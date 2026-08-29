@@ -10,6 +10,11 @@ on:
       images_src:
         description: '源镜像'
         required: true
+      strip_attestation:
+        description: '剔除 attestation manifest（源镜像带 provenance/SBOM 时勾选，如 netbirdio）'
+        required: false
+        type: boolean
+        default: false
 
 # 工作流程任务（通常含有一个或多个步骤）
 jobs:
@@ -31,6 +36,7 @@ jobs:
         logout: false
 
     - name: Use Skopeo Tools Sync Image to Docker Hub
+      if: ${{ inputs.strip_attestation != true }}
       run: |
         #!/usr/bin/env bash
         str="${{ inputs.images_src }}"
@@ -41,4 +47,26 @@ jobs:
         echo "源镜像：${{ inputs.images_src }}"
         echo "目标镜像：registry.cn-shenzhen.aliyuncs.com/nicholyx/${new_images}"
         skopeo copy --all docker://${{ inputs.images_src }} docker://registry.cn-shenzhen.aliyuncs.com/nicholyx/${new_images}
- 
+
+    - name: Use regctl Sync Image to AliYuncs (strip attestation)
+      if: ${{ inputs.strip_attestation == true }}
+      run: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        # 安装 regctl (regclient)
+        curl -sSf https://i.regclient.org/regctl_install.sh | sh
+        echo "$HOME/.regclient/bin" >> "$GITHUB_PATH"
+        export PATH="$HOME/.regclient/bin:$PATH"
+
+        str="${{ inputs.images_src }}"
+        # regctl 引用不带 docker:// 前缀
+        src="${str#docker://}"
+        # 替换字符串中的 / 为 __
+        new_images="${str//\//_}"
+        echo "源镜像：$src"
+        echo "目标镜像：registry.cn-shenzhen.aliyuncs.com/nicholyx/${new_images}"
+        # 只拷贝 amd64/arm64，attestation manifest（platform 为空）会被自动剔除，
+        # 规避阿里云 ACR 对 OCI 1.1 空 blob 的 "unknown manifest class" 拒绝
+        regctl image copy --platforms linux/amd64,linux/arm64 \
+          "$src" "registry.cn-shenzhen.aliyuncs.com/nicholyx/${new_images}"
+
