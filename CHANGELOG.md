@@ -24,6 +24,11 @@
 
 ### 变更
 
+- 增量跳过的比较依据由「顶层 manifest 的完整 JSON」改为「各平台子 manifest
+  的 digest」。前者对 mediaType、annotations 与字段顺序都敏感，源与目标
+  由不同 registry 提供时会误判为不同
+- 比较时排除 Windows 平台：其 manifest 在传输过程中会被重新生成、digest
+  必然改变，纳入比较会让跳过永远不成立
 - 单个镜像的处理改为在独立子进程中执行，结果通过带序号的临时文件汇总，
   保证并发模式下结果表的顺序仍与输入顺序一致
 - 校验 `--concurrency` / `--timeout` / `--retries` 的取值，非法参数在
