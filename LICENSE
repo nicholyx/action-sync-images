@@ -19,18 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-## 来源说明 / Provenance
-
-本仓库最早衍生自 WeiyiGeek 的
-[action-sync-images](https://github.com/WeiyiGeek/action-sync-images)。
-该上游仓库未附带任何许可证，其原始教程性内容已归档至
-[docs/BACKGROUND.md](docs/BACKGROUND.md) 并保留原作者署名。
-
-自 2024 年起本仓库由 nicholyx 独立维护，现有的同步工作流实现、CI 工具链
-与全部文档均已重写或大幅改写。MIT 许可证覆盖的是本仓库中由本项目作者
-原创的部分。
-
-如果你需要以更明确的方式使用上游的原始内容，请自行联系原作者取得授权。
