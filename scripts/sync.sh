@@ -400,15 +400,48 @@ sync_one() {
   fi
 }
 
-# 判断目标仓库是否已有与源完全一致的镜像。
+# 提取镜像的「平台 → 子 manifest digest」映射。
 #
-# 做法是比较两边 manifest 的规范化 JSON：直接比原始字节会因为 JSON 的键顺序
-# 不同而误判，用 jq -S 排序后再比就能得到语义层面的相等性。
-# 任何一步失败都返回「不相等」，宁可多同步一次，也不要错误地跳过。
+# 为什么不直接比较顶层 manifest 的完整 JSON：不同 registry 对 mediaType、
+# annotations 与字段顺序的处理并不一致——例如源是 OCI index、目标被规范化成
+# Docker manifest list，两边内容完全一致却会被判为不同，导致跳过永远不生效。
+# 逐个比较各平台子 manifest 的 digest，才真正对应「镜像内容是否一致」。
+#
+# 单平台镜像没有 manifests 字段，返回空，由调用方决定退化策略。
+platform_digest_map() {
+  skopeo inspect --raw "docker://$1" 2>/dev/null \
+    | jq -r '
+        .manifests[]?
+        | select(.platform.architecture != null and .platform.architecture != "unknown")
+        | "\(.platform.os)/\(.platform.architecture) \(.digest)"
+      ' 2>/dev/null \
+    | sort
+}
+
+# 判断目标仓库是否已有与源一致的镜像。
+#
+# 任何一步失败都返回「不一致」——宁可多同步一次，也不要错误地跳过。
 is_up_to_date() {
   local src="$1" dest="$2"
-  local src_norm dest_norm
+  local src_map dest_map src_norm dest_norm
 
+  src_map="$(platform_digest_map "$src")" || return 1
+  dest_map="$(platform_digest_map "$dest")" || return 1
+
+  if [[ "${SYNC_DEBUG:-}" == "1" ]]; then
+    log_dim "  [debug] 源平台摘要: ${src_map:-<无>}"
+    log_dim "  [debug] 目标平台摘要: ${dest_map:-<无>}"
+  fi
+
+  # multi-arch：逐平台比对子 manifest 的 digest
+  if [[ -n "$src_map" ]]; then
+    if [[ -n "$dest_map" && "$src_map" == "$dest_map" ]]; then
+      return 0
+    fi
+    return 1
+  fi
+
+  # 单平台镜像没有 manifests 字段，退化为比较规范化后的 manifest JSON
   src_norm="$(skopeo inspect --raw "docker://${src}" 2>/dev/null | jq -S -c . 2>/dev/null)" || return 1
   [[ -n "$src_norm" ]] || return 1
 
