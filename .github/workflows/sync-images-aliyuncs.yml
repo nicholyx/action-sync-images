@@ -1,76 +1,94 @@
 # 工作流名称
 name: Sync-Images-to-AliYuncs
-# 工作流运行时显示名称
-run-name: ${{ github.actor }} - Sync Images to AliYuncs.
+# 工作流运行时显示名称（带上源镜像，便于在 Actions 列表中区分每次同步）
+run-name: ${{ github.actor }} - Sync ${{ inputs.images_src }} to AliYuncs.
+
 # 怎样触发工作流
 on:
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
     inputs:
       images_src:
-        description: '源镜像'
+        description: '源镜像（无需 docker:// 前缀）。多个镜像用换行或逗号分隔'
         required: true
       strip_attestation:
         description: '剔除 attestation manifest（源镜像带 provenance/SBOM 时勾选，如 netbirdio）'
         required: false
         type: boolean
         default: false
+      platforms:
+        description: '保留哪些平台，逗号分隔（留空则自动探测；仅在勾选剔除 attestation 时生效）'
+        required: false
+        default: ''
+      dry_run:
+        description: '仅预览将要执行的命令，不实际推送'
+        required: false
+        type: boolean
+        default: false
+
+# 只需要读代码，推送凭证通过 Secrets 注入
+permissions:
+  contents: read
 
 # 工作流程任务（通常含有一个或多个步骤）
 jobs:
   sync-images:
+    name: 同步到阿里云 ACR
     runs-on: ubuntu-latest
+    env:
+      # 目标仓库前缀（registry host + 命名空间）。
+      # 需要更换仓库时，在 Settings → Secrets and variables → Variables 新增
+      # ALIYUNCS_REGISTRY 覆盖即可，无需修改本文件；未设置则使用下面的默认值。
+      DEST_REGISTRY: ${{ vars.ALIYUNCS_REGISTRY || 'registry.cn-shenzhen.aliyuncs.com/nicholyx' }}
     steps:
-    - name: Checkout Repos
-      uses: actions/checkout@v3
+      - name: Checkout Repos
+        uses: actions/checkout@v7
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v2.9.1
+      - name: Login to AliYuncs Registry
+        env:
+          REGISTRY_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          # 取目标地址第一段作为 registry host，更换仓库地址后登录地址会自动跟随
+          registry_host="${DEST_REGISTRY%%/*}"
+          echo "登录仓库：${registry_host}"
+          printf '%s' "${REGISTRY_PASSWORD}" | docker login "${registry_host}" \
+            --username "${REGISTRY_USERNAME}" --password-stdin
 
-    - name: Login to Docker Hub
-      uses: docker/login-action@v3
-      with:
-        registry: registry.cn-shenzhen.aliyuncs.com
-        username: ${{ secrets.DOCKER_USERNAME }}
-        password: ${{ secrets.DOCKER_PASSWORD }}
-        logout: false
+      - name: 执行镜像同步
+        env:
+          IMAGES_SRC: ${{ inputs.images_src }}
+          PLATFORMS: ${{ inputs.platforms }}
+          STRIP_ATTESTATION: ${{ inputs.strip_attestation }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
 
-    - name: Use Skopeo Tools Sync Image to Docker Hub
-      if: ${{ inputs.strip_attestation != true }}
-      run: |
-        #!/usr/bin/env bash
-        str="${{ inputs.images_src }}"
-        # 替换字符串中的 / 为 __
-        new_images="${str//\//_}"
-        echo "$new_images"
-        
-        echo "源镜像：${{ inputs.images_src }}"
-        echo "目标镜像：registry.cn-shenzhen.aliyuncs.com/nicholyx/${new_images}"
-        skopeo copy --all docker://${{ inputs.images_src }} docker://registry.cn-shenzhen.aliyuncs.com/nicholyx/${new_images}
+          # 所有参数都经 env 中转后再引用，避免表达式注入
+          args=(--src "$IMAGES_SRC" --dest "$DEST_REGISTRY" --report-dir ./reports)
 
-    - name: Use regctl Sync Image to AliYuncs (strip attestation)
-      if: ${{ inputs.strip_attestation == true }}
-      run: |
-        #!/usr/bin/env bash
-        set -euo pipefail
-        # 安装 regctl (regclient)，直接从 GitHub Releases 下载官方二进制
-        mkdir -p "$HOME/.regclient/bin"
-        curl -sSfL "https://github.com/regclient/regclient/releases/latest/download/regctl-linux-amd64" \
-          -o "$HOME/.regclient/bin/regctl"
-        chmod +x "$HOME/.regclient/bin/regctl"
-        echo "$HOME/.regclient/bin" >> "$GITHUB_PATH"
-        export PATH="$HOME/.regclient/bin:$PATH"
+          if [[ "$STRIP_ATTESTATION" == "true" ]]; then
+            args+=(--strip-attestation)
+          fi
+          if [[ -n "$PLATFORMS" ]]; then
+            args+=(--platforms "$PLATFORMS")
+          fi
+          if [[ "$DRY_RUN" == "true" ]]; then
+            args+=(--dry-run)
+          fi
 
-        str="${{ inputs.images_src }}"
-        # regctl 引用不带 docker:// 前缀
-        src="${str#docker://}"
-        # 替换字符串中的 / 为 __
-        new_images="${str//\//_}"
-        echo "源镜像：$src"
-        echo "目标镜像：registry.cn-shenzhen.aliyuncs.com/nicholyx/${new_images}"
-        # 只拷贝 amd64/arm64 平台子 manifest 到目标仓库后重建 index，
-        # attestation manifest（platform 为 unknown）不会包含，
-        # 规避阿里云 ACR 对 OCI 1.1 空 blob 的 "unknown manifest class" 拒绝
-        regctl index create "registry.cn-shenzhen.aliyuncs.com/nicholyx/${new_images}" \
-          --ref "$src" --platform linux/amd64 --platform linux/arm64
+          echo "执行：./scripts/sync.sh ${args[*]}"
+          ./scripts/sync.sh "${args[@]}"
 
+      - name: 上传同步报告
+        # 无论成功失败都上传，失败的运行更需要这份报告
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sync-report-aliyuncs
+          path: reports/
+          retention-days: 30
+          if-no-files-found: ignore
