@@ -336,6 +336,8 @@ brew install skopeo regclient   # macOS
 
 [MIT](LICENSE)
 
+本项目最早衍生自 [WeiyiGeek/action-sync-images](https://github.com/WeiyiGeek/action-sync-images)（详见上方致谢）。该上游仓库未附带许可证，因此 **MIT 许可证覆盖的是本仓库中由本项目作者原创的部分**；原始的教程性内容已归档至 [docs/BACKGROUND.md](docs/BACKGROUND.md) 并保留原作者署名。如需以更明确的方式使用上游的原始内容，请自行联系原作者取得授权。
+
 <div align="center">
 <sub>如果这个项目帮你省下了一台 VPS 的钱，欢迎点个 ⭐</sub>
 </div>
