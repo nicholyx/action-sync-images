@@ -1,0 +1,235 @@
+# 工作流名称
+name: CI
+# 工作流运行时显示名称
+run-name: CI · ${{ github.event_name }} · ${{ github.ref_name }}
+
+# 怎样触发工作流
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 只读权限就够了：CI 不写回仓库，这是最小权限原则的体现。
+# 注意那些需要写权限的工作流（labeler / stale）在各自文件里单独声明。
+permissions:
+  contents: read
+
+# 同一分支连推多次时，取消掉旧的运行，省额度也省等待
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 固定版本以保证 CI 结果可复现
+  ACTIONLINT_VERSION: "1.7.12"
+
+# 工作流程任务（通常含有一个或多个步骤）
+jobs:
+  # ---------------------------------------------------------------------------
+  # 工作流静态检查
+  # actionlint 能发现 YAML 层面看不出、但运行时会炸的问题：
+  # 表达式拼写错误、上下文用错、run 块里的 shell 问题等。
+  # ---------------------------------------------------------------------------
+  actionlint:
+    name: 工作流静态检查
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repos
+        uses: actions/checkout@v7
+
+      - name: 安装 actionlint
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL "$url" | tar -xz actionlint
+          ./actionlint --version
+
+      - name: 运行 actionlint
+        run: ./actionlint -color
+
+  # ---------------------------------------------------------------------------
+  # YAML 风格检查
+  # ---------------------------------------------------------------------------
+  yamllint:
+    name: YAML 风格检查
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repos
+        uses: actions/checkout@v7
+
+      - name: 安装 yamllint
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          pipx install yamllint
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: 运行 yamllint
+        run: yamllint -c .yamllint .github/
+
+  # ---------------------------------------------------------------------------
+  # Shell 脚本检查
+  # ---------------------------------------------------------------------------
+  shellcheck:
+    name: Shell 脚本检查
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repos
+        uses: actions/checkout@v7
+
+      - name: 运行 shellcheck
+        run: shellcheck -x scripts/*.sh
+
+      - name: bash 语法检查
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          for f in scripts/*.sh; do
+            echo "检查 ${f}"
+            bash -n "$f"
+          done
+
+  # ---------------------------------------------------------------------------
+  # sync.sh 冒烟测试
+  # 用 dry-run 验证脚本能正确解析输入、拆分批量镜像、拼出目标仓库名，
+  # 并确认非法输入会被拦下。不需要任何真实凭证。
+  # ---------------------------------------------------------------------------
+  smoke-test:
+    name: sync.sh 冒烟测试
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repos
+        uses: actions/checkout@v7
+
+      - name: 安装 skopeo
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq skopeo
+
+      - name: 验证批量输入解析与目标名生成
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          ./scripts/sync.sh \
+            --src "registry.k8s.io/pause:3.9, registry.k8s.io/coredns/coredns:v1.11.1" \
+            --src "nginx:1.27" \
+            --dest registry.example.com/smoke \
+            --dry-run
+
+      - name: 验证非法镜像引用会被拦下
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 两种情况都必须失败：带协议前缀的、缺少 tag 的
+          for bad in "https://example.com/nginx:1.27" "nginx"; do
+            echo "--- 期望被拒绝：${bad}"
+            set +e
+            ./scripts/sync.sh --src "$bad" --dest registry.example.com/smoke --dry-run
+            code=$?
+            set -e
+
+            if [[ "$code" -ne 2 ]]; then
+              echo "::error::输入「${bad}」应被判定为同步失败（期望退出码 2，实际 ${code}）"
+              exit 1
+            fi
+            echo "✓ 已正确拒绝（退出码 ${code}）"
+          done
+
+      - name: 验证缺少必填参数时报错
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          set +e
+          ./scripts/sync.sh --src "nginx:1.27" >/dev/null 2>&1
+          code=$?
+          set -e
+          if [[ "$code" -ne 1 ]]; then
+            echo "::error::缺少 --dest 时应以退出码 1 结束，实际为 ${code}"
+            exit 1
+          fi
+          echo "✓ 缺少必填参数时正确报错"
+
+  # ---------------------------------------------------------------------------
+  # 提交信息规范
+  # 只在 PR 上跑（push 到 main 的提交已经过 PR 校验）。
+  # squash merge 后 PR 标题会成为提交信息，所以标题也要一并校验。
+  # ---------------------------------------------------------------------------
+  commit-messages:
+    name: 提交信息规范
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout Repos
+        uses: actions/checkout@v7
+        with:
+          # 需要完整的提交历史才能校验区间内的所有提交
+          fetch-depth: 0
+
+      - name: 校验 PR 中的提交信息
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: ./scripts/check-commit-msg.sh --range "${BASE_SHA}..${HEAD_SHA}"
+
+      - name: 校验 PR 标题
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: ./scripts/check-commit-msg.sh --message "$PR_TITLE"
+
+  # ---------------------------------------------------------------------------
+  # CI 总览
+  # 把所有检查汇总成一个结果，分支保护规则只需要盯这一个 check 即可。
+  # ---------------------------------------------------------------------------
+  ci-summary:
+    name: CI 总览
+    runs-on: ubuntu-latest
+    needs: [actionlint, yamllint, shellcheck, smoke-test, commit-messages]
+    if: always()
+    steps:
+      - name: 汇总各检查结果
+        env:
+          R_ACTIONLINT: ${{ needs.actionlint.result }}
+          R_YAMLLINT: ${{ needs.yamllint.result }}
+          R_SHELLCHECK: ${{ needs.shellcheck.result }}
+          R_SMOKE: ${{ needs.smoke-test.result }}
+          R_COMMITS: ${{ needs.commit-messages.result }}
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          declare -a names=(工作流静态检查 YAML风格检查 Shell脚本检查 冒烟测试 提交信息规范)
+          declare -a results=("$R_ACTIONLINT" "$R_YAMLLINT" "$R_SHELLCHECK" "$R_SMOKE" "$R_COMMITS")
+
+          failed=0
+
+          {
+            echo "## CI 检查结果"
+            echo ""
+            echo "| 检查项 | 结果 |"
+            echo "| --- | :---: |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for i in "${!names[@]}"; do
+            case "${results[$i]}" in
+              success) icon="✅" ;;
+              skipped) icon="⏭️" ;;   # PR 之外的触发方式会跳过提交信息检查，属于正常
+              *)       icon="❌"; failed=1 ;;
+            esac
+            printf '| %s | %s |\n' "${names[$i]}" "$icon" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$failed" -ne 0 ]]; then
+            echo "❌ 存在未通过的检查，请查看上方各任务的日志。" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::CI 未能全部通过"
+            exit 1
+          fi
+
+          echo "✅ 全部检查通过。" >> "$GITHUB_STEP_SUMMARY"

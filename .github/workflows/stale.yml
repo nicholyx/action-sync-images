@@ -1,0 +1,71 @@
+# 工作流名称
+name: Stale
+# 工作流运行时显示名称
+run-name: 清理长期无响应的 Issue 与 PR
+
+# 怎样触发工作流
+on:
+  schedule:
+    # 每天 UTC 01:37（北京时间 09:37）运行一次。
+    # 刻意避开整点：GitHub 的定时任务在整点前后极其拥挤，排队可能延迟很久。
+    - cron: '37 1 * * *'
+  workflow_dispatch:
+
+# 需要读写 Issue 与 PR 的权限
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  stale:
+    name: 标记并关闭过期条目
+    runs-on: ubuntu-latest
+    steps:
+      - name: 处理长期无响应的条目
+        uses: actions/stale@v11
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+          # 60 天没有任何动静标记为 stale，再等 14 天关闭
+          days-before-stale: 60
+          days-before-close: 14
+
+          stale-issue-label: 'stale'
+          stale-pr-label: 'stale'
+
+          # 打了这些标签的条目永不标记过期
+          exempt-issue-labels: 'pinned,security,good first issue,help wanted,accepted'
+          exempt-pr-labels: 'pinned,security,blocked,work-in-progress'
+
+          # 已被指派的条目说明有人在跟，不要打扰
+          exempt-all-assignees: true
+
+          # 每轮最多处理 30 条，避免一次刷屏式操作触发 GitHub 的滥用检测
+          operations-per-run: 30
+
+          # 有人回复后自动撤销 stale 标记
+          remove-stale-when-updated: true
+
+          stale-issue-message: |
+            这个 Issue 已经 60 天没有新的进展了，我先给它打上 `stale` 标记。
+
+            如果问题依然存在，**回复任意内容即可让这个标记消失**。如果已经有了解决方案或者不再需要跟进，那就不必理会——14 天后我会自动关闭它。
+
+            这样做的目的只是让待办列表保持可信：列表里的每一条都应该是真正需要处理的事。
+
+          close-issue-message: |
+            由于长期没有新的进展，这个 Issue 已被自动关闭。
+
+            如果问题仍然存在，欢迎随时重新开启，并附上最新的复现信息。感谢你曾经的反馈。
+
+          stale-pr-message: |
+            这个 PR 已经 60 天没有更新了，我先给它打上 `stale` 标记。
+
+            如果是还在进行中，回复一下进度，或者把它转成 Draft PR 都可以让标记消失；如果已经不需要了，我会在 14 天后自动关闭，这不会影响你之后重新提交。
+
+            如果只是需要 review 而一直没人看，请直接 @ 维护者——那是我们的问题，不是你的。
+
+          close-pr-message: |
+            这个 PR 因长期没有更新已被自动关闭。
+
+            代码和讨论都还保留着，如果你希望继续推进，随时可以重新开启或另开一个 PR。
