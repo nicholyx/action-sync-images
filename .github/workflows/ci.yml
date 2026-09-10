@@ -155,6 +155,53 @@ jobs:
           fi
           echo "✓ 缺少必填参数时正确报错"
 
+      - name: 验证并发、超时与增量跳过参数
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 并发同步：3 个镜像、并发度 3，dry-run 下应全部走完且结果顺序与输入一致
+          output="$(./scripts/sync.sh \
+            --src "nginx:1.27,redis:7.4,alpine:3.20" \
+            --dest registry.example.com/smoke \
+            --concurrency 3 --timeout 120 --skip-existing --dry-run 2>&1)"
+
+          echo "$output"
+
+          # 结果表应按输入顺序排列。并发下各镜像的完成顺序是不确定的，
+          # 结果经由带序号的临时文件收集后再按序读回，这里正是在守住这一点。
+          order="$(printf '%s\n' "$output" | awk '/✓/ && /^ / {print $NF}' | paste -sd, -)"
+          expected="nginx:1.27,redis:7.4,alpine:3.20"
+          if [[ "$order" != "$expected" ]]; then
+            echo "::error::并发模式下结果顺序异常：期望 ${expected}，实际 ${order}"
+            exit 1
+          fi
+          echo "✓ 并发同步执行完毕，结果顺序与输入一致"
+
+      - name: 验证非法参数被立即拒绝
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 这些都应该以退出码 1（参数错误）结束，而不是跑到一半才炸
+          check_reject() {
+            local desc="$1"; shift
+            set +e
+            "$@" >/dev/null 2>&1
+            local code=$?
+            set -e
+            if [[ "$code" -ne 1 ]]; then
+              echo "::error::${desc}：期望退出码 1，实际 ${code}"
+              exit 1
+            fi
+            echo "✓ 已拒绝：${desc}"
+          }
+
+          check_reject "并发度非数字" ./scripts/sync.sh --src "nginx:1.27" --dest r.example.com/x --concurrency abc
+          check_reject "并发度为 0"   ./scripts/sync.sh --src "nginx:1.27" --dest r.example.com/x --concurrency 0
+          check_reject "超时为非数字" ./scripts/sync.sh --src "nginx:1.27" --dest r.example.com/x --timeout soon
+          check_reject "精确目标配多个镜像" ./scripts/sync.sh --src "nginx:1.27,redis:7.4" --dest-exact h.example.com/a --dry-run
+
   # ---------------------------------------------------------------------------
   # 提交信息规范
   # 只在 PR 上跑（push 到 main 的提交已经过 PR 校验）。

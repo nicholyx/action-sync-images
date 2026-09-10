@@ -20,6 +20,15 @@ on:
         description: '保留哪些平台，逗号分隔（留空则自动探测；仅在勾选剔除 attestation 时生效）'
         required: false
         default: ''
+      concurrency:
+        description: '并发同步的镜像数量，批量同步时能显著提速（建议 4~8，过高可能被上游限流）'
+        required: false
+        default: '4'
+      skip_existing:
+        description: '跳过目标仓库中已存在且完全相同的镜像（增量同步，重复运行会快很多）'
+        required: false
+        type: boolean
+        default: true
       dry_run:
         description: '仅预览将要执行的命令，不实际推送'
         required: false
@@ -62,6 +71,8 @@ jobs:
           IMAGES_SRC: ${{ inputs.images_src }}
           PLATFORMS: ${{ inputs.platforms }}
           STRIP_ATTESTATION: ${{ inputs.strip_attestation }}
+          CONCURRENCY: ${{ inputs.concurrency }}
+          SKIP_EXISTING: ${{ inputs.skip_existing }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           #!/usr/bin/env bash
@@ -75,6 +86,12 @@ jobs:
           fi
           if [[ -n "$PLATFORMS" ]]; then
             args+=(--platforms "$PLATFORMS")
+          fi
+          if [[ -n "$CONCURRENCY" ]]; then
+            args+=(--concurrency "$CONCURRENCY")
+          fi
+          if [[ "$SKIP_EXISTING" == "true" ]]; then
+            args+=(--skip-existing)
           fi
           if [[ "$DRY_RUN" == "true" ]]; then
             args+=(--dry-run)

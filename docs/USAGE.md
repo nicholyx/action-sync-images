@@ -147,6 +147,8 @@ registry.k8s.io/pause:3.9, nginx:1.27, redis:7.4
 | `images_src` | ✅ | — | 源镜像。可填多个，用换行/逗号/分号分隔。不需要 `docker://` 前缀 |
 | `strip_attestation` | | `false` | 剔除 attestation manifest。源镜像带 provenance/SBOM 时勾选（见下方说明） |
 | `platforms` | | 自动探测 | 保留哪些平台，如 `linux/amd64,linux/arm64`。**仅在勾选上一项时生效** |
+| `concurrency` | | `4` | 并发同步的镜像数量。填 `1` 即回到串行 |
+| `skip_existing` | | `true` | 跳过目标仓库中已存在且完全相同的镜像 |
 | `dry_run` | | `false` | 只打印将要执行的命令，不实际推送。用于确认目标地址是否正确 |
 
 **关于 `strip_attestation`：** 什么时候该勾？简单判断法是——如果同步时报了包含 `unknown manifest class` 的错误，就勾上重试。常见需要勾选的有 `ghcr.io/netbirdio/*` 这类用 BuildKit 构建且开启了 provenance 的项目。原理见 [ARCHITECTURE.md](ARCHITECTURE.md#深入理解-attestation-问题)。
@@ -159,6 +161,8 @@ registry.k8s.io/pause:3.9, nginx:1.27, redis:7.4
 | --- | :---: | --- | --- |
 | `images_src` | ✅ | — | 源镜像，支持批量的规则同上 |
 | `images_dest` | ✅ | — | 目标路径，会拼在 `HARBOR_REGISTRY` 之后，例如 `library/nginx:1.27` |
+| `concurrency` | | `4` | 并发同步的镜像数量 |
+| `skip_existing` | | `true` | 跳过已存在的相同镜像 |
 | `dry_run` | | `false` | 同上 |
 
 > ⚠️ Harbor 路径是**精确匹配**，不会做「把 `/` 换成 `_`」的压平处理。请确保 Harbor 中已经存在对应的项目（如 `library`），否则会推送失败。
@@ -169,6 +173,8 @@ registry.k8s.io/pause:3.9, nginx:1.27, redis:7.4
 | --- | :---: | --- | --- |
 | `lockfile` | ✅ | `images.lock.txt` | 清单文件路径 |
 | `dest_registry` | | 见说明 | 目标仓库前缀。留空则依次取 `ALIYUNCS_REGISTRY` 变量、内置默认值 |
+| `concurrency` | | `6` | 并发同步的镜像数量 |
+| `skip_existing` | | `true` | 跳过已存在的相同镜像 |
 | `dry_run` | | `false` | 同上 |
 
 ---
@@ -232,6 +238,26 @@ ALIYUNCS_REGISTRY = registry.cn-hangzhou.aliyuncs.com/your-company
 ```
 
 确认无误后取消勾选，再正式跑一次。
+
+### 场景七：让批量同步跑得更快
+
+同步镜像的时间几乎全花在网络等待上，所以**并发**和**跳过**是最有效的两个手段。
+
+**并发** —— `concurrency` 控制同时进行几个镜像的同步，默认 4（批量工作流是 6），建议范围 4~8。
+实测 4 个各需 1 秒的镜像：串行耗时 4 秒，并发后 1 秒。
+
+> ⚠️ 不建议设得过高。上游仓库可能对并发连接限流，结果反而更慢，极端情况下还会触发风控。
+
+**增量跳过** —— `skip_existing` 默认开启。同步前会比对源与目标的 manifest，
+完全相同时直接跳过。定期同步的场景下绝大部分镜像都会被跳过，一次运行通常几秒就结束。
+
+> 比对过程中任何一步失败都会判定为「需要同步」——宁可多推一次，也不会错误地跳过。
+> 另外注意：`strip_attestation` 模式会重建索引，目标的 digest 必然与源不同，
+> 比较 digest 没有意义，因此该模式下不做跳过。
+
+**超时** —— 单个镜像默认 600 秒。某个镜像特别大、或者上游偶尔抽风时，
+超时能让它快速失败并继续处理其余镜像，而不是卡住整个任务。
+工作流没有暴露这个参数，需要时可在本地用 `--timeout` 指定。
 
 ---
 

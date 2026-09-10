@@ -47,7 +47,10 @@
 - **完整保留多架构** —— amd64 / arm64 一起搬，不会只同步当前平台
 - **处理 attestation** —— 专门的路径解决阿里云 ACR 拒绝 OCI 1.1 空 blob 的问题（`unknown manifest class`）
 - **批量同步** —— 一次填多个镜像，或用清单文件维护一整套镜像集合
+- **并发 + 增量** —— 批量同步支持并发执行，并自动跳过目标已有的相同镜像。
+  定期同步的场景下，重复运行通常几秒就跑完
 - **失败不中断** —— 批量同步时单个镜像失败不影响其余镜像，最后统一汇总
+- **超时保护** —— 单个镜像可设超时，避免一个大镜像卡住整个批量任务
 - **结果一目了然** —— 运行结束直接生成结果表格，无需翻日志
 - **可在本地复现** —— 同一套逻辑封装成 `scripts/sync.sh`，本地也能跑，支持 `--dry-run`
 - **目标仓库可配置** —— 换命名空间或区域不需要改代码
@@ -125,6 +128,8 @@ registry.k8s.io/kube-scheduler:v1.31.0
 | `images_src` | ✅ | — | 源镜像，可多个。不需要 `docker://` 前缀 |
 | `strip_attestation` | | `false` | 剔除 attestation manifest。报 `unknown manifest class` 时勾它 |
 | `platforms` | | 自动探测 | 保留的平台，如 `linux/amd64,linux/arm64`。仅在上项勾选时生效 |
+| `concurrency` | | `4` | 并发同步的镜像数量，批量时提速明显 |
+| `skip_existing` | | `true` | 跳过目标仓库中已存在且完全相同的镜像 |
 | `dry_run` | | `false` | 只打印命令不推送，用来确认目标地址 |
 
 ### Sync-Images-to-Harbor
@@ -133,6 +138,8 @@ registry.k8s.io/kube-scheduler:v1.31.0
 | --- | :---: | --- | --- |
 | `images_src` | ✅ | — | 源镜像，支持批量 |
 | `images_dest` | ✅ | — | 目标路径，拼在 `HARBOR_REGISTRY` 之后，如 `library/nginx:1.27` |
+| `concurrency` | | `4` | 并发同步的镜像数量 |
+| `skip_existing` | | `true` | 跳过已存在的相同镜像 |
 | `dry_run` | | `false` | 同上 |
 
 ### Sync-Batch
@@ -141,6 +148,8 @@ registry.k8s.io/kube-scheduler:v1.31.0
 | --- | :---: | --- | --- |
 | `lockfile` | ✅ | `images.lock.txt` | 清单文件路径 |
 | `dest_registry` | | 见说明 | 目标仓库前缀，留空则用 `ALIYUNCS_REGISTRY` 变量或内置默认值 |
+| `concurrency` | | `6` | 并发同步的镜像数量 |
+| `skip_existing` | | `true` | 跳过已存在的相同镜像 |
 | `dry_run` | | `false` | 同上 |
 
 > 📖 每个参数的深入说明、边界情况与示例，见 [使用文档](docs/USAGE.md#输入参数详解)。

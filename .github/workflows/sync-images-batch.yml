@@ -16,6 +16,15 @@ on:
         description: '目标仓库前缀（留空则使用 ALIYUNCS_REGISTRY 或内置默认值）'
         required: false
         default: ''
+      concurrency:
+        description: '并发同步的镜像数量（清单通常有几十个条目，调大可显著缩短耗时）'
+        required: false
+        default: '6'
+      skip_existing:
+        description: '跳过目标仓库中已存在且完全相同的镜像（定期同步时绝大部分都会被跳过）'
+        required: false
+        type: boolean
+        default: true
       dry_run:
         description: '仅预览将要执行的命令，不实际推送'
         required: false
@@ -63,6 +72,8 @@ jobs:
       - name: 执行批量同步
         env:
           LOCKFILE: ${{ inputs.lockfile }}
+          CONCURRENCY: ${{ inputs.concurrency }}
+          SKIP_EXISTING: ${{ inputs.skip_existing }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           #!/usr/bin/env bash
@@ -84,6 +95,12 @@ jobs:
 
           args=(--file "$LOCKFILE" --dest "$DEST_REGISTRY" --report-dir ./reports)
 
+          if [[ -n "$CONCURRENCY" ]]; then
+            args+=(--concurrency "$CONCURRENCY")
+          fi
+          if [[ "$SKIP_EXISTING" == "true" ]]; then
+            args+=(--skip-existing)
+          fi
           if [[ "$DRY_RUN" == "true" ]]; then
             args+=(--dry-run)
           fi
