@@ -24,10 +24,18 @@ DRY_RUN="false"
 REPORT_DIR=""
 REPORT_NAME="sync-report"
 REGCTL_VERSION="v0.11.6"
+CONCURRENCY="1"
+TIMEOUT="600"
+SKIP_EXISTING="false"
 declare -a SOURCE_IMAGES=()
 declare -a SOURCE_FILES=()
 
-# 结果收集（与 SOURCE_IMAGES 下标一一对应）
+# 单个镜像的结果写进这个目录下的独立文件。
+# 之所以用文件而不是全局数组，是因为并发模式下每个任务是独立的子进程，
+# 子进程对数组的修改不会传回父进程。
+WORK_DIR=""
+
+# 结果数组，由 load_results 从 WORK_DIR 读入
 declare -a R_SRC=()
 declare -a R_DEST=()
 declare -a R_STATUS=()
@@ -51,6 +59,7 @@ log_ok()    { printf '%s[成功]%s %s\n' "$C_GREEN"  "$C_RESET" "$*" >&2; }
 log_warn()  { printf '%s[警告]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 log_error() { printf '%s[错误]%s %s\n' "$C_RED"    "$C_RESET" "$*" >&2; }
 log_dim()   { printf '%s%s%s\n'        "$C_DIM"               "$*" "$C_RESET" >&2; }
+log_skip()  { printf '%s[跳过]%s %s\n' "$C_DIM"               "$*" "$C_RESET" >&2; }
 
 die() {
   log_error "$@"
@@ -106,19 +115,30 @@ sync.sh —— 容器镜像同步引擎
   -s, --src <镜像>         源镜像，可重复指定；也支持逗号 / 分号 / 换行分隔的多个镜像
   -f, --file <路径>        从文件读取镜像列表，每行一个，# 开头为注释，空行忽略
 
-可选：
+可用性：
   -p, --platforms <列表>   逗号分隔的平台列表。仅在 --strip-attestation 下生效；
                            不指定时会自动探测源镜像的平台
       --strip-attestation  剔除 attestation manifest，改用 regctl 重建索引
                            （源镜像带 provenance/SBOM 时使用，如 netbirdio）
+      --skip-existing      目标仓库已有完全相同的镜像时直接跳过，不重复推送。
+                           默认的 skopeo 路径支持此优化；--strip-attestation
+                           会重建索引，目标 digest 必然不同，因此不做跳过
+
+性能与可靠性：
+  -c, --concurrency <N>    并发同步的镜像数量，默认 1（串行）。
+                           批量同步几十个镜像时调大能显著缩短总耗时，
+                           建议值 4~8，过高可能触发上游限流
+  -t, --timeout <秒>       单个镜像的超时时间，默认 600 秒（10 分钟）
   -r, --retries <次数>     单个镜像的失败重试次数，默认 3
+
+输出：
       --dry-run            只打印将要执行的命令，不实际推送
       --report-dir <目录>  把同步报告写入该目录（同时生成 .md 与 .json）
       --regctl-version <v> 指定 regctl 版本，默认 v0.11.6
   -h, --help               显示本帮助
 
 退出码：
-  0  全部镜像同步成功
+  0  全部镜像同步成功（含被跳过的）
   1  参数或环境错误（缺少依赖、参数非法）
   2  至少一个镜像同步失败（其余镜像仍会继续尝试）
 
@@ -128,6 +148,10 @@ sync.sh —— 容器镜像同步引擎
 
   # 批量同步，先看命令对不对
   ./scripts/sync.sh --src "nginx:1.27,redis:7.4" -d harbor.example.com/library --dry-run
+
+  # 批量并发同步，并跳过已经同步过的镜像
+  ./scripts/sync.sh --file images.lock.txt -d registry.cn-shenzhen.aliyuncs.com/nicholyx \
+      --concurrency 6 --skip-existing
 
   # 剔除 attestation，只保留 amd64 与 arm64
   ./scripts/sync.sh -s ghcr.io/netbirdio/netbird:0.28.0 -d registry.cn-shenzhen.aliyuncs.com/nicholyx \
@@ -143,7 +167,8 @@ parse_args() {
     case "$1" in
       -s|--src|--source)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
-        SOURCE_IMAGES+=("$2"); shift 2 ;;      -f|--file|--source-file)
+        SOURCE_IMAGES+=("$2"); shift 2 ;;
+      -f|--file|--source-file)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         SOURCE_FILES+=("$2"); shift 2 ;;
       -d|--dest|--dest-registry)
@@ -157,6 +182,14 @@ parse_args() {
         PLATFORMS="$2"; shift 2 ;;
       --strip-attestation)
         STRIP_ATTESTATION="true"; shift ;;
+      --skip-existing)
+        SKIP_EXISTING="true"; shift ;;
+      -c|--concurrency)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        CONCURRENCY="$2"; shift 2 ;;
+      -t|--timeout)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        TIMEOUT="$2"; shift 2 ;;
       -r|--retries)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         MAX_RETRIES="$2"; shift 2 ;;
@@ -179,6 +212,14 @@ parse_args() {
         exit 1 ;;
     esac
   done
+}
+
+# 校验数值型参数，避免把 --concurrency abc 这种输入带到后面才炸
+validate_numeric() {
+  local name="$1" value="$2"
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    die "${name} 必须是非负整数，当前为「${value}」"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -272,19 +313,50 @@ ensure_regctl() {
 }
 
 # ---------------------------------------------------------------------------
+# 超时包装
+#
+# GNU coreutils 提供 timeout，macOS 需要装 coreutils 才有对应的 gtimeout。
+# 两者都没有时降级为不限制超时，并给出一次提示——这比直接报错更友好，
+# 毕竟超时只是保护措施，不是功能本身。
+# ---------------------------------------------------------------------------
+declare -a TIMEOUT_CMD=()
+
+setup_timeout() {
+  if [[ "$TIMEOUT" == "0" ]]; then
+    TIMEOUT_CMD=()
+    return 0
+  fi
+  if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_CMD=(timeout "$TIMEOUT")
+  elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_CMD=(gtimeout "$TIMEOUT")
+  else
+    TIMEOUT_CMD=()
+    log_warn "未找到 timeout 命令，单镜像超时保护已禁用（macOS 可 brew install coreutils）"
+  fi
+}
+
+run_with_timeout() {
+  if [[ ${#TIMEOUT_CMD[@]} -gt 0 ]]; then
+    "${TIMEOUT_CMD[@]}" "$@"
+  else
+    "$@"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # 同步实现
 # ---------------------------------------------------------------------------
 
 # 常规路径：skopeo 原样搬运，--all 保证 multi-arch 索引完整保留
 sync_via_skopeo() {
   local src="$1" dest="$2"
-  local -a cmd=(skopeo copy --all --retry-times "$MAX_RETRIES"
-                "docker://${src}" "docker://${dest}")
   if [[ "$DRY_RUN" == "true" ]]; then
-    log_dim "  [dry-run] ${cmd[*]}"
+    log_dim "  [dry-run] skopeo copy --all --retry-times ${MAX_RETRIES} docker://${src} docker://${dest}"
     return 0
   fi
-  "${cmd[@]}"
+  run_with_timeout skopeo copy --all --retry-times "$MAX_RETRIES" \
+    "docker://${src}" "docker://${dest}"
 }
 
 # 特殊路径：用 regctl 重建索引，只包含指定平台，
@@ -308,14 +380,14 @@ sync_via_regctl() {
 
   [[ ${#platform_args[@]} -gt 0 ]] || die "平台列表解析结果为空：${platforms}"
 
-  local -a cmd=(regctl index create "$dest"
-                --ref "$src"
-                "${platform_args[@]}")
   if [[ "$DRY_RUN" == "true" ]]; then
-    log_dim "  [dry-run] ${cmd[*]}"
+    log_dim "  [dry-run] regctl index create ${dest} --ref ${src} ${platforms//,/ --platform }"
     return 0
   fi
-  "${cmd[@]}"
+
+  run_with_timeout regctl index create "$dest" \
+    --ref "$src" \
+    "${platform_args[@]}"
 }
 
 # 同步单个镜像，返回 0 表示成功
@@ -326,6 +398,24 @@ sync_one() {
   else
     sync_via_skopeo "$src" "$dest"
   fi
+}
+
+# 判断目标仓库是否已有与源完全一致的镜像。
+#
+# 做法是比较两边 manifest 的规范化 JSON：直接比原始字节会因为 JSON 的键顺序
+# 不同而误判，用 jq -S 排序后再比就能得到语义层面的相等性。
+# 任何一步失败都返回「不相等」，宁可多同步一次，也不要错误地跳过。
+is_up_to_date() {
+  local src="$1" dest="$2"
+  local src_norm dest_norm
+
+  src_norm="$(skopeo inspect --raw "docker://${src}" 2>/dev/null | jq -S -c . 2>/dev/null)" || return 1
+  [[ -n "$src_norm" ]] || return 1
+
+  dest_norm="$(skopeo inspect --raw "docker://${dest}" 2>/dev/null | jq -S -c . 2>/dev/null)" || return 1
+  [[ -n "$dest_norm" ]] || return 1
+
+  [[ "$src_norm" == "$dest_norm" ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -399,26 +489,178 @@ collect_images() {
 }
 
 # ---------------------------------------------------------------------------
-# 报告输出
+# 单个镜像的处理（可能在子进程中运行）
 # ---------------------------------------------------------------------------
-emit_summary() {
-  local total=${#R_SRC[@]} ok=0 fail=0 i
-  for i in "${!R_STATUS[@]}"; do
-    if [[ "${R_STATUS[$i]}" == "success" ]]; then
-      ok=$((ok + 1))
+
+write_result() {
+  local file="$1" src="$2" dest="$3" status="$4" platform="$5" seconds="$6" note="$7"
+  # note 里若混入制表符会破坏字段分隔，统一换成空格
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$src" "$dest" "$status" "$platform" "$seconds" "${note//$'\t'/ }" > "$file"
+}
+
+# 解析本镜像要使用的平台列表
+resolve_platforms() {
+  local src="$1" platforms=""
+
+  if [[ "$STRIP_ATTESTATION" != "true" ]]; then
+    printf '%s' "全部（--all）"
+    return 0
+  fi
+
+  platforms="$PLATFORMS"
+  if [[ -z "$platforms" ]]; then
+    platforms="$(detect_platforms "$src" || true)"
+    if [[ -n "$platforms" ]]; then
+      log_info "自动探测到平台：${platforms}"
     else
-      fail=$((fail + 1))
+      platforms="linux/amd64,linux/arm64"
+      log_warn "无法自动探测平台，回退默认值：${platforms}"
+    fi
+  fi
+  printf '%s' "$platforms"
+}
+
+process_one() {
+  local idx="$1" raw_src="$2"
+  local total="$3"
+  local src dest dest_repo platforms start end elapsed status note=""
+  local result_file
+  result_file="${WORK_DIR}/result-$(printf '%04d' "$idx")"
+
+  src="$(normalize_ref "$raw_src")"
+
+  # 格式明显不对的输入直接记为失败，不浪费一次网络请求
+  if ! validate_ref "$src"; then
+    local reason
+    reason="$(validate_ref "$src" 2>&1 || true)"
+    log_error "[${idx}/${total}] 跳过非法镜像引用：${src} —— ${reason}"
+    gh_error "镜像引用格式错误：${src}（${reason}）"
+    write_result "$result_file" "$src" "—" "failed" "—" "0" "镜像引用格式错误：${reason}"
+    return 0
+  fi
+
+  if [[ -n "$DEST_EXACT" ]]; then
+    dest="$DEST_EXACT"
+  else
+    dest_repo="$(dest_repo_for "$src")"
+    dest="${DEST_REGISTRY}/${dest_repo}"
+  fi
+
+  group_start "[${idx}/${total}] ${src}"
+  log_info "目标：${dest}"
+
+  # 增量跳过：目标已经有完全相同的镜像时不必再推一次。
+  # strip-attestation 模式会重建索引，目标 digest 必然与源不同，
+  # 比较 digest 没有意义，因此该模式下不做跳过。
+  if [[ "$SKIP_EXISTING" == "true" && "$STRIP_ATTESTATION" != "true" && "$DRY_RUN" != "true" ]]; then
+    if is_up_to_date "$src" "$dest"; then
+      log_skip "[${idx}/${total}] 目标已是最新，跳过"
+      write_result "$result_file" "$src" "$dest" "skipped" "全部（--all）" "0" "目标已存在相同镜像"
+      group_end
+      return 0
+    fi
+  fi
+
+  platforms="$(resolve_platforms "$src")"
+  log_info "平台：${platforms}"
+
+  start="$(date +%s)"
+  if sync_one "$src" "$dest" "$platforms"; then
+    status="success"
+    log_ok "[${idx}/${total}] 同步成功"
+  else
+    status="failed"
+    note="同步失败，详见上方日志"
+    log_error "[${idx}/${total}] 同步失败"
+    gh_error "镜像同步失败：${src}"
+  fi
+  end="$(date +%s)"
+  elapsed=$((end - start))
+
+  write_result "$result_file" "$src" "$dest" "$status" "$platforms" "$elapsed" "$note"
+  group_end
+  return 0
+}
+
+# 调度所有镜像。
+# 并发通过后台进程实现，槽位靠 jobs -pr 统计当前运行中的作业数来控制——
+# 不用 wait -n（bash 4.3+）是为了兼容 macOS 自带的 bash 3.2。
+dispatch_all() {
+  local idx=0
+  local total=${#SOURCE_IMAGES[@]}
+  local raw_src
+
+  for raw_src in "${SOURCE_IMAGES[@]}"; do
+    idx=$((idx + 1))
+
+    if [[ "$CONCURRENCY" -gt 1 ]]; then
+      while [[ "$(jobs -pr | wc -l | tr -d ' ')" -ge "$CONCURRENCY" ]]; do
+        sleep 0.3
+      done
+      process_one "$idx" "$raw_src" "$total" &
+    else
+      process_one "$idx" "$raw_src" "$total"
     fi
   done
 
-  log_info "同步完成：共 ${total} 个镜像，成功 ${ok} 个，失败 ${fail} 个"
+  if [[ "$CONCURRENCY" -gt 1 ]]; then
+    # wait 返回最后一个作业的退出码；process_one 内部已把失败转成结果记录，
+    # 这里不让它影响脚本自身
+    wait || true
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 结果汇总与报告
+# ---------------------------------------------------------------------------
+load_results() {
+  local f src dest status platform seconds note
+  local -a files=()
+
+  # glob 排序后是字典序，因此文件名用零填充保证 1、2、…、10 的顺序正确
+  for f in "${WORK_DIR}"/result-*; do
+    [[ -e "$f" ]] || continue
+    files+=("$f")
+  done
+
+  [[ ${#files[@]} -gt 0 ]] || return 0
+
+  for f in "${files[@]}"; do
+    src=""; dest=""; status=""; platform=""; seconds="0"; note=""
+    IFS=$'\t' read -r src dest status platform seconds note < "$f" || true
+    R_SRC+=("${src:-}")
+    R_DEST+=("${dest:-}")
+    R_STATUS+=("${status:-unknown}")
+    R_PLATFORM+=("${platform:-}")
+    R_SECONDS+=("${seconds:-0}")
+    R_NOTE+=("${note:-}")
+  done
+}
+
+emit_summary() {
+  local total=${#R_SRC[@]}
+  local ok=0 fail=0 skipped=0 i
+  for i in "${!R_STATUS[@]}"; do
+    case "${R_STATUS[$i]}" in
+      success) ok=$((ok + 1)) ;;
+      skipped) skipped=$((skipped + 1)) ;;
+      *)       fail=$((fail + 1)) ;;
+    esac
+  done
+
+  log_info "同步完成：共 ${total} 个镜像，成功 ${ok} 个，跳过 ${skipped} 个，失败 ${fail} 个"
 
   # ---- 控制台表格 ----
   printf '\n' >&2
   printf '%s\n' "────────────────────────────────────────────────────────" >&2
   for i in "${!R_SRC[@]}"; do
     local mark="${C_GREEN}✓${C_RESET}"
-    [[ "${R_STATUS[$i]}" == "success" ]] || mark="${C_RED}✗${C_RESET}"
+    case "${R_STATUS[$i]}" in
+      success) mark="${C_GREEN}✓${C_RESET}" ;;
+      skipped) mark="${C_DIM}⤼${C_RESET}" ;;
+      *)       mark="${C_RED}✗${C_RESET}" ;;
+    esac
     printf ' %s %s\n' "$mark" "${R_SRC[$i]}" >&2
     printf '   %s→ %s%s\n' "$C_DIM" "${R_DEST[$i]}" "$C_RESET" >&2
     printf '   %s平台 %s · 耗时 %ss%s\n' "$C_DIM" "${R_PLATFORM[$i]:-未知}" "${R_SECONDS[$i]}" "$C_RESET" >&2
@@ -439,11 +681,15 @@ emit_summary() {
       echo "| --- | --- | :---: | --- | --- |"
       for i in "${!R_SRC[@]}"; do
         local icon="✅"
-        [[ "${R_STATUS[$i]}" == "success" ]] || icon="❌"
+        case "${R_STATUS[$i]}" in
+          skipped) icon="⤼ 已存在" ;;
+          success) icon="✅" ;;
+          *)       icon="❌" ;;
+        esac
         echo "| \`${R_SRC[$i]}\` | \`${R_DEST[$i]}\` | ${icon} | ${R_PLATFORM[$i]:-—} | ${R_SECONDS[$i]}s |"
       done
       echo ""
-      echo "**合计**：${total} 个镜像 · 成功 ${ok} · 失败 ${fail}"
+      echo "**合计**：${total} 个镜像 · 成功 ${ok} · 跳过 ${skipped} · 失败 ${fail}"
       echo ""
       if [[ "$DRY_RUN" == "true" ]]; then
         echo "> ⚠️ 本次为 dry-run，未实际推送任何镜像。"
@@ -453,7 +699,7 @@ emit_summary() {
 
   # ---- 报告文件 ----
   if [[ -n "$REPORT_DIR" ]]; then
-    write_report "$total" "$ok" "$fail"
+    write_report "$total" "$ok" "$skipped" "$fail"
   fi
 
   [[ "$fail" -eq 0 ]] || return 2
@@ -461,7 +707,7 @@ emit_summary() {
 }
 
 write_report() {
-  local total="$1" ok="$2" fail="$3" i
+  local total="$1" ok="$2" skipped="$3" fail="$4" i
   mkdir -p "$REPORT_DIR"
 
   local md="${REPORT_DIR}/${REPORT_NAME}.md"
@@ -471,13 +717,17 @@ write_report() {
     echo "- 生成时间：$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     echo "- 目标地址：${DEST_EXACT:-$DEST_REGISTRY}"
     echo "- 同步模式：$([[ "$STRIP_ATTESTATION" == "true" ]] && echo 'regctl（剔除 attestation）' || echo 'skopeo（保留全部平台）')"
-    echo "- 结果：共 ${total} 个镜像，成功 ${ok} 个，失败 ${fail} 个"
+    echo "- 结果：共 ${total} 个镜像，成功 ${ok} 个，跳过 ${skipped} 个，失败 ${fail} 个"
     echo ""
     echo "| 源镜像 | 目标镜像 | 结果 | 平台 | 耗时 |"
     echo "| --- | --- | :---: | --- | --- |"
     for i in "${!R_SRC[@]}"; do
       local icon="✅"
-      [[ "${R_STATUS[$i]}" == "success" ]] || icon="❌"
+      case "${R_STATUS[$i]}" in
+        skipped) icon="⤼" ;;
+        success) icon="✅" ;;
+        *)       icon="❌" ;;
+      esac
       echo "| \`${R_SRC[$i]}\` | \`${R_DEST[$i]}\` | ${icon} | ${R_PLATFORM[$i]:-—} | ${R_SECONDS[$i]}s |"
     done
   } > "$md"
@@ -490,12 +740,15 @@ write_report() {
     printf '  "strip_attestation": %s,\n' "$STRIP_ATTESTATION"
     printf '  "total": %s,\n' "$total"
     printf '  "success": %s,\n' "$ok"
+    printf '  "skipped": %s,\n' "$skipped"
     printf '  "failed": %s,\n' "$fail"
     printf '  "images": [\n'
     for i in "${!R_SRC[@]}"; do
       printf '    {"source": "%s", "dest": "%s", "status": "%s", "platforms": "%s", "seconds": %s}' \
         "${R_SRC[$i]}" "${R_DEST[$i]}" "${R_STATUS[$i]}" "${R_PLATFORM[$i]:-}" "${R_SECONDS[$i]}"
-      [[ "$i" -lt $((${#R_SRC[@]} - 1)) ]] && printf ','
+      if [[ "$i" -lt $((${#R_SRC[@]} - 1)) ]]; then
+        printf ','
+      fi
       printf '\n'
     done
     printf '  ]\n'
@@ -519,12 +772,19 @@ main() {
     exit 1
   fi
 
+  validate_numeric "--concurrency" "$CONCURRENCY"
+  validate_numeric "--timeout" "$TIMEOUT"
+  validate_numeric "--retries" "$MAX_RETRIES"
+
+  [[ "$CONCURRENCY" -ge 1 ]] || die "--concurrency 至少为 1"
+
   DEST_REGISTRY="${DEST_REGISTRY#docker://}"
   DEST_REGISTRY="${DEST_REGISTRY%/}"
   DEST_EXACT="${DEST_EXACT#docker://}"
 
   ensure_skopeo
   ensure_jq
+  setup_timeout
   if [[ "$STRIP_ATTESTATION" == "true" ]]; then
     ensure_regctl
   fi
@@ -542,67 +802,27 @@ main() {
     log_warn "--platforms 仅在 --strip-attestation 模式下生效，本次将忽略（skopeo 用 --all 同步全部平台）"
   fi
 
+  if [[ "$SKIP_EXISTING" == "true" && "$STRIP_ATTESTATION" == "true" ]]; then
+    log_warn "--skip-existing 在 --strip-attestation 模式下不可用（索引会被重建，digest 必然不同），本次将忽略"
+  fi
+
   local total=${#SOURCE_IMAGES[@]}
   log_info "待同步镜像 ${total} 个 → ${DEST_EXACT:-$DEST_REGISTRY}"
+  if [[ "$CONCURRENCY" -gt 1 ]]; then
+    log_info "并发度：${CONCURRENCY}"
+  fi
 
-  local idx=0
-  for raw_src in "${SOURCE_IMAGES[@]}"; do
-    idx=$((idx + 1))
-    local src dest_repo dest platforms start end elapsed status note=""
+  WORK_DIR="$(mktemp -d)"
+  # shellcheck disable=SC2064  # 此处就是要在此刻展开 WORK_DIR 的值
+  trap "rm -rf '${WORK_DIR}'" EXIT
 
-    src="$(normalize_ref "$raw_src")"
+  local start end
+  start="$(date +%s)"
+  dispatch_all
+  end="$(date +%s)"
+  log_info "总耗时：$((end - start)) 秒"
 
-    if ! validate_ref "$src"; then
-      # 格式明显不对的输入直接记为失败，不浪费一次网络请求
-      R_SRC+=("$src"); R_DEST+=("—"); R_STATUS+=("failed")
-      R_PLATFORM+=("—"); R_SECONDS+=("0"); R_NOTE+=("镜像引用格式错误：$(validate_ref "$src" || true)")
-      log_error "[${idx}/${total}] 跳过非法镜像引用：${src}"
-      continue
-    fi
-
-    if [[ -n "$DEST_EXACT" ]]; then
-      dest="$DEST_EXACT"
-    else
-      dest_repo="$(dest_repo_for "$src")"
-      dest="${DEST_REGISTRY}/${dest_repo}"
-    fi
-
-    # 决定平台列表：显式指定优先，否则尝试自动探测，最后回退默认值
-    platforms="$PLATFORMS"
-    if [[ "$STRIP_ATTESTATION" == "true" && -z "$platforms" ]]; then
-      platforms="$(detect_platforms "$src" || true)"
-      if [[ -n "$platforms" ]]; then
-        log_info "[${idx}/${total}] 自动探测到平台：${platforms}"
-      else
-        platforms="linux/amd64,linux/arm64"
-        log_warn "[${idx}/${total}] 无法自动探测平台，回退默认值：${platforms}"
-      fi
-    elif [[ "$STRIP_ATTESTATION" != "true" ]]; then
-      platforms="全部（--all）"
-    fi
-
-    group_start "[${idx}/${total}] ${src}"
-    log_info "目标：${dest}"
-    log_info "平台：${platforms}"
-
-    start="$(date +%s)"
-    if sync_one "$src" "$dest" "$platforms"; then
-      status="success"
-      log_ok "[${idx}/${total}] 同步成功"
-    else
-      status="failed"
-      note="同步失败，详见上方日志"
-      log_error "[${idx}/${total}] 同步失败"
-      gh_error "镜像同步失败：${src}"
-    fi
-    end="$(date +%s)"
-    elapsed=$((end - start))
-
-    R_SRC+=("$src"); R_DEST+=("$dest"); R_STATUS+=("$status")
-    R_PLATFORM+=("$platforms"); R_SECONDS+=("$elapsed"); R_NOTE+=("$note")
-    group_end
-  done
-
+  load_results
   emit_summary
 }
 
