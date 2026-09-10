@@ -1,45 +1,82 @@
-#$schema: https://json.schemastore.org/github-workflow
-
 # 工作流名称
 name: Sync-Images-to-Harbor
-# 工作流运行时显示名称
-run-name: ${{ github.actor }} - Sync Images to Harbor.
+# 工作流运行时显示名称（带上源镜像，便于在 Actions 列表中区分每次同步）
+run-name: ${{ github.actor }} - Sync ${{ inputs.images_src }} to Harbor.
+
 # 怎样触发工作流
 on:
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
     inputs:
       images_src:
-        description: '源镜像（例如：nginx:1.27）'
+        description: '源镜像（无需 docker:// 前缀）。多个镜像用换行或逗号分隔'
         required: true
       images_dest:
-        description: '目标镜像（例如：docker.io/nginx:1.27）'
+        description: '目标镜像路径，拼接在 HARBOR_REGISTRY 之后（例如：library/nginx:1.27）'
         required: true
+      dry_run:
+        description: '仅预览将要执行的命令，不实际推送'
+        required: false
+        type: boolean
+        default: false
+
+# 只需要读代码，推送凭证通过 Secrets 注入
+permissions:
+  contents: read
 
 # 工作流程任务（通常含有一个或多个步骤）
 jobs:
   sync-images:
+    name: 同步到 Harbor
     runs-on: ubuntu-latest
+    env:
+      HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
     steps:
-    - name: Checkout Repos
-      uses: actions/checkout@v3
+      - name: Checkout Repos
+        uses: actions/checkout@v7
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v2.9.1
+      - name: Login to Harbor
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ secrets.HARBOR_REGISTRY }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+          logout: false
 
-    - name: Login to Docker Hub
-      uses: docker/login-action@v3
-      with:
-        registry: ${{ secrets.HARBOR_REGISTRY }}
-        username: ${{ secrets.HARBOR_USERNAME }}
-        password: ${{ secrets.HARBOR_PASSWORD }}
-        logout: false
+      - name: 执行镜像同步
+        # Harbor 的目标路径由用户显式给出，可能带多级路径，
+        # 因此这里不能套用阿里云那套「把 / 换成 _」的扁平化规则：
+        # sync.sh 负责搬运，目标地址在调用前就拼好。
+        env:
+          IMAGES_SRC: ${{ inputs.images_src }}
+          IMAGES_DEST: ${{ inputs.images_dest }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
 
-    - name: Use Skopeo Tools Sync Image to Docker Hub
-      run: |
-        #!/usr/bin/env bash
-        
-        echo "源镜像：${{ inputs.images_src }}"
-        echo "目标镜像：${{ inputs.images_dest }}"
-        skopeo copy docker://${{ inputs.images_src }} docker://${{ secrets.HARBOR_REGISTRY }}/${{ inputs.images_dest }}
- 
+          [[ -n "$HARBOR_REGISTRY" ]] || { echo "::error::未配置 HARBOR_REGISTRY"; exit 1; }
+
+          # 目标地址 = Harbor 地址 + 用户给定路径，例如
+          #   harbor.example.com/library/nginx:1.27
+          # 这里的路径由用户完全指定，所以用 --dest-exact 而非前缀模式，
+          # 避免 sync.sh 再拼接一次源镜像名。兼容以 / 开头的写法。
+          dest="${HARBOR_REGISTRY}/${IMAGES_DEST#/}"
+
+          args=(--src "$IMAGES_SRC" --dest-exact "$dest" --report-dir ./reports)
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+
+          echo "执行：./scripts/sync.sh ${args[*]}"
+          ./scripts/sync.sh "${args[@]}"
+
+      - name: 上传同步报告
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sync-report-harbor
+          path: reports/
+          retention-days: 30
+          if-no-files-found: ignore
