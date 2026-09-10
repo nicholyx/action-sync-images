@@ -1,0 +1,53 @@
+# ============================================================================
+# 镜像同步清单
+# ============================================================================
+#
+# 本文件配合 .github/workflows/sync-images-batch.yml 使用。
+# 在 Actions 页面手动触发该工作流，即可一次性同步下面列出的全部镜像，
+# 不必再一个个填表单。
+#
+# 语法：
+#   - 每行一个镜像，必须带 tag 或 digest
+#   - 井号开头是整行注释，行尾也可以写注释
+#   - 空行会被忽略
+#   - 不需要写 docker:// 前缀
+#
+# 适用场景：
+#   维护一套固定的镜像集合（比如某个 Kubernetes 版本的组件、某套中间件栈），
+#   需要定期跟着上游更新，同时保证国内集群随时拉得到。
+#
+# ---------------------------------------------------------------------------
+
+# 示例条目：取消注释即可生效。
+# 当前保留这一条是为了让批量工作流开箱可用，pause 镜像体积极小、无副作用。
+registry.k8s.io/pause:3.9
+
+# ---------------------------------------------------------------------------
+# Kubernetes 集群组件（以 v1.31.0 为例）
+# 改动 kubeadm 配置后，可以用下面的命令重新生成这份列表：
+#   kubeadm config images list --kubernetes-version=v1.31.0
+# ---------------------------------------------------------------------------
+# registry.k8s.io/kube-apiserver:v1.31.0
+# registry.k8s.io/kube-controller-manager:v1.31.0
+# registry.k8s.io/kube-scheduler:v1.31.0
+# registry.k8s.io/kube-proxy:v1.31.0
+# registry.k8s.io/coredns/coredns:v1.11.1
+# registry.k8s.io/etcd:3.5.15-0
+# registry.k8s.io/pause:3.10
+
+# ---------------------------------------------------------------------------
+# 常用基础设施镜像
+# ---------------------------------------------------------------------------
+# ghcr.io/fluxcd/source-controller:v1.4.1
+# ghcr.io/fluxcd/kustomize-controller:v1.4.0
+# registry.k8s.io/ingress-nginx/controller:v1.11.3
+# registry.k8s.io/metrics-server/metrics-server:v0.7.2
+# quay.io/prometheus/node-exporter:v1.8.2
+# quay.io/coreos/kube-state-metrics:v2.14.0
+
+# ---------------------------------------------------------------------------
+# 需要剔除 attestation 的镜像（源镜像带 provenance/SBOM 时）
+# 这类镜像在批量模式下会走 skopeo 路径，可能被阿里云 ACR 拒绝。
+# 如需同步它们，请改用单镜像工作流并勾选「剔除 attestation」。
+# ---------------------------------------------------------------------------
+# ghcr.io/netbirdio/netbird:0.28.0
