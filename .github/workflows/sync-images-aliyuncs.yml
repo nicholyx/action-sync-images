@@ -74,6 +74,7 @@ jobs:
           CONCURRENCY: ${{ inputs.concurrency }}
           SKIP_EXISTING: ${{ inputs.skip_existing }}
           DRY_RUN: ${{ inputs.dry_run }}
+          SYNC_DEBUG: '1'
         run: |
           #!/usr/bin/env bash
           set -euo pipefail
