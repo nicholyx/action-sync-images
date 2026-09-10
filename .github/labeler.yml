@@ -1,0 +1,56 @@
+# PR 自动打标签规则
+#
+# 由 .github/workflows/labeler.yml 驱动（actions/labeler）。
+# 规则基于改动到的文件路径，不依赖人工操作。
+#
+# 文档：https://github.com/actions/labeler
+
+# 同步逻辑本身
+sync-aliyuncs:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/workflows/sync-images-aliyuncs.yml'
+
+sync-harbor:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/workflows/sync-images-harbor.yml'
+
+# CI / 工作流基础设施
+ci:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/workflows/**'
+          - '.github/dependabot.yml'
+          - '.github/labeler.yml'
+
+# 自动化脚本
+automation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'scripts/**'
+
+# 文档
+documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '**/*.md'
+          - 'docs/**'
+          - 'LICENSE'
+
+# 仓库治理配置
+governance:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/ISSUE_TEMPLATE/**'
+          - '.github/PULL_REQUEST_TEMPLATE.md'
+          - '.github/CODEOWNERS'
+          - 'CODE_OF_CONDUCT.md'
+          - 'SECURITY.md'
+          - 'CONTRIBUTING.md'
+
+# 依赖更新
+dependencies:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/dependabot.yml'

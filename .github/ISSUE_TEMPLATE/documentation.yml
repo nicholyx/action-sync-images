@@ -1,0 +1,62 @@
+name: 📖 文档问题
+description: 文档写错了、看不懂、或者缺少内容
+title: "[Docs] "
+labels:
+  - documentation
+body:
+  - type: markdown
+    attributes:
+      value: |
+        文档问题同样是有效的问题。**「我看不懂这一段」本身就是重要反馈**，
+        请不要因为「可能是我太笨」而放弃提交。
+
+  - type: input
+    id: location
+    attributes:
+      label: 涉及的文档位置
+      description: 文件路径或页面链接，越具体越好
+      placeholder: README.md 的「配置 Secrets 与 Variables」一节
+    validations:
+      required: true
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: 问题类型
+      options:
+        - 内容错误（描述与实际行为不符）
+        - 表述不清（能读但难以理解）
+        - 缺少内容（某个场景没有覆盖）
+        - 链接失效或路径错误
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: detail
+    attributes:
+      label: 具体说明
+      description: 哪里有问题？你期望看到什么？
+      placeholder: |
+        文档说「未设置 ALIYUNCS_REGISTRY 时会使用默认值」，
+        但没说默认值具体是什么，我得去翻工作流源码才能确认。
+    validations:
+      required: true
+
+  - type: dropdown
+    id: willing
+    attributes:
+      label: 你愿意直接提 PR 修正吗
+      options:
+        - 愿意
+        - 愿意，但需要有人指导
+        - 暂时没有精力
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: 补充信息
+    validations:
+      required: false

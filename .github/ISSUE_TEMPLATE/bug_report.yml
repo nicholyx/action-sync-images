@@ -1,0 +1,112 @@
+name: 🐛 Bug 报告
+description: 同步失败、报错，或行为与文档描述不符
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你花时间反馈问题！
+
+        提交之前，请先确认两件事，这能帮我们省下大量来回沟通的时间：
+        1. 搜索[已有 Issue](https://github.com/nicholyx/action-sync-images/issues)，避免重复
+        2. 查阅 [docs/TROUBLESHOOTING.md](https://github.com/nicholyx/action-sync-images/blob/main/docs/TROUBLESHOOTING.md)，
+           常见错误（attestation、多架构丢失、认证失败）在那里都有现成答案
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已搜索过现有 Issue，确认没有重复
+          required: true
+        - label: 我已查阅排错文档
+          required: true
+        - label: 这不是安全漏洞（安全漏洞请走 SECURITY.md 中的私有渠道，不要提公开 Issue）
+          required: true
+
+  - type: dropdown
+    id: workflow
+    attributes:
+      label: 涉及的工作流
+      description: 出问题的是哪一个工作流？
+      options:
+        - Sync-Images-to-AliYuncs
+        - Sync-Images-to-Harbor
+        - CI / 其他工作流
+        - 本地脚本 scripts/
+        - 不确定
+    validations:
+      required: true
+
+  - type: input
+    id: source-image
+    attributes:
+      label: 出问题的源镜像
+      description: 完整的镜像引用，包含 tag 或 digest
+      placeholder: registry.k8s.io/coredns/coredns:v1.11.1
+    validations:
+      required: true
+
+  - type: textarea
+    id: inputs
+    attributes:
+      label: 触发时填写的输入
+      description: 请贴出你在 Run workflow 里填的参数，**不要包含任何凭证**
+      render: yaml
+      placeholder: |
+        images_src: registry.k8s.io/coredns/coredns:v1.11.1
+        strip_attestation: false
+        platforms: linux/amd64,linux/arm64
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望的行为
+      placeholder: 镜像应当被同步到 registry.cn-shenzhen.aliyuncs.com/nicholyx/registry.k8s.io_coredns_coredns:v1.11.1
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际的行为与完整报错
+      description: |
+        请直接粘贴**文本日志**而不是截图。日志可以在 Actions 运行页面复制。
+        只贴上你判断相关的那部分，但请保留完整的错误信息。
+      render: shell
+      placeholder: |
+        time="2026-09-11T03:12:44Z" level=fatal msg="copying image: ..."
+        Error: exit status 1
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现方式
+      description: 是必现还是偶发？有没有摸索出触发条件？
+      placeholder: |
+        必现。用上面给出的输入重新触发一次就能复现。
+    validations:
+      required: true
+
+  - type: input
+    id: run-url
+    attributes:
+      label: 失败运行的链接
+      description: Actions 运行页面的 URL，能大幅加快定位速度
+      placeholder: https://github.com/nicholyx/action-sync-images/actions/runs/123456789
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: 补充信息
+      description: 任何你觉得有帮助的线索。例如「勾选 strip_attestation 后可以成功」这类观察非常有价值
+    validations:
+      required: false

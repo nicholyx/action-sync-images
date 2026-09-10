@@ -1,0 +1,16 @@
+# Issue 模板选择器的配置
+# 文档：https://docs.github.com/communities/using-templates-to-encourage-useful-issues-and-pull-requests/configuring-issue-templates-for-your-repository
+blank_issues_enabled: false
+
+contact_links:
+  - name: 🔒 报告安全漏洞
+    url: https://github.com/nicholyx/action-sync-images/security/advisories/new
+    about: 请勿通过公开 Issue 报告安全漏洞，使用这个私有渠道。
+
+  - name: 💬 提问与讨论
+    url: https://github.com/nicholyx/action-sync-images/discussions
+    about: 使用方式上的疑问、想法交流，欢迎到 Discussions，不必开 Issue。
+
+  - name: 📚 排错文档
+    url: https://github.com/nicholyx/action-sync-images/blob/main/docs/TROUBLESHOOTING.md
+    about: 同步失败？常见错误与解决办法都整理在这里了。
