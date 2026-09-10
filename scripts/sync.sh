@@ -408,11 +408,18 @@ sync_one() {
 # 逐个比较各平台子 manifest 的 digest，才真正对应「镜像内容是否一致」。
 #
 # 单平台镜像没有 manifests 字段，返回空，由调用方决定退化策略。
+#
+# Windows 平台被排除在外。实测发现它的 digest 在搬运前后必然不同
+# （源 registry.k8s.io/pause:3.9 的两个 windows/amd64 条目是 4e2a…/4fe1…，
+# 推送到阿里云后变成 26b1…/fb04…，其余 5 个 Linux 平台则完全一致）——
+# 说明 manifest 在传输过程中被重新生成了。把它纳入比较只会让跳过永远
+# 不生效，而本项目面向的是国内 Linux 容器环境，用不到 Windows 镜像。
 platform_digest_map() {
   skopeo inspect --raw "docker://$1" 2>/dev/null \
     | jq -r '
         .manifests[]?
         | select(.platform.architecture != null and .platform.architecture != "unknown")
+        | select(.platform.os != "windows")
         | "\(.platform.os)/\(.platform.architecture) \(.digest)"
       ' 2>/dev/null \
     | sort
