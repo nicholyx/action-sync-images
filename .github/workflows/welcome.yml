@@ -1,0 +1,54 @@
+# 工作流名称
+name: Welcome
+# 工作流运行时显示名称
+run-name: 欢迎新的贡献者
+
+# 怎样触发工作流
+on:
+  # 同 labeler.yml：fork 来的 PR 在 pull_request 事件下拿不到写权限的 token，
+  # 而我们要在 PR 上发评论，所以用 pull_request_target。
+  # 本工作流不 checkout 也不执行任何 PR 内容，因此是安全的。
+  pull_request_target:
+    types: [opened]
+  issues:
+    types: [opened]
+
+# 需要写 Issue 与 PR 评论的权限
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  welcome:
+    name: 向首次贡献者致意
+    runs-on: ubuntu-latest
+    steps:
+      - name: 发表欢迎评论
+        uses: actions/first-interaction@v3
+        with:
+          # 注意：v3 起输入名改成了 snake_case，旧版的 repo-token 已不再识别
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+
+          issue_message: |
+            👋 欢迎，这是你在这个项目的第一个 Issue！
+
+            感谢你花时间把它写下来。维护者收到通知后会尽快查看。
+
+            在等待期间，如果你还没看过：
+            - [排错文档](https://github.com/nicholyx/action-sync-images/blob/main/docs/TROUBLESHOOTING.md) —— 常见错误几乎都能在这里找到答案
+            - [贡献指南](https://github.com/nicholyx/action-sync-images/blob/main/CONTRIBUTING.md) —— 想直接动手改的话可以看看
+
+            如果一周内没有收到回复，欢迎直接在这里 @ 维护者，通常是我们漏看了通知。
+
+          pr_message: |
+            🎉 感谢你的第一个 Pull Request！
+
+            我已经收到通知，会尽快开始 review。在你等待的时候，有几件事可以顺手确认一下：
+
+            - [ ] 本地跑过 `./scripts/lint.sh`
+            - [ ] 提交信息遵循了[约定式提交规范](https://github.com/nicholyx/action-sync-images/blob/main/CONTRIBUTING.md#提交信息规范)
+            - [ ] PR 描述里说明了**为什么**要做这个改动
+
+            CI 会自动跑起来（大约 1 分钟）。如果红了不用慌，点击失败的检查项就能看到具体原因；实在看不懂就把日志贴到评论里，我们一起看。
+
+            首次贡献总是最需要勇气的，谢谢你迈出这一步。💛

@@ -1,0 +1,104 @@
+# 更新日志
+
+本文件记录本项目的所有重要变更。
+
+格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
+版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+
+---
+
+## [Unreleased]
+
+### 新增
+
+- **批量同步**：`images_src` 现在支持一次传入多个镜像（换行、逗号或空格分隔），
+  单个镜像失败不会中断其余镜像的同步，结束后输出汇总表
+- **同步结果摘要**：每次运行生成 GitHub Step Summary 表格，包含每个镜像的目标地址、
+  架构列表与耗时，无需翻日志即可确认结果
+- **同步报告产物**：运行结束后可下载 Markdown / JSON 格式的同步报告（Artifact）
+- **本地 CLI**：新增 `scripts/sync.sh`，可在本地复现同一套同步逻辑，支持 `--dry-run`
+- **统一校验入口**：新增 `scripts/lint.sh`，一条命令跑完 CI 的全部静态检查
+- **输入校验**：同步前校验镜像引用格式，格式错误立即标记失败并给出原因，
+  不会浪费一次网络请求
+- **可配置重试**：`scripts/sync.sh` 支持 `--retries` 指定失败重试次数（默认 3 次）
+- 项目文档体系：`docs/ARCHITECTURE.md`（原理）、`docs/TROUBLESHOOTING.md`（排错）、
+  `docs/MAINTAINER_GUIDE.md`（维护者手册）、`docs/BACKGROUND.md`（原始教程归档）
+- 开源治理文件：`LICENSE`、`CONTRIBUTING.md`、`CODE_OF_CONDUCT.md`、`SECURITY.md`、
+  `CODEOWNERS`、Issue / PR 模板
+- CI 工作流：`actionlint` + `yamllint` + `shellcheck` + 提交信息规范校验
+- 自动化：PR 自动打标签、首个贡献者欢迎、Issue / PR 过期提醒、自动发布
+
+### 变更
+
+- **目标仓库地址不再硬编码**：`registry.cn-shenzhen.aliyuncs.com/nicholyx` 收敛为
+  `DEST_REGISTRY` 变量，可通过仓库变量 `ALIYUNCS_REGISTRY` 覆盖
+- **登录方式改为 `docker login`**：使登录地址与推送地址共用同一个变量，避免改一处漏一处
+- **regctl 版本固定为 `v0.11.6`**：原先使用 `releases/latest` 下载，导致同一工作流
+  在不同时间可能拿到不同版本，无法复现
+- **工作流运行名称**现在包含源镜像名，便于在 Actions 列表中区分每次同步
+- 移除了两个与镜像同步无关的多余步骤（`actions/checkout` 与 `docker/setup-buildx-action`）
+- `platforms` 改为可通过工作流输入配置，不再写死
+
+### 修复
+
+- **Harbor 工作流丢失多架构**：补上 `skopeo copy --all`。此前同步 multi-arch 镜像时
+  只搬运 runner 所在的 amd64 平台，arm64 用户拉取会报 `no matching manifest`
+- **regctl 分支在特定输入下生成非法镜像名**：源镜像带 `docker://` 前缀时，
+  目标仓库名会连同前缀一起参与替换，生成 `docker:__xxx` 这类非法引用
+- **注释与实现不符**：注释写「替换 `/` 为 `__`」，实际早已改为单个 `_`，会误导后续维护者
+- 修正了工作流中误导性的步骤名（登录阿里云 / Harbor 的步骤原名为 `Login to Docker Hub`）
+
+### 安全
+
+- 所有来自 `workflow_dispatch` 的输入不再直接插值到 `run:` 脚本，统一经 `env:` 中转，
+  消除表达式注入风险
+- 新增 `SECURITY.md` 说明本项目的威胁模型与漏洞报告流程
+- 忽略 `.qoder/` 等编辑器本地配置，避免误提交
+
+---
+
+## 历史版本
+
+以下版本早于本日志的建立，依据 Git 提交历史回溯整理。
+
+### [0.3.0] - 2026-08-29
+
+#### 修复
+
+- 用 `regctl index create` 重建不含 attestation 的镜像索引，
+  规避阿里云 ACR 对 OCI 1.1 空 blob 的 `unknown manifest class` 拒绝
+- `regctl --platforms` 需重复传参而非逗号分隔
+- 改用 GitHub Releases 下载 `regctl`（原先的安装方式已失效）
+
+### [0.2.0] - 2026-08-29
+
+#### 新增
+
+- 支持同步 multi-arch 镜像（amd64 / arm64）
+- 增加剔除 attestation manifest 的同步选项
+
+#### 修复
+
+- 修正目标仓库名中斜杠替换导致无法上传到阿里云的问题
+
+### [0.1.1] - 2025
+
+#### 新增
+
+- 新增 Harbor 仓库同步工作流
+
+### [0.1.0] - 2024-06-26
+
+#### 新增
+
+- 首个版本：基于 `skopeo` 将国外镜像同步至阿里云容器镜像服务
+
+---
+
+## 版本说明
+
+- **Unreleased** 段落由贡献者在 PR 中随手补充，维护者在发布时归入正式版本号
+- 每个版本的分类固定为：`新增` / `变更` / `弃用` / `移除` / `修复` / `安全`
+- 破坏性变更会在标题后标注 **BREAKING**
+
+[Unreleased]: https://github.com/nicholyx/action-sync-images/commits/main

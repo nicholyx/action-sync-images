@@ -1,0 +1,19 @@
+# CODEOWNERS
+#
+# 语法说明：https://docs.github.com/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+# 每一行的所有者会在对应文件被改动时自动收到 review 请求。
+
+# 兜底规则：所有文件的默认所有者
+*                       @nicholyx
+
+# 工作流文件直接持有镜像仓库凭证，任何改动都需要维护者亲自过目
+/.github/workflows/     @nicholyx
+
+# 安全策略与许可证属于治理文件，变更需维护者确认
+/SECURITY.md            @nicholyx
+/LICENSE                @nicholyx
+/CODEOWNERS             @nicholyx
+
+# 供贡献者参考：新增同步目标时，请同步更新这里列出的文档
+/docs/                  @nicholyx
+/README.md              @nicholyx

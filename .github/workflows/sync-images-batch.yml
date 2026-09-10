@@ -1,0 +1,100 @@
+# 工作流名称
+name: Sync-Batch
+# 工作流运行时显示名称
+run-name: ${{ github.actor }} - 批量同步镜像清单
+
+# 怎样触发工作流
+on:
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      lockfile:
+        description: '镜像清单文件路径'
+        required: true
+        default: 'images.lock.txt'
+      dest_registry:
+        description: '目标仓库前缀（留空则使用 ALIYUNCS_REGISTRY 或内置默认值）'
+        required: false
+        default: ''
+      dry_run:
+        description: '仅预览将要执行的命令，不实际推送'
+        required: false
+        type: boolean
+        default: false
+
+  # ---------------------------------------------------------------------------
+  # 定时同步（默认关闭）
+  #
+  # 打开后会每天自动把清单里的镜像同步一遍，好处是上游更新了 tag 也能跟上。
+  # 开启前请留意两点：
+  #   1. 会持续消耗 Actions 额度与镜像仓库存储
+  #   2. 清单里的 tag 若是可变的（如 latest），每次都会重新拉取
+  # 确认清楚后再取消下面的注释。
+  # ---------------------------------------------------------------------------
+  # schedule:
+  #   - cron: '17 18 * * *'
+
+# 只需要读代码，推送凭证通过 Secrets 注入
+permissions:
+  contents: read
+
+jobs:
+  sync-batch:
+    name: 批量同步清单中的镜像
+    runs-on: ubuntu-latest
+    env:
+      DEST_REGISTRY: ${{ inputs.dest_registry || vars.ALIYUNCS_REGISTRY || 'registry.cn-shenzhen.aliyuncs.com/nicholyx' }}
+    steps:
+      - name: Checkout Repos
+        uses: actions/checkout@v7
+
+      - name: Login to AliYuncs Registry
+        env:
+          REGISTRY_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          registry_host="${DEST_REGISTRY%%/*}"
+          echo "登录仓库：${registry_host}"
+          printf '%s' "${REGISTRY_PASSWORD}" | docker login "${registry_host}" \
+            --username "${REGISTRY_USERNAME}" --password-stdin
+
+      - name: 执行批量同步
+        env:
+          LOCKFILE: ${{ inputs.lockfile }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          if [[ ! -f "$LOCKFILE" ]]; then
+            echo "::error::清单文件不存在：${LOCKFILE}"
+            exit 1
+          fi
+
+          # 提前统计一下有多少条有效条目，方便在日志里先给个预期
+          image_count="$(grep -vcE '^\s*(#|$)' "$LOCKFILE" || true)"
+          echo "清单 ${LOCKFILE} 中共有 ${image_count} 个镜像"
+
+          if [[ "$image_count" -eq 0 ]]; then
+            echo "::error::清单文件中没有任何启用的镜像条目（是否全被注释掉了？）"
+            exit 1
+          fi
+
+          args=(--file "$LOCKFILE" --dest "$DEST_REGISTRY" --report-dir ./reports)
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+
+          ./scripts/sync.sh "${args[@]}"
+
+      - name: 上传同步报告
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sync-report-batch
+          path: reports/
+          retention-days: 30
+          if-no-files-found: ignore

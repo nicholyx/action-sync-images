@@ -4,34 +4,40 @@ name: learn-github-actions
 run-name: ${{ github.actor }} is learning GitHub Actions
 # 怎样触发工作流
 on:
-# push:
-#   branches: [ "main" ]
-# pull_request:
-#   branches: [ "main" ]
+  # push:
+  #   branches: [ "main" ]
+  # pull_request:
+  #   branches: [ "main" ]
 
- # Allows you to run this workflow manually from the Actions tab
- workflow_dispatch:
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
 
 # 工作流程任务（通常含有一个或多个步骤）
 jobs:
   # 工作任务名称
   check-bats-version:
-    # 将作业配置为在最新版本的Ubuntu Linux运行程序上运行, 注意此处不是Docker Hub中的ubuntu:latest, 而是Github中自己的虚拟主机。
+    # 将作业配置为在最新版本的 Ubuntu Linux 运行程序上运行。
+    # 注意此处不是 Docker Hub 中的 ubuntu:latest，而是 GitHub 中自己的虚拟主机。
     runs-on: ubuntu-latest
     # 操作步骤
     steps:
-      # 使用 actions 脚本，例如，用于在工作流程中检出代码仓库的操作，即它允许你从存储库中检出（拉取）代码
-      - uses: actions/checkout@v3
-      # 使用 actions 脚本，创建一个 node 运行环境并使用with参数指定了版本为 14
-      - uses: actions/setup-node@v3
+      # 使用 actions 脚本，例如，用于在工作流程中检出代码仓库的操作，
+      # 即它允许你从存储库中检出（拉取）代码
+      - uses: actions/checkout@v7
+
+      # 使用 actions 脚本，创建一个 node 运行环境并使用 with 参数指定版本。
+      # 原先这里锁的是 node 14，该版本早已停止维护，GitHub Actions 的运行器
+      # 也不再支持对应的 action 版本（v3），工作流会在启动阶段直接失败。
+      - uses: actions/setup-node@v7
         with:
-          node-version: '14'
-      # 运行一段shell命令或者Shell脚本
+          node-version: '22'
+
+      # 运行一段 shell 命令或者 Shell 脚本
       - run: npm install -g bats
       - run: bats -v
       - run: |
           #!/usr/bin/env bash
-          echo -e "Hello, Github Actions!" 
-          whoami  
-          uname -a 
+          echo -e "Hello, Github Actions!"
+          whoami
+          uname -a
           ip addr

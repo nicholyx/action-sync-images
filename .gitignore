@@ -173,6 +173,9 @@ cython_debug/
 .pytest_cache
 .DS_Store
 
+# Qoder 编辑器本地配置
+.qoder/
+
 
 .models/
 .configs/settings.developer-*.yaml

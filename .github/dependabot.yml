@@ -1,0 +1,35 @@
+# Dependabot 配置
+#
+# 本项目没有语言层面的依赖包，唯一的依赖是工作流里引用的 GitHub Actions。
+# 让 Dependabot 盯着它们，可以及时拿到安全修复与新版本。
+#
+# 文档：https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+
+version: 2
+updates:
+  # 保持 .github/workflows/ 中引用的 Actions 处于最新版本
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Asia/Shanghai"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      # 生成的提交信息本身即符合约定式提交规范，CI 不会拦
+      prefix: "ci"
+      include: "scope"
+    # 把同一个 Actions 的主版本更新合并到一个 PR，避免 PR 数量爆炸
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    reviewers:
+      - "nicholyx"

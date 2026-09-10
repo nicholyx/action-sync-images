@@ -1,0 +1,25 @@
+# 默认由 git 自动识别文本文件，统一使用 LF
+* text=auto eol=lf
+
+# 显式声明常见文本类型的换行符，避免 Windows 贡献者提交 CRLF 造成无意义的 diff
+*.sh    text eol=lf
+*.bash  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.txt   text eol=lf
+.editorconfig text eol=lf
+.gitattributes text eol=lf
+
+# 二进制文件不做换行符转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.gz binary
+*.zip binary
+
+# 折叠生成的文件的 diff，让 review 更聚焦
+CHANGELOG.md linguist-generated=false

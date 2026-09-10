@@ -1,143 +1,341 @@
-
-### 0.前言简述
-描述：使用Github-Action或者Aliyun镜像服务同步镜像到个人DockerHub或者私有镜像仓库中
-
----
-
-### 1.使用Github Action优雅的同步国外镜像到个人DockerHub中
-描述: 由于国内上网环境的原因，在部署某些云原生应用时，通常会遇到镜像无法直接拉取，例如 `k8s.io、gcr.io、quay.io` 等国外仓库中的镜像，在最开始的做法是使用他人同步到dockerHub仓库中的此版本镜像，或者是采用国外的vps虚拟主机使用`docker pull/docker tag/docker push`命令的方式复制到dockerHub仓库，但是对于作者来说这两种都不是最优解，因为有可能他人没有同步到你所需要的版本或者说你根本就没有VPS，此时应该怎么办呢。
-
-虽然前面作者写了一篇【如何使用Aliyun容器镜像服务对海外gcr、quay仓库镜像进行镜像拉取构建?】的文章地址：
-https://mp.weixin.qq.com/s/oQ82YWYRnSIUp-RXLdNS8A 
-
-但是作者仍然觉得不够优雅，并且不能批量的同步，此处作者在使用Github-Action构建项目时，突发奇想为何不用Github Action+Skopeo工具来同步镜像呢，说做就做，遂有了此篇文章。
-
-
-Github项目地址(欢迎大家Fork): https://github.com/WeiyiGeek/action-sync-images/
-
-
-**操作流程:**
-Step 1.登录Gitub，点击右上角`+`,然后创建一个名为`action-sync-images`的Github仓库。
-
-![weiyigeek.top-创建Github仓库图](https://img.weiyigeek.top/2023/5/20230727092416.png)
-
-
-Step 2.首先点击仓库里中的settins菜单，选择安全选项卡，点击Action，然后将会进入到 `Actions secrets and variables`，此时为了账号密码，我们需要提前设置我们Docker hub登录的账号密码到项目的secrets中（PS: fork了此项目的朋友可以自行将对应DocekrHub设置为自己的账号密码）。
-
-![weiyigeek.top-创建action使用的secrets图](https://img.weiyigeek.top/2023/5/20230727094133.png)
-
-
-Step 3.然后点击仓库里中的Action菜单，在选择一个 simple workflows 将会为我们创建一个新的工作流文件或者在项目根目录自行创建一个`.github/workflows/sync-images-dockerHub-example.yaml`目录文件。
-
-![weiyigeek.top-快速创建 simple workflows 图](https://img.weiyigeek.top/2023/5/20230727092651.png)
-
-
-Step 4.此处我们拉取kubernetes 最新的 V1.27.4 版本，使用kubeadm搭建集群此时我们要在Github Action中使用skopeo工具将`registry.k8s.io`仓库中的镜像同步到docker.io，执行下述shell命令，我们提前获取所需镜像并拼接拷贝命令，若需拷贝到自己的hub仓库请执行自行修改`DOCKER_HUBUSERURL`，此处我dockerhub用户名是`weiyigeek`。
-```bash
-K8SVERSION=1.27.4
-DOCKER_HUBUSERURL=docker.io/weiyigeek
-kubeadm config images list --kubernetes-version=${K8SVERSION} 2>/dev/null > K8sv1.27.4.txt
-for i in `cat K8sv1.27.4.txt`;do
-  echo skopeo copy --all docker://${i} docker://${DOCKER_HUBUSERURL}/${i##*/}
-done
-
-# 执行结果:
-skopeo copy --all docker://registry.k8s.io/kube-apiserver:v1.27.4 docker://docker.io/weiyigeek/kube-apiserver:v1.27.4
-skopeo copy --all docker://registry.k8s.io/kube-controller-manager:v1.27.4 docker://docker.io/weiyigeek/kube-controller-manager:v1.27.4
-skopeo copy --all docker://registry.k8s.io/kube-scheduler:v1.27.4 docker://docker.io/weiyigeek/kube-scheduler:v1.27.4
-skopeo copy --all docker://registry.k8s.io/kube-proxy:v1.27.4 docker://docker.io/weiyigeek/kube-proxy:v1.27.4
-skopeo copy --all docker://registry.k8s.io/pause:3.9 docker://docker.io/weiyigeek/pause:3.9
-skopeo copy --all docker://registry.k8s.io/etcd:3.5.7-0 docker://docker.io/weiyigeek/etcd:3.5.7-0
-skopeo copy --all docker://registry.k8s.io/coredns/coredns:v1.10.1 docker://docker.io/weiyigeek/coredns:v1.10.1
-
-```
-
-Step 5.将上述执行结果放置在`Use Skopeo Tools Sync Image to Docker Hub`子步骤下，然后将下述工作流的脚本复制粘贴到`sync-images-dockerHub-example.yaml`文件中，然后点击`commit changes`进行提交即可，注意下面是使用skopeo工具进行同步，为啥要使用此工具可以参考作者的【如何使用Skopeo做一个优雅的镜像搬运工】此篇文章地址: https://mp.weixin.qq.com/s/_r9WLMAIbOFEzj7-OWPWDw。
-
-```bash
-# 工作流名称
-name: Sync-Images-to-DockerHub-Example
-# 工作流运行时显示名称
-run-name: ${{ github.actor }} is Sync Images to DockerHub.
-# 怎样触发工作流
-on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
-
-# 工作流程任务（通常含有一个或多个步骤）
-jobs:
-  syncimages:
-    runs-on: ubuntu-latest
-    steps:
-    - name: Checkout Repos
-      uses: actions/checkout@v3
-      
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v2.9.1
-
-    - name: Login to Docker Hub
-      uses: docker/login-action@v2.2.0
-      with:
-        username: ${{ secrets.DOCKER_USERNAME }}
-        password: ${{ secrets.DOCKER_PASSWORD }}
-        logout: false
-    
-    # 使用shell命令批量同步所需的镜像到dockerHub中
-    - name: Use Skopeo Tools Sync Image to Docker Hub
-      run: |
-        #!/usr/bin/env bash
-        skopeo copy --all docker://registry.k8s.io/kube-apiserver:v1.27.4 docker://docker.io/weiyigeek/kube-apiserver:v1.27.4
-        skopeo copy --all docker://registry.k8s.io/kube-controller-manager:v1.27.4 docker://docker.io/weiyigeek/kube-controller-manager:v1.27.4
-        skopeo copy --all docker://registry.k8s.io/kube-scheduler:v1.27.4 docker://docker.io/weiyigeek/kube-scheduler:v1.27.4
-        skopeo copy --all docker://registry.k8s.io/kube-proxy:v1.27.4 docker://docker.io/weiyigeek/kube-proxy:v1.27.4
-        skopeo copy --all docker://registry.k8s.io/pause:3.9 docker://docker.io/weiyigeek/pause:3.9
-        skopeo copy --all docker://registry.k8s.io/etcd:3.5.7-0 docker://docker.io/weiyigeek/etcd:3.5.7-0
-        skopeo copy --all docker://registry.k8s.io/coredns/coredns:v1.10.1 docker://docker.io/weiyigeek/coredns:v1.10.1
-```
-
-![weiyigeek.top-sync-images-dockerHub-example图](https://img.weiyigeek.top/2023/5/20230727103541.png)
-
-
-Step 6.commit提交后将会触发工作流执行，此时我们回到仓库的action页面，点击如下图所示的，查看此工作流执行情况，是否有同步失败的情况。
-
-![weiyigeek.top-查看工作流执行情况图](https://img.weiyigeek.top/2023/5/20230727103839.png)
-
-Step 7.最后登录我的Docker Hub ( https://hub.docker.com/r/weiyigeek/ )验证是否已经同步过来, 可以从下图看到已经同步过来了。此后我们便可以使用 `docker pull` 命令或者是 `ctr image pull` 命令拉取镜像即可。
-
-![weiyigeek.top-验证镜像同步图](https://img.weiyigeek.top/2023/5/20230727105454.png)
-
-
-温馨提示: 默认`Docker Hub`我们创建的账号都是免费计划，虽然没有空间的大小限制，但是有下载次数以及下载速度的限制，所以有条件的尽量自行使用内部私有镜像仓库。
-
-至此，使用Github Action + Skopeo 工具优雅的同步镜像到dockerHub中完毕!
-
-<br/>
-
-### 2.使用Aliyun容器镜像服务拉取同步
-
-如何使用Aliyun容器镜像服务对海外gcr、quay仓库镜像进行镜像拉取构建?
-
-参考文章：https://mp.weixin.qq.com/s/oQ82YWYRnSIUp-RXLdNS8A
-
-```bash
-k8s.gcr.io/sig-storage/nfs-subdir-external-provisioner  > registry.cn-hangzhou.aliyuncs.com/weiyigeek/nfs-subdir-external-provisioner:v4.0.2
-
-gcr.io/kaniko-project/executor:latest ->  registry.cn-hangzhou.aliyuncs.com/weiyigeek/kaniko-executor:latest
-```
-
----
-
-<span style="color:red">温馨提示</span>：微信小程序【极客全栈修炼】上线了，可以直接在微信中浏览唯一极客技术博客（ https://blog.weiyigeek.top ）中的相关文章，涉及网络安全、系统运维、应用开发、物联网实战、全栈文章，希望和大家一起学习进步，欢迎浏览交流！  
-
 <div align="center">
-  <img src="https://www.weiyigeek.top/img/share.jpg" alt="个人主页站点-微信公众号-微信小程序【极客全栈修炼】" />
+
+# action-sync-images
+
+**借用 GitHub Actions 当免费的海外中转机，把拉不动的镜像搬回国内仓库。**
+
+不需要 VPS，不需要服务器，不依赖别人同步好的镜像。
+
+[![CI](https://github.com/nicholyx/action-sync-images/actions/workflows/ci.yml/badge.svg)](https://github.com/nicholyx/action-sync-images/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+[![GitHub stars](https://img.shields.io/github/stars/nicholyx/action-sync-images?style=social)](https://github.com/nicholyx/action-sync-images/stargazers)
+
+[快速开始](#快速开始) · [使用文档](docs/USAGE.md) · [工作原理](docs/ARCHITECTURE.md) · [排错手册](docs/TROUBLESHOOTING.md) · [贡献指南](CONTRIBUTING.md)
+
 </div>
 
+---
 
+## 这是什么
 
+国内集群要拉 `registry.k8s.io`、`gcr.io`、`quay.io`、`ghcr.io` 上的镜像，往往会卡在网络这一关。
 
+常见的三种绕法各有各的麻烦：用别人同步好的镜像，版本捏在别人手里；买台海外 VPS 做中转，要花钱还要维护；用云厂商的镜像服务，单次操作、不便批量、也进不了版本管理。
+
+这个项目走第四条路：**把 GitHub Actions 当作一台免费的临时中转机**。
+
+运行器在海外，能直接访问所有上游仓库。你只要点一下按钮，它就把镜像从一个 registry 搬到另一个 registry。全程不需要你拥有任何服务器。
+
+```text
+  registry.k8s.io/coredns/coredns:v1.11.1
+                  │
+                  │  GitHub Actions（海外运行器）
+                  │  skopeo / regctl 搬运
+                  ▼
+  registry.cn-shenzhen.aliyuncs.com/nicholyx/registry.k8s.io_coredns_coredns:v1.11.1
+                  │
+                  ▼
+            你的国内集群
+```
+
+---
+
+## 特性
+
+- **零基础设施** —— 不需要 VPS、不需要服务器，只需要一个 GitHub 账号
+- **完整保留多架构** —— amd64 / arm64 一起搬，不会只同步当前平台
+- **处理 attestation** —— 专门的路径解决阿里云 ACR 拒绝 OCI 1.1 空 blob 的问题（`unknown manifest class`）
+- **批量同步** —— 一次填多个镜像，或用清单文件维护一整套镜像集合
+- **失败不中断** —— 批量同步时单个镜像失败不影响其余镜像，最后统一汇总
+- **结果一目了然** —— 运行结束直接生成结果表格，无需翻日志
+- **可在本地复现** —— 同一套逻辑封装成 `scripts/sync.sh`，本地也能跑，支持 `--dry-run`
+- **目标仓库可配置** —— 换命名空间或区域不需要改代码
+- **静态检查齐全** —— actionlint + yamllint + shellcheck + 提交信息规范，`./scripts/lint.sh` 一键跑完
+
+---
+
+## 快速开始
+
+### 1. 配置凭证
+
+进入仓库 `Settings` → `Secrets and variables` → `Actions`，添加阿里云容器镜像服务的凭证：
+
+| Secret | 值 |
+| --- | --- |
+| `DOCKER_USERNAME` | 阿里云账号 |
+| `DOCKER_PASSWORD` | 镜像仓库的**固定密码**（不是阿里云登录密码） |
+
+> 用 Harbor 的话改配 `HARBOR_REGISTRY` / `HARBOR_USERNAME` / `HARBOR_PASSWORD`，详见 [使用文档](docs/USAGE.md#第一步准备凭证)。
+
+### 2. 触发同步
+
+打开 **Actions** → 左侧选 `Sync-Images-to-AliYuncs` → **Run workflow** → 填入源镜像：
+
+```text
+registry.k8s.io/pause:3.9
+```
+
+### 3. 拉取验证
+
+```bash
+docker pull registry.cn-shenzhen.aliyuncs.com/nicholyx/registry.k8s.io_pause:3.9
+```
+
+就这样。整个流程不需要你写一行代码。
+
+---
+
+## 三种同步方式
+
+### ① 单个镜像
+
+在 `Sync-Images-to-AliYuncs` 的 `images_src` 里填一个镜像，适合临时需要。
+
+### ② 一次多个镜像
+
+`images_src` 支持**换行、逗号、分号**分隔，可以混用：
+
+```text
+registry.k8s.io/kube-apiserver:v1.31.0
+registry.k8s.io/kube-controller-manager:v1.31.0
+registry.k8s.io/kube-scheduler:v1.31.0
+```
+
+或写成一行：`nginx:1.27, redis:7.4, registry.k8s.io/pause:3.9`
+
+重复的会自动去重；**某个镜像失败不会影响其它镜像**，结束后给你一张汇总表。
+
+### ③ 按清单批量同步
+
+适合维护「某个 k8s 版本的整套组件」这类固定集合。
+
+编辑仓库根目录的 [`images.lock.txt`](images.lock.txt)，然后触发 `Sync-Batch` 工作流即可。
+
+> 💡 清单生成小技巧：`kubeadm config images list --kubernetes-version=v1.31.0` 的输出可以直接粘进去。
+
+---
+
+## 参数速查
+
+### Sync-Images-to-AliYuncs（主力工作流）
+
+| 参数 | 必填 | 默认 | 说明 |
+| --- | :---: | --- | --- |
+| `images_src` | ✅ | — | 源镜像，可多个。不需要 `docker://` 前缀 |
+| `strip_attestation` | | `false` | 剔除 attestation manifest。报 `unknown manifest class` 时勾它 |
+| `platforms` | | 自动探测 | 保留的平台，如 `linux/amd64,linux/arm64`。仅在上项勾选时生效 |
+| `dry_run` | | `false` | 只打印命令不推送，用来确认目标地址 |
+
+### Sync-Images-to-Harbor
+
+| 参数 | 必填 | 默认 | 说明 |
+| --- | :---: | --- | --- |
+| `images_src` | ✅ | — | 源镜像，支持批量 |
+| `images_dest` | ✅ | — | 目标路径，拼在 `HARBOR_REGISTRY` 之后，如 `library/nginx:1.27` |
+| `dry_run` | | `false` | 同上 |
+
+### Sync-Batch
+
+| 参数 | 必填 | 默认 | 说明 |
+| --- | :---: | --- | --- |
+| `lockfile` | ✅ | `images.lock.txt` | 清单文件路径 |
+| `dest_registry` | | 见说明 | 目标仓库前缀，留空则用 `ALIYUNCS_REGISTRY` 变量或内置默认值 |
+| `dry_run` | | `false` | 同上 |
+
+> 📖 每个参数的深入说明、边界情况与示例，见 [使用文档](docs/USAGE.md#输入参数详解)。
+
+---
+
+## 目标镜像名是怎么变的
+
+这是使用中最容易困惑的一点，**建议动手前先看一眼**。
+
+默认采用「压平」规则，因为**阿里云容器镜像服务的个人版不支持多级仓库路径**：
+
+```text
+源镜像：registry.k8s.io/coredns/coredns:v1.11.1
+        └──────┬──────┘ └──┬──┘ └──┬──┘
+               └───────────┴───────┴──→ / 全部替换为 _
+                              ▼
+目标：  <你的仓库前缀>/registry.k8s.io_coredns_coredns:v1.11.1
+```
+
+保留 registry 域名是为了避免不同来源的同名镜像互相覆盖——`registry.k8s.io/pause` 和 `docker.io/pause` 会落到两个不同的仓库。
+
+不确定会变成什么样？**勾上 `dry_run` 跑一次**，日志里会打印完整的命令。
+
+自建 Harbor 支持多级路径，用的是精确模式（不做压平）：
+
+```text
+源：nginx:1.27  →  目标：harbor.example.com/library/nginx:1.27
+```
+
+---
+
+## 常见场景
+
+<details>
+<summary><b>同步带 attestation 的镜像（报 <code>unknown manifest class</code>）</b></summary>
+
+勾选 `strip_attestation`，`platforms` 留空（会自动探测）：
+
+```text
+images_src:        ghcr.io/netbirdio/netbird:0.28.0
+strip_attestation: ✅
+```
+
+常见触发者是 `ghcr.io/netbirdio/*`，以及任何用 BuildKit 开启了 provenance 的项目。原理见 [ARCHITECTURE.md](docs/ARCHITECTURE.md#深入理解-attestation-问题)。
+
+</details>
+
+<details>
+<summary><b>源镜像只有单平台（报 <code>platform not found</code>）</b></summary>
+
+勾选 `strip_attestation`，并显式指定平台：
+
+```text
+images_src:        some.registry/only-amd64:1.0
+strip_attestation: ✅
+platforms:         linux/amd64
+```
+
+先确认源镜像有哪些平台：
+
+```bash
+skopeo inspect --raw docker://<源镜像> | jq -r '.manifests[]?.platform | "\(.os)/\(.architecture)"'
+```
+
+</details>
+
+<details>
+<summary><b>换一个阿里云命名空间 / 区域</b></summary>
+
+不用改代码。`Settings` → `Secrets and variables` → `Actions` → **Variables**，新增：
+
+```text
+ALIYUNCS_REGISTRY = registry.cn-hangzhou.aliyuncs.com/your-namespace
+```
+
+登录地址会自动从它的第一段推导，所以换区域也只需改这一处。
+
+</details>
+
+<details>
+<summary><b>同步到 Docker Hub</b></summary>
+
+`sync.sh` 不限定目标仓库。复制一份工作流，把目标地址改成 `docker.io/你的用户名`，配上对应 Secrets 即可。
+
+> ⚠️ Docker Hub 免费账号有拉取速率限制，且公共仓库的镜像**对所有人可见**。
+
+</details>
+
+<details>
+<summary><b>在本地跑，不用 GitHub Actions</b></summary>
+
+```bash
+brew install skopeo regclient   # macOS
+
+# 先预览
+./scripts/sync.sh --src registry.k8s.io/pause:3.9 --dest registry.cn-shenzhen.aliyuncs.com/nicholyx --dry-run
+
+# 确认后正式同步（需先 docker login）
+./scripts/sync.sh --src registry.k8s.io/pause:3.9 --dest registry.cn-shenzhen.aliyuncs.com/nicholyx
+```
+
+`./scripts/sync.sh --help` 查看全部参数。
+
+</details>
+
+---
+
+## 项目结构
+
+```text
+.
+├── .github/workflows/
+│   ├── sync-images-aliyuncs.yml   同步到阿里云（主力）
+│   ├── sync-images-harbor.yml     同步到自建 Harbor
+│   ├── sync-images-batch.yml      按清单文件批量同步
+│   ├── ci.yml                     CI：静态检查 + 冒烟测试
+│   ├── labeler.yml                PR 自动打标签
+│   ├── stale.yml                  Issue/PR 过期管理
+│   ├── welcome.yml                欢迎首次贡献者
+│   └── release.yml                自动发布
+├── scripts/
+│   ├── sync.sh                    ★ 同步引擎（全项目唯一的逻辑实现）
+│   ├── lint.sh                    本地统一校验入口
+│   └── check-commit-msg.sh        提交信息规范校验
+├── docs/                          完整文档，见下方索引
+├── images.lock.txt                批量同步清单
+└── ...                            治理文件（LICENSE / CONTRIBUTING / SECURITY 等）
+```
+
+**一个设计要点：** 所有同步逻辑都在 `scripts/sync.sh` 里，工作流只负责登录、组装参数、调用脚本。这样本地和 CI 跑的是同一套代码，不会出现「CI 能跑本地不行」的漂移。
+
+---
+
+## 文档索引
+
+| 文档 | 内容 | 适合谁 |
+| --- | --- | --- |
+| [USAGE.md](docs/USAGE.md) | 完整使用指南：配置、参数、场景、验证 | 所有使用者 |
+| [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | 排错手册：错误速查表与逐项排查 | 遇到问题时 |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | 原理剖析：架构、流程、设计取舍 | 想读懂代码的人 |
+| [MAINTAINER_GUIDE.md](docs/MAINTAINER_GUIDE.md) | 维护者手册：日常、发布、应急 | 维护者 |
+| [BACKGROUND.md](docs/BACKGROUND.md) | 项目起源与原始教程归档 | 想了解来龙去脉 |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | 如何贡献：报 bug、提 PR、提交规范 | 想参与的人 |
+| [SECURITY.md](SECURITY.md) | 安全策略与威胁模型 | 关注安全的人 |
+| [CHANGELOG.md](CHANGELOG.md) | 更新日志 | 所有人 |
+
+---
+
+## 路线图
+
+### 已完成
+
+- [x] 同步到阿里云 ACR / 自建 Harbor
+- [x] 多架构镜像支持（保留完整索引）
+- [x] attestation 剔除路径
+- [x] 批量同步与清单文件
+- [x] 本地 CLI 与 `--dry-run`
+- [x] 完整的 CI 与自动化
+
+### 计划中
+
+- [ ] 支持为源镜像配置独立凭证（同步私有仓库镜像）
+- [ ] 同步结果的历史记录与趋势
+- [ ] 支持一次性推送到多个目标仓库
+- [ ] 可配置的超时与并发度
+
+有想法？欢迎[提 Issue](https://github.com/nicholyx/action-sync-images/issues/new/choose) 讨论。
+
+---
+
+## 贡献
+
+欢迎任何形式的参与——报 bug、补文档、提代码，甚至只是反馈「这段话说得看不懂」都是帮助。
+
+动手前请读一下 [CONTRIBUTING.md](CONTRIBUTING.md)，里面写清了提交信息规范、代码风格和 PR 流程。
+
+最简单的一条：**提交前跑一次 `./scripts/lint.sh`**，它能让你少推一轮 CI。
+
+首次贡献者会在 PR 下收到一份自动欢迎与上手提示。
+
+---
+
+## 致谢
+
+本项目的雏形衍生自 [WeiyiGeek/action-sync-images](https://github.com/WeiyiGeek/action-sync-images)，感谢原作者提供了最初的思路与教程，相关文章见 [BACKGROUND.md](docs/BACKGROUND.md)。
+
+同时感谢 [skopeo](https://github.com/containers/skopeo) 与 [regclient](https://github.com/regclient/regclient) —— 这个项目本质上是在编排这两个优秀的工具。
+
+---
+
+## 许可证
+
+[MIT](LICENSE)
+
+<div align="center">
+<sub>如果这个项目帮你省下了一台 VPS 的钱，欢迎点个 ⭐</sub>
+</div>
