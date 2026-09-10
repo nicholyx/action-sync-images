@@ -425,8 +425,13 @@ is_up_to_date() {
   local src="$1" dest="$2"
   local src_map dest_map src_norm dest_norm
 
-  src_map="$(platform_digest_map "$src")" || return 1
-  dest_map="$(platform_digest_map "$dest")" || return 1
+  # 这里刻意不判断 platform_digest_map 的退出码。
+  # set -o pipefail 下，只要管道中任一环节返回非零，整个管道就是失败的——
+  # 而 skopeo 完全可能在输出了正确内容之后仍返回非零（例如对个别平台打印警告）。
+  # 实测正是这一点让跳过从未生效：摘要明明一字不差，却因为退出码被判为「不一致」。
+  # 真正有意义的是**有没有拿到内容**，所以只看输出。
+  src_map="$(platform_digest_map "$src" || true)"
+  dest_map="$(platform_digest_map "$dest" || true)"
 
   if [[ "${SYNC_DEBUG:-}" == "1" ]]; then
     log_dim "  [debug] 源平台摘要: ${src_map:-<无>}"
@@ -441,11 +446,12 @@ is_up_to_date() {
     return 1
   fi
 
-  # 单平台镜像没有 manifests 字段，退化为比较规范化后的 manifest JSON
-  src_norm="$(skopeo inspect --raw "docker://${src}" 2>/dev/null | jq -S -c . 2>/dev/null)" || return 1
+  # 单平台镜像没有 manifests 字段，退化为比较规范化后的 manifest JSON。
+  # 同样只看内容而不看退出码，理由见上。
+  src_norm="$(skopeo inspect --raw "docker://${src}" 2>/dev/null | jq -S -c . 2>/dev/null || true)"
   [[ -n "$src_norm" ]] || return 1
 
-  dest_norm="$(skopeo inspect --raw "docker://${dest}" 2>/dev/null | jq -S -c . 2>/dev/null)" || return 1
+  dest_norm="$(skopeo inspect --raw "docker://${dest}" 2>/dev/null | jq -S -c . 2>/dev/null || true)"
   [[ -n "$dest_norm" ]] || return 1
 
   [[ "$src_norm" == "$dest_norm" ]]
