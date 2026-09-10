@@ -66,12 +66,35 @@
 
 ### 仓库功能开关
 
-| 功能 | 状态 | 说明 |
-| --- | --- | --- |
-| Issues | 需启用 | 提交反馈的主入口 |
-| Discussions | 建议启用 | 承接使用提问，避免 Issue 列表被问答淹没 |
-| Wiki | 可关闭 | 文档都在仓库的 `docs/` 里，Wiki 容易和代码脱节 |
-| Projects | 可关闭 | 单人维护时收益有限 |
+以下是当前的配置状态，可作为重建仓库或排查配置问题时的对照：
+
+| 功能 | 当前状态 | 说明 |
+| --- | :---: | --- |
+| Issues | ✅ 已启用 | 反馈主入口，配合 `.github/ISSUE_TEMPLATE/` 的表单使用 |
+| Discussions | ✅ 已启用 | 承接使用提问，避免 Issue 列表被问答淹没 |
+| Wiki | ⚠️ 待初始化 | 作为 GitHub 上的入口页，文档正文仍在 `docs/`（初始化方式见下） |
+| Projects | ✅ 已启用 | 单人维护时收益有限，可随时关闭 |
+| Secret scanning | ✅ 已启用 | 持续扫描仓库中的凭证泄露 |
+| Push protection | ✅ 已启用 | 推送含凭证的内容时直接拦截 |
+| Dependabot 告警 | ✅ 已启用 | 与自动安全更新一同开启 |
+| Topics | ✅ 已配置 | `docker` / `kubernetes` / `skopeo` 等 10 个主题标签 |
+| 分支保护 | ✅ 已配置 | 见上一节 |
+
+#### 初始化 Wiki
+
+GitHub 要求**先在网页端创建首个页面**，才会初始化 Wiki 的 git 仓库——这一步没有对应的 API，无法自动化：
+
+1. 打开 <https://github.com/nicholyx/action-sync-images/wiki>
+2. 点击 **Create the first page**
+3. 标题填 `Home`，内容写一句「文档正文在仓库的 `docs/` 目录」并用链接指过去
+4. 保存之后，就可以用命令行维护了：
+
+   ```bash
+   git clone https://github.com/nicholyx/action-sync-images.wiki.git
+   ```
+
+> 💡 **为什么不把文档正文放进 Wiki？**
+> Wiki 是一个独立的 git 仓库，改代码时很容易忘记同步；而 `docs/` 里的文档会随 PR 一起被 review（CODEOWNERS 也覆盖了该目录），不会出现文档与代码脱节的情况。Wiki 更适合作为入口页。
 
 > ⚠️ **如果本仓库仍是 fork**，Issues 默认是禁用的，且部分设置受限。需要先执行「Leave fork network」（见下文）。
 
