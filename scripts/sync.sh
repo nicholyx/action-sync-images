@@ -71,10 +71,21 @@ group_end() {
   fi
 }
 
-# 把消息登记为 GitHub Actions 的注解，会直接显示在 PR / 运行页面上
-gh_notice() { [[ -n "${GITHUB_ACTIONS:-}" ]] && printf '::notice::%s\n' "$1" >&2 || true; }
-gh_warning() { [[ -n "${GITHUB_ACTIONS:-}" ]] && printf '::warning::%s\n' "$1" >&2 || true; }
-gh_error() { [[ -n "${GITHUB_ACTIONS:-}" ]] && printf '::error::%s\n' "$1" >&2 || true; }
+# 把消息登记为 GitHub Actions 的注解，会直接显示在运行页面与 PR 上。
+# 本地运行时静默，不干扰正常输出。
+#
+# 这里刻意不写成「[[ ... ]] && printf ... || true」：
+# A && B || C 并不是 if-then-else —— B 执行失败时 C 同样会跑，
+# 静态检查的 SC2015 提示的正是这一点。用 if 表达意图更准确。
+gh_annotation() {
+  local level="$1" message="$2"
+  if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+    printf '::%s::%s\n' "$level" "$message" >&2
+  fi
+}
+gh_notice()  { gh_annotation notice  "$1"; }
+gh_warning() { gh_annotation warning "$1"; }
+gh_error()   { gh_annotation error   "$1"; }
 
 usage() {
   cat <<'EOF'
