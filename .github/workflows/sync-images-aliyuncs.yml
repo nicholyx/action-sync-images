@@ -77,6 +77,11 @@ jobs:
           # 可选：在仓库 Secrets 中配置 NOTIFY_WEBHOOK 即可启用结果通知。
           # 未配置时为空字符串，脚本不会发送任何通知。
           NOTIFY_WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK }}
+          # 可选：同步私有源镜像时，在仓库 Secrets 中配置这两个。
+          # 用环境变量而不是命令行参数传：参数既对同机进程可见，也会被下面那句
+          # 「执行：./scripts/sync.sh ${args[*]}」原样打进日志。
+          SYNC_SRC_USERNAME: ${{ secrets.SRC_REGISTRY_USERNAME }}
+          SYNC_SRC_PASSWORD: ${{ secrets.SRC_REGISTRY_PASSWORD }}
         run: |
           #!/usr/bin/env bash
           set -euo pipefail

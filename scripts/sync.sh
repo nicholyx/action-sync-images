@@ -40,6 +40,20 @@ WRITE_LOCK=""
 declare -a SOURCE_IMAGES=()
 declare -a SOURCE_FILES=()
 
+# 源仓库凭证。
+#
+# 源与目标通常是两套**独立**的凭证：目标是自己的仓库，源是别人的系统。
+# 把目标仓库的凭证发往源仓库，等于把「往我仓库推送」的权限交给一个你并不信任的
+# 第三方，因此这里刻意不提供「复用一个 --username」的捷径。
+#
+# 凭证只写进临时认证文件，绝不进命令行——命令行参数对同机其他进程可见（ps），
+# 而 --dry-run 还会把命令原样打印出来。
+SRC_USERNAME=""
+SRC_PASSWORD=""
+SRC_REGISTRY=""
+# 由 setup_src_auth 生成的临时认证文件（600 权限），脚本退出时删除
+SRC_AUTHFILE=""
+
 # 镜像筛选。二者都是 ERE 正则，作用于源镜像的完整引用。
 FILTER_REGEX=""
 EXCLUDE_REGEX=""
@@ -157,6 +171,19 @@ sync.sh —— 容器镜像同步引擎
       --tls-verify <bool>  是否校验 registry 的 TLS 证书，默认 true。
                            自建 HTTP 仓库（如本地 registry:2）填 false
 
+源仓库凭证（同步私有镜像时使用）：
+      --src-username <名>  源仓库的用户名，需与 --src-password 同时提供
+      --src-password <密>  源仓库的密码或 Token
+      --src-registry <地址>
+                           凭证对应的源仓库地址。不指定时会自动从源镜像推导，
+                           并把结果列在日志里；如果清单里混有公开仓库，
+                           建议显式指定，避免凭证被发往并不需要的仓库
+
+      以上三项也可用环境变量传入：SYNC_SRC_USERNAME / SYNC_SRC_PASSWORD /
+      SYNC_SRC_REGISTRY。CI 等自动化场景**应当**用环境变量——命令行参数
+      对同机其他进程可见，也容易被调用方的日志语句原样打印出去。
+      无论走哪条路，凭证都不会出现在本脚本的日志里（写入临时的 600 权限文件）
+
 性能与可靠性：
   -c, --concurrency <N>    并发同步的镜像数量，默认 1（串行）。
                            批量同步几十个镜像时调大能显著缩短总耗时，
@@ -245,6 +272,16 @@ parse_args() {
       --tls-verify)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         TLS_VERIFY="$2"; shift 2 ;;
+      --src-username)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        SRC_USERNAME="$2"; shift 2 ;;
+      --src-password)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        SRC_PASSWORD="$2"; shift 2 ;;
+      --src-registry)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        SRC_REGISTRY="${2#docker://}"; SRC_REGISTRY="${SRC_REGISTRY%/}"
+        shift 2 ;;
       -c|--concurrency)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         CONCURRENCY="$2"; shift 2 ;;
@@ -383,8 +420,37 @@ skopeo_inspect_raw() {
   if [[ "$TLS_VERIFY" == "false" ]]; then
     cmd+=(--tls-verify=false)
   fi
+  # 私有源的探测同样需要凭证。漏掉这里会重演「跳过判定静默失效」那类问题：
+  # inspect 拿到 401，跳过判定一律判为「需要同步」，增量能力形同虚设。
+  if [[ -n "$SRC_AUTHFILE" ]]; then
+    cmd+=(--authfile "$SRC_AUTHFILE")
+  fi
   cmd+=("docker://${ref}")
   "${cmd[@]}"
+}
+
+# 从镜像引用中提取 registry 主机名。
+#
+# 规则与 OCI 的引用解析一致：只有第一段看起来像主机名时才当作 registry，
+# 否则视为 Docker Hub。这里不能简单地取「第一个 / 之前的部分」——
+# nginx:1.27 里的冒号是 tag 分隔符而不是端口，那样会把它误判成主机名。
+registry_host_of() {
+  local ref="$1" first
+  ref="${ref#docker://}"
+  ref="${ref%%@*}"
+
+  # 不含 / 的引用必然来自 Docker Hub（如 nginx:1.27、library/nginx:1.27）
+  if [[ "$ref" != */* ]]; then
+    printf 'docker.io'
+    return 0
+  fi
+
+  first="${ref%%/*}"
+  if [[ "$first" == *.* || "$first" == *:* || "$first" == "localhost" ]]; then
+    printf '%s' "$first"
+  else
+    printf 'docker.io'
+  fi
 }
 
 # 探测源镜像包含哪些平台。
@@ -499,6 +565,11 @@ sync_via_skopeo() {
 
   if [[ "$TLS_VERIFY" == "false" ]]; then
     cmd+=(--src-tls-verify=false --dest-tls-verify=false)
+  fi
+
+  # 只传给源：目标是自己的仓库，凭证由 docker login 或 CI 的 Secrets 提供
+  if [[ -n "$SRC_AUTHFILE" ]]; then
+    cmd+=(--src-authfile "$SRC_AUTHFILE")
   fi
 
   cmd+=("docker://${src}" "docker://${dest}")
@@ -752,6 +823,82 @@ apply_filters() {
   fi
 
   FILTERED_OUT_COUNT="$excluded"
+}
+
+# ---------------------------------------------------------------------------
+# 源仓库凭证
+#
+# 两个刻意的设计：
+#
+# 1. **凭证不经过命令行。** 命令行参数对同机其他进程可见（ps aux），
+#    而 --dry-run 还会把命令原样打印出来。所以凭证只写进临时文件，
+#    再用 --src-authfile 交给 skopeo。
+# 2. **不与目标仓库复用凭证。** 源和目标是两套独立的东西：目标是你自己的仓库，
+#    源是别人的系统。把目标仓库的凭证发往源仓库，等于把「往我仓库推送」的权限
+#    交给一个你并不信任的第三方，哪怕实践中两者偶尔相同也不该默认如此。
+# ---------------------------------------------------------------------------
+setup_src_auth() {
+  [[ -n "$SRC_USERNAME" || -n "$SRC_PASSWORD" || -n "$SRC_REGISTRY" ]] || return 0
+
+  if [[ -n "$SRC_REGISTRY" && -z "$SRC_USERNAME" ]]; then
+    die "--src-registry 需要与 --src-username / --src-password 一起使用"
+  fi
+
+  if [[ -z "$SRC_USERNAME" || -z "$SRC_PASSWORD" ]]; then
+    die "--src-username 与 --src-password 必须同时提供（当前只给了一个）"
+  fi
+
+  local -a hosts=()
+  local img
+  if [[ -n "$SRC_REGISTRY" ]]; then
+    hosts=("$SRC_REGISTRY")
+  else
+    for img in "${SOURCE_IMAGES[@]}"; do
+      hosts+=("$(registry_host_of "$img")")
+    done
+  fi
+
+  # 去重。用 sort 而不是关联数组，同样是为了兼容 macOS 自带的 bash 3.2。
+  local -a uniq_hosts=()
+  local h
+  while IFS= read -r h; do
+    if [[ -n "$h" ]]; then
+      uniq_hosts+=("$h")
+    fi
+  done < <(printf '%s\n' "${hosts[@]}" | sort -u)
+
+  # TMPDIR 常以 / 结尾，拼路径前先去掉，否则会生成 // 这种双斜杠路径
+  local tmpdir="${TMPDIR:-/tmp}"
+  tmpdir="${tmpdir%/}"
+
+  SRC_AUTHFILE="$(mktemp "${tmpdir}/sync-src-auth.XXXXXX")" || die "无法创建临时认证文件"
+  chmod 600 "$SRC_AUTHFILE"
+
+  # auth.json 里的凭据是 base64 编码的「用户名:密码」，且不能带换行
+  local auth_b64
+  auth_b64="$(printf '%s:%s' "$SRC_USERNAME" "$SRC_PASSWORD" | base64 | tr -d '\n')"
+
+  # 交给 jq 拼 JSON：手工拼接的话，用户名里的引号或反斜杠会直接破坏文件结构
+  if ! printf '%s\n' "${uniq_hosts[@]}" | jq -R . | jq -s \
+      --arg auth "$auth_b64" \
+      '{auths: (map({(.): {auth: $auth}}) | add)}' > "$SRC_AUTHFILE"; then
+    die "生成源仓库认证文件失败"
+  fi
+
+  # 只报「配了哪些仓库」。用户名不打印，密码更不打印。
+  log_info "源仓库凭证已装载（${#uniq_hosts[@]} 个）：${uniq_hosts[*]:-}"
+  if [[ -z "$SRC_REGISTRY" && "${#uniq_hosts[@]}" -gt 1 ]]; then
+    log_warn "凭证被应用到多个源仓库。若不希望如此，请用 --src-registry 指定其中之一"
+  fi
+}
+
+# 退出时清理临时文件。
+# 用函数而不是把命令内联进 trap，是为了让以后新增的清理项只改这一处，
+# 不必再去核对 trap 那行字符串的展开时机。
+cleanup() {
+  [[ -n "${SRC_AUTHFILE:-}" ]] && rm -f "$SRC_AUTHFILE"
+  [[ -n "${WORK_DIR:-}" ]] && rm -rf "$WORK_DIR"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1302,6 +1449,22 @@ write_report() {
 main() {
   parse_args "$@"
 
+  # 环境变量作为兜底，命令行参数优先。
+  #
+  # CI 里尤其要用环境变量：命令行参数既对同机其他进程可见（ps aux），
+  # 也容易被调用方的日志语句原样打印出去——工作流里就有一句
+  # 「执行：./scripts/sync.sh ${args[*]}」。凭证不该经过那条路。
+  if [[ -z "$SRC_USERNAME" && -n "${SYNC_SRC_USERNAME:-}" ]]; then
+    SRC_USERNAME="$SYNC_SRC_USERNAME"
+  fi
+  if [[ -z "$SRC_PASSWORD" && -n "${SYNC_SRC_PASSWORD:-}" ]]; then
+    SRC_PASSWORD="$SYNC_SRC_PASSWORD"
+  fi
+  if [[ -z "$SRC_REGISTRY" && -n "${SYNC_SRC_REGISTRY:-}" ]]; then
+    SRC_REGISTRY="${SYNC_SRC_REGISTRY#docker://}"
+    SRC_REGISTRY="${SRC_REGISTRY%/}"
+  fi
+
   if [[ ${#DEST_REGISTRIES[@]} -eq 0 && -z "$DEST_EXACT" ]]; then
     log_error "缺少必填参数：--dest 或 --dest-exact"
     echo "" >&2
@@ -1364,6 +1527,9 @@ main() {
   # 筛选放在 collect_images 之后、其余校验之前：
   # --dest-exact 要求「只有一个源镜像」，而筛选后的数量才是有意义的数量
   apply_filters
+  # 凭证依赖最终的镜像列表（未指定 --src-registry 时要从里面推导 host），
+  # 因此放在筛选之后——被筛掉的镜像不该影响凭证要发给谁
+  setup_src_auth
 
   # 这里看的是「筛选之后」的数量：--dest-exact 的约束来自多个镜像会撞到
   # 同一个目标地址，而筛掉之后只剩一个就不会撞
@@ -1409,8 +1575,9 @@ main() {
   fi
 
   WORK_DIR="$(mktemp -d)"
-  # shellcheck disable=SC2064  # 此处就是要在此刻展开 WORK_DIR 的值
-  trap "rm -rf '${WORK_DIR}'" EXIT
+  # 用函数而不是内联字符串：退出时要清理的不止 WORK_DIR（还有源仓库认证文件），
+  # 写成函数后新增清理项只改 cleanup 一处，不必再核对这行的展开时机
+  trap cleanup EXIT
 
   local start end
   start="$(date +%s)"

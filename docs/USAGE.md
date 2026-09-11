@@ -89,6 +89,36 @@
 
 设置后工作流会自动使用它；不设置则使用内置默认值。登录地址会从该变量的第一段自动推导，所以换区域（比如从深圳换到杭州）也只需要改这一个地方。
 
+### 可选：同步私有仓库的镜像
+
+上面几条讲的都是**同步到**哪里，这一条讲的是**从哪里同步**。
+
+公司内部 Harbor、私有 GHCR 包这类需要认证的源，匿名拉取会在第一步就 401。配置一对凭证即可：
+
+| Secret | 值 |
+| --- | --- |
+| `SRC_REGISTRY_USERNAME` | 源仓库的用户名 |
+| `SRC_REGISTRY_PASSWORD` | 源仓库的密码或 Token |
+
+配置后三个同步工作流都会自动带上它们，无需改动任何工作流文件。
+
+> ⚠️ **源与目标的凭证是分开的两套。** 目标是你的仓库，源是别人的系统——把目标仓库的凭证发往源仓库，等于把「往我仓库推送」的权限交给一个你并不信任的第三方。所以这里刻意没有「复用已有凭证」的选项，哪怕实践中两者偶尔相同。
+
+凭证会被发往哪个仓库？不指定时脚本从源镜像自动推导，并把结果列在日志里：
+
+```text
+[信息] 源仓库凭证已装载（1 个）：harbor.internal.example.com
+```
+
+如果清单里**混有公开镜像**（比如同时有 `docker.io` 和内部 Harbor），建议固定到一个仓库。否则凭证会被发往所有源仓库，其中并不需要凭证的那些反而可能因为凭证不匹配而失败：
+
+```yaml
+env:
+  SYNC_SRC_REGISTRY: harbor.internal.example.com
+```
+
+> 💡 凭证**不会出现在命令行或日志里**。脚本把它写进一个 600 权限的临时文件，用 `--src-authfile` 交给 skopeo——命令行参数对同机其他进程可见（`ps aux`），也容易被调用方的日志语句原样打印出去。该文件在脚本退出时删除。
+
 ---
 
 ## 第二步：同步第一个镜像
@@ -518,6 +548,12 @@ brew install skopeo regclient
   --src ghcr.io/netbirdio/netbird:0.28.0 \
   --dest registry.cn-shenzhen.aliyuncs.com/nicholyx \
   --strip-attestation
+
+# 私有源。凭证走环境变量比走命令行更稳妥——命令行参数对同机其他进程可见
+SYNC_SRC_USERNAME=alice SYNC_SRC_PASSWORD='…' \
+  ./scripts/sync.sh \
+    --src harbor.internal.example.com/library/nginx:1.27 \
+    --dest registry.cn-shenzhen.aliyuncs.com/nicholyx
 ```
 
 ### 同步到自建的 HTTP registry
