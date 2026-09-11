@@ -35,6 +35,18 @@ WRITE_LOCK=""
 declare -a SOURCE_IMAGES=()
 declare -a SOURCE_FILES=()
 
+# 镜像筛选。二者都是 ERE 正则，作用于源镜像的完整引用。
+FILTER_REGEX=""
+EXCLUDE_REGEX=""
+
+# 与 SOURCE_IMAGES 按下标对齐：第 i 项非空表示该镜像被排除，内容为排除原因。
+# 用「标记」而不是「从数组里删掉」是为了保住下标——下标同时决定了结果文件的
+# 序号，删元素会让序号错位，结果表的顺序也就跟输入对不上了。
+declare -a EXCLUDE_REASONS=()
+
+# 被筛掉的镜像数量，由 apply_filters 填写，用于日志中的数量提示
+FILTERED_OUT_COUNT="0"
+
 # 单个镜像的结果写进这个目录下的独立文件。
 # 之所以用文件而不是全局数组，是因为并发模式下每个任务是独立的子进程，
 # 子进程对数组的修改不会传回父进程。
@@ -123,6 +135,12 @@ sync.sh —— 容器镜像同步引擎
   -s, --src <镜像>         源镜像，可重复指定；也支持逗号 / 分号 / 换行分隔的多个镜像
   -f, --file <路径>        从文件读取镜像列表，每行一个，# 开头为注释，空行忽略
 
+筛选（作用于源镜像的完整引用，ERE 正则）：
+      --filter <正则>      只同步匹配的镜像，例如 '^registry\.k8s\.io/'
+      --exclude <正则>     跳过匹配的镜像，例如 '/pause:'
+                           两者可同时使用：先 filter，后 exclude。
+                           被排除的镜像仍会出现在结果表中并标注原因
+
 可用性：
   -p, --platforms <列表>   逗号分隔的平台列表。仅在 --strip-attestation 下生效；
                            不指定时会自动探测源镜像的平台
@@ -174,6 +192,10 @@ sync.sh —— 容器镜像同步引擎
   # 剔除 attestation，只保留 amd64 与 arm64
   ./scripts/sync.sh -s ghcr.io/netbirdio/netbird:0.28.0 -d registry.cn-shenzhen.aliyuncs.com/nicholyx \
       --strip-attestation --platforms linux/amd64,linux/arm64
+
+  # 从完整清单里只同步 kube-* 组件，并临时跳过已知有问题的 apiserver
+  ./scripts/sync.sh --file images.lock.txt -d registry.cn-shenzhen.aliyuncs.com/nicholyx \
+      --filter 'kube-' --exclude 'kube-apiserver'
 EOF
 }
 
@@ -189,6 +211,12 @@ parse_args() {
       -f|--file|--source-file)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         SOURCE_FILES+=("$2"); shift 2 ;;
+      --filter)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        FILTER_REGEX="$2"; shift 2 ;;
+      --exclude)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        EXCLUDE_REGEX="$2"; shift 2 ;;
       -d|--dest|--dest-registry)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         DEST_REGISTRIES+=("$2"); shift 2 ;;
@@ -637,6 +665,63 @@ collect_images() {
   SOURCE_IMAGES=("${unique[@]}")
 }
 
+# 校验正则是否合法。
+#
+# grep 的退出码语义正好可用：0 匹配、1 不匹配、2 出错。所以「喂空输入」
+# 就能把语法错误与「没有匹配」区分开——1 是正常结果，只有 2 才说明正则写错了。
+# 这个判断放在任何同步动作之前，避免跑到一半才发现参数有问题。
+validate_regex() {
+  local name="$1" re="$2"
+  [[ -n "$re" ]] || return 0
+
+  local code=0
+  printf '' | grep -Eq -- "$re" 2>/dev/null || code=$?
+
+  if [[ "$code" -eq 2 ]]; then
+    die "${name} 不是合法的正则表达式：「${re}」"
+  fi
+}
+
+# 按 --filter / --exclude 标记要排除的镜像。
+#
+# 注意这里**只做标记，不删除元素**。下标同时决定结果文件的序号，删掉元素会让
+# 序号整体前移，被排除项之后的镜像序号全错，结果表的顺序也就与输入对不上了。
+apply_filters() {
+  [[ -n "$FILTER_REGEX" || -n "$EXCLUDE_REGEX" ]] || return 0
+
+  local i src
+  local excluded=0
+
+  for i in "${!SOURCE_IMAGES[@]}"; do
+    src="${SOURCE_IMAGES[$i]}"
+
+    if [[ -n "$FILTER_REGEX" ]] && ! printf '%s\n' "$src" | grep -Eq -- "$FILTER_REGEX"; then
+      EXCLUDE_REASONS[i]="未匹配 --filter「${FILTER_REGEX}」"
+      excluded=$((excluded + 1))
+      continue
+    fi
+
+    if [[ -n "$EXCLUDE_REGEX" ]] && printf '%s\n' "$src" | grep -Eq -- "$EXCLUDE_REGEX"; then
+      EXCLUDE_REASONS[i]="匹配 --exclude「${EXCLUDE_REGEX}」"
+      excluded=$((excluded + 1))
+      continue
+    fi
+  done
+
+  local total=${#SOURCE_IMAGES[@]}
+  if [[ "$excluded" -gt 0 ]]; then
+    log_info "筛选：${total} 个镜像中排除 ${excluded} 个，实际同步 $((total - excluded)) 个"
+  fi
+
+  # 全被筛掉时明确失败。静默地「什么都不同步然后报成功」是最糟的结果——
+  # 使用者会以为同步完成了，直到集群拉不到镜像才发现。
+  if [[ "$excluded" -eq "$total" ]]; then
+    die "全部 ${total} 个镜像都被筛掉了，没有可同步的镜像。请放宽 --filter / --exclude"
+  fi
+
+  FILTERED_OUT_COUNT="$excluded"
+}
+
 # ---------------------------------------------------------------------------
 # 单个镜像的处理（可能在子进程中运行）
 # ---------------------------------------------------------------------------
@@ -815,10 +900,18 @@ process_one() {
 dispatch_all() {
   local idx=0
   local total=${#SOURCE_IMAGES[@]}
-  local raw_src
+  local raw_src reason
 
   for raw_src in "${SOURCE_IMAGES[@]}"; do
     idx=$((idx + 1))
+
+    # 被筛掉的镜像不进子进程：既不值得为它起一个进程，也不需要网络请求。
+    # 序号照常占位，所以结果表的顺序与输入完全一致。
+    reason="${EXCLUDE_REASONS[$((idx - 1))]:-}"
+    if [[ -n "$reason" ]]; then
+      write_result "$(result_file_for "$idx" 1)" "$raw_src" "—" "excluded" "—" "0" "$reason" "" ""
+      continue
+    fi
 
     if [[ "$CONCURRENCY" -gt 1 ]]; then
       while [[ "$(jobs -pr | wc -l | tr -d ' ')" -ge "$CONCURRENCY" ]]; do
@@ -894,6 +987,11 @@ write_lockfile() {
         echo "# [失败] ${R_SRC[$i]}"
         continue
       fi
+      # 被筛掉的是有意不锁的，与「锁失败」区分开，避免误读为出了问题
+      if [[ "${R_STATUS[$i]}" == "excluded" ]]; then
+        echo "# [已排除] ${R_SRC[$i]}"
+        continue
+      fi
       if [[ -z "${R_SRC_DIGEST[$i]}" ]]; then
         echo "# [无 digest] ${R_SRC[$i]}"
         continue
@@ -930,11 +1028,15 @@ detect_notify_type() {
 
 # 组装通知正文。各平台的差异只在最外层包装，正文共用同一份。
 build_notify_text() {
-  local total="$1" ok="$2" skipped="$3" fail="$4"
+  local total="$1" ok="$2" skipped="$3" fail="$4" excluded="${5:-0}"
   local i text=""
 
   text="## 镜像同步完成"$'\n\n'
   text+="共 **${total}** 个镜像 ｜ 成功 ${ok} ｜ 跳过 ${skipped} ｜ 失败 ${fail}"$'\n'
+
+  if [[ "$excluded" -gt 0 ]]; then
+    text+="另有 ${excluded} 个镜像被筛选条件排除，未参与本次同步。"$'\n'
+  fi
 
   if [[ "$fail" -gt 0 ]]; then
     text+=$'\n'"### 失败详情"$'\n\n'
@@ -955,7 +1057,7 @@ build_notify_text() {
 }
 
 send_notification() {
-  local total="$1" ok="$2" skipped="$3" fail="$4"
+  local total="$1" ok="$2" skipped="$3" fail="$4" excluded="${5:-0}"
 
   [[ -n "$NOTIFY_WEBHOOK" ]] || return 0
 
@@ -970,7 +1072,7 @@ send_notification() {
   fi
 
   local text payload
-  text="$(build_notify_text "$total" "$ok" "$skipped" "$fail")"
+  text="$(build_notify_text "$total" "$ok" "$skipped" "$fail" "$excluded")"
 
   # 交给 jq 构造 JSON，转义由它负责，避免镜像名中的特殊字符破坏结构
   case "$type" in
@@ -1007,17 +1109,25 @@ send_notification() {
 }
 
 emit_summary() {
-  local total=${#R_SRC[@]}
-  local ok=0 fail=0 skipped=0 i
+  local ok=0 fail=0 skipped=0 excluded=0 i
   for i in "${!R_STATUS[@]}"; do
     case "${R_STATUS[$i]}" in
-      success) ok=$((ok + 1)) ;;
-      skipped) skipped=$((skipped + 1)) ;;
-      *)       fail=$((fail + 1)) ;;
+      success)  ok=$((ok + 1)) ;;
+      skipped)  skipped=$((skipped + 1)) ;;
+      excluded) excluded=$((excluded + 1)) ;;
+      *)        fail=$((fail + 1)) ;;
     esac
   done
 
-  log_info "同步完成：共 ${total} 个镜像，成功 ${ok} 个，跳过 ${skipped} 个，失败 ${fail} 个"
+  # total 只统计真正尝试同步的镜像。把被筛掉的算进来会让「共 N 个镜像」
+  # 包含根本没打算同步的那些，与实际发生的事情对不上。
+  local total=$((ok + skipped + fail))
+
+  local headline="同步完成：共 ${total} 个镜像，成功 ${ok} 个，跳过 ${skipped} 个，失败 ${fail} 个"
+  if [[ "$excluded" -gt 0 ]]; then
+    headline+="，另有 ${excluded} 个被筛选排除"
+  fi
+  log_info "$headline"
 
   # ---- 控制台表格 ----
   printf '\n' >&2
@@ -1025,9 +1135,10 @@ emit_summary() {
   for i in "${!R_SRC[@]}"; do
     local mark="${C_GREEN}✓${C_RESET}"
     case "${R_STATUS[$i]}" in
-      success) mark="${C_GREEN}✓${C_RESET}" ;;
-      skipped) mark="${C_DIM}⤼${C_RESET}" ;;
-      *)       mark="${C_RED}✗${C_RESET}" ;;
+      success)  mark="${C_GREEN}✓${C_RESET}" ;;
+      skipped)  mark="${C_DIM}⤼${C_RESET}" ;;
+      excluded) mark="${C_DIM}⊘${C_RESET}" ;;
+      *)        mark="${C_RED}✗${C_RESET}" ;;
     esac
     printf ' %s %s\n' "$mark" "${R_SRC[$i]}" >&2
     printf '   %s→ %s%s\n' "$C_DIM" "${R_DEST[$i]}" "$C_RESET" >&2
@@ -1050,14 +1161,19 @@ emit_summary() {
       for i in "${!R_SRC[@]}"; do
         local icon="✅"
         case "${R_STATUS[$i]}" in
-          skipped) icon="⤼ 已存在" ;;
-          success) icon="✅" ;;
-          *)       icon="❌" ;;
+          skipped)  icon="⤼ 已存在" ;;
+          excluded) icon="⊘ 已排除" ;;
+          success)  icon="✅" ;;
+          *)        icon="❌" ;;
         esac
         echo "| \`${R_SRC[$i]}\` | \`${R_DEST[$i]}\` | ${icon} | ${R_PLATFORM[$i]:-—} | \`$(short_digest "${R_SRC_DIGEST[$i]:-}")\` | ${R_SECONDS[$i]}s |"
       done
       echo ""
       echo "**合计**：${total} 个镜像 · 成功 ${ok} · 跳过 ${skipped} · 失败 ${fail}"
+      if [[ "$excluded" -gt 0 ]]; then
+        echo ""
+        echo "> 另有 ${excluded} 个镜像被 \`--filter\` / \`--exclude\` 排除，未参与本次同步。"
+      fi
       echo ""
       if [[ "$DRY_RUN" == "true" ]]; then
         echo "> ⚠️ 本次为 dry-run，未实际推送任何镜像。"
@@ -1067,7 +1183,7 @@ emit_summary() {
 
   # ---- 报告文件 ----
   if [[ -n "$REPORT_DIR" ]]; then
-    write_report "$total" "$ok" "$skipped" "$fail"
+    write_report "$total" "$ok" "$skipped" "$fail" "$excluded"
   fi
 
   # ---- 锁文件 ----
@@ -1076,15 +1192,20 @@ emit_summary() {
   fi
 
   # ---- 结果通知 ----
-  send_notification "$total" "$ok" "$skipped" "$fail"
+  send_notification "$total" "$ok" "$skipped" "$fail" "$excluded"
 
   [[ "$fail" -eq 0 ]] || return 2
   return 0
 }
 
 write_report() {
-  local total="$1" ok="$2" skipped="$3" fail="$4" i
+  local total="$1" ok="$2" skipped="$3" fail="$4" excluded="$5" i
   mkdir -p "$REPORT_DIR"
+
+  local result_line="共 ${total} 个镜像，成功 ${ok} 个，跳过 ${skipped} 个，失败 ${fail} 个"
+  if [[ "$excluded" -gt 0 ]]; then
+    result_line+="；另有 ${excluded} 个被筛选排除"
+  fi
 
   local md="${REPORT_DIR}/${REPORT_NAME}.md"
   {
@@ -1093,16 +1214,20 @@ write_report() {
     echo "- 生成时间：$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     echo "- 目标地址：${DEST_EXACT:-${DEST_REGISTRIES[*]}}"
     echo "- 同步模式：$([[ "$STRIP_ATTESTATION" == "true" ]] && echo 'regctl（剔除 attestation）' || echo 'skopeo（保留全部平台）')"
-    echo "- 结果：共 ${total} 个镜像，成功 ${ok} 个，跳过 ${skipped} 个，失败 ${fail} 个"
+    if [[ -n "$FILTER_REGEX" || -n "$EXCLUDE_REGEX" ]]; then
+      echo "- 筛选条件：$([[ -n "$FILTER_REGEX" ]] && echo "--filter「${FILTER_REGEX}」")$([[ -n "$FILTER_REGEX" && -n "$EXCLUDE_REGEX" ]] && echo " ")$([[ -n "$EXCLUDE_REGEX" ]] && echo "--exclude「${EXCLUDE_REGEX}」")"
+    fi
+    echo "- 结果：${result_line}"
     echo ""
     echo "| 源镜像 | 目标镜像 | 结果 | 平台 | 源 Digest | 目标 Digest | 耗时 |"
     echo "| --- | --- | :---: | --- | --- | --- | --- |"
     for i in "${!R_SRC[@]}"; do
       local icon="✅"
       case "${R_STATUS[$i]}" in
-        skipped) icon="⤼" ;;
-        success) icon="✅" ;;
-        *)       icon="❌" ;;
+        skipped)  icon="⤼" ;;
+        excluded) icon="⊘" ;;
+        success)  icon="✅" ;;
+        *)        icon="❌" ;;
       esac
       echo "| \`${R_SRC[$i]}\` | \`${R_DEST[$i]}\` | ${icon} | ${R_PLATFORM[$i]:-—} | \`${R_SRC_DIGEST[$i]:-—}\` | \`${R_DEST_DIGEST[$i]:-—}\` | ${R_SECONDS[$i]}s |"
     done
@@ -1118,6 +1243,9 @@ write_report() {
     printf '  "success": %s,\n' "$ok"
     printf '  "skipped": %s,\n' "$skipped"
     printf '  "failed": %s,\n' "$fail"
+    printf '  "excluded": %s,\n' "$excluded"
+    printf '  "filter": "%s",\n' "$FILTER_REGEX"
+    printf '  "exclude": "%s",\n' "$EXCLUDE_REGEX"
     printf '  "images": [\n'
     for i in "${!R_SRC[@]}"; do
       printf '    {"source": "%s", "dest": "%s", "status": "%s", "platforms": "%s", "source_digest": "%s", "dest_digest": "%s", "seconds": %s}' \
@@ -1159,6 +1287,10 @@ main() {
   validate_numeric "--timeout" "$TIMEOUT"
   validate_numeric "--retries" "$MAX_RETRIES"
 
+  # 正则先校验再跑。写错的正则应该立刻被拒绝，而不是等收集完镜像才发现
+  validate_regex "--filter" "$FILTER_REGEX"
+  validate_regex "--exclude" "$EXCLUDE_REGEX"
+
   [[ "$CONCURRENCY" -ge 1 ]] || die "--concurrency 至少为 1"
 
   case "$NOTIFY_ON" in
@@ -1197,9 +1329,17 @@ main() {
   fi
 
   collect_images
+  # 筛选放在 collect_images 之后、其余校验之前：
+  # --dest-exact 要求「只有一个源镜像」，而筛选后的数量才是有意义的数量
+  apply_filters
 
-  if [[ -n "$DEST_EXACT" && ${#SOURCE_IMAGES[@]} -gt 1 ]]; then
-    die "--dest-exact 只能搭配单个源镜像使用（当前提供了 ${#SOURCE_IMAGES[@]} 个）；批量同步请改用 --dest 前缀模式"
+  # 这里看的是「筛选之后」的数量：--dest-exact 的约束来自多个镜像会撞到
+  # 同一个目标地址，而筛掉之后只剩一个就不会撞
+  local active_count
+  active_count=$((${#SOURCE_IMAGES[@]} - FILTERED_OUT_COUNT))
+
+  if [[ -n "$DEST_EXACT" && "$active_count" -gt 1 ]]; then
+    die "--dest-exact 只能搭配单个源镜像使用（当前提供了 ${active_count} 个）；批量同步请改用 --dest 前缀模式"
   fi
 
   if [[ -n "$PLATFORMS" && "$STRIP_ATTESTATION" != "true" ]]; then
@@ -1210,7 +1350,8 @@ main() {
     log_warn "--skip-existing 在 --strip-attestation 模式下不可用（索引会被重建，digest 必然不同），本次将忽略"
   fi
 
-  local total=${#SOURCE_IMAGES[@]}
+  # 报「实际要同步」的数量，而不是清单里的总数——筛选之后这两个值常常不同
+  local total="$active_count"
   if [[ -n "$DEST_EXACT" ]]; then
     log_info "待同步镜像 ${total} 个 → ${DEST_EXACT}"
   else

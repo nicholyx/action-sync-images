@@ -30,6 +30,14 @@ on:
         required: false
         type: boolean
         default: false
+      filter:
+        description: '只同步匹配该正则的镜像（ERE，例如 kube-；留空则全部同步）'
+        required: false
+        default: ''
+      exclude:
+        description: '跳过匹配该正则的镜像（ERE，例如 apiserver；留空则不排除）'
+        required: false
+        default: ''
 
   # ---------------------------------------------------------------------------
   # 定时同步（默认关闭）
@@ -75,6 +83,8 @@ jobs:
           CONCURRENCY: ${{ inputs.concurrency }}
           SKIP_EXISTING: ${{ inputs.skip_existing }}
           DRY_RUN: ${{ inputs.dry_run }}
+          FILTER_REGEX: ${{ inputs.filter }}
+          EXCLUDE_REGEX: ${{ inputs.exclude }}
           NOTIFY_WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK }}
         run: |
           #!/usr/bin/env bash
@@ -88,6 +98,9 @@ jobs:
           # 提前统计一下有多少条有效条目，方便在日志里先给个预期
           image_count="$(grep -vcE '^\s*(#|$)' "$LOCKFILE" || true)"
           echo "清单 ${LOCKFILE} 中共有 ${image_count} 个镜像"
+          if [[ -n "$FILTER_REGEX" || -n "$EXCLUDE_REGEX" ]]; then
+            echo "已设置筛选条件，实际同步数量可能少于此数——以同步报告中的「已排除」标注为准"
+          fi
 
           if [[ "$image_count" -eq 0 ]]; then
             echo "::error::清单文件中没有任何启用的镜像条目（是否全被注释掉了？）"
@@ -104,6 +117,12 @@ jobs:
           fi
           if [[ "$DRY_RUN" == "true" ]]; then
             args+=(--dry-run)
+          fi
+          if [[ -n "$FILTER_REGEX" ]]; then
+            args+=(--filter "$FILTER_REGEX")
+          fi
+          if [[ -n "$EXCLUDE_REGEX" ]]; then
+            args+=(--exclude "$EXCLUDE_REGEX")
           fi
           if [[ -n "$NOTIFY_WEBHOOK" ]]; then
             args+=(--notify-webhook "$NOTIFY_WEBHOOK")
