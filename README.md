@@ -47,11 +47,15 @@
 - **完整保留多架构** —— amd64 / arm64 一起搬，不会只同步当前平台
 - **处理 attestation** —— 专门的路径解决阿里云 ACR 拒绝 OCI 1.1 空 blob 的问题（`unknown manifest class`）
 - **批量同步** —— 一次填多个镜像，或用清单文件维护一整套镜像集合
+- **按需筛选** —— 用正则从清单里挑出这次要同步的镜像，不必为了临时筛选去改清单文件
+- **多目标同步** —— 一次运行推送到多个仓库（比如阿里云给国内集群、Harbor 做内部归档）
 - **并发 + 增量** —— 批量同步支持并发执行，并自动跳过目标已有的相同镜像。
   定期同步的场景下，重复运行通常几秒就跑完
 - **失败不中断** —— 批量同步时单个镜像失败不影响其余镜像，最后统一汇总
-- **超时保护** —— 单个镜像可设超时，避免一个大镜像卡住整个批量任务
+- **超时与重试可控** —— 单个镜像可设超时，避免一个大镜像卡住整个批量任务
+- **支持自建 registry** —— 可关闭 TLS 校验，同步自建的 HTTP 仓库
 - **结果通知** —— 可推送同步结果到钉钉 / 飞书 / Slack，无人值守时也能第一时间知道成败
+- **可审计** —— 记录源与目标的 digest，并可生成锁文件用于精确复现
 - **结果一目了然** —— 运行结束直接生成结果表格，无需翻日志
 - **可在本地复现** —— 同一套逻辑封装成 `scripts/sync.sh`，本地也能跑，支持 `--dry-run`
 - **目标仓库可配置** —— 换命名空间或区域不需要改代码
@@ -152,6 +156,8 @@ registry.k8s.io/kube-scheduler:v1.31.0
 | `concurrency` | | `6` | 并发同步的镜像数量 |
 | `skip_existing` | | `true` | 跳过已存在的相同镜像 |
 | `dry_run` | | `false` | 同上 |
+| `filter` | | 空 | 只同步匹配该正则的镜像，如 `kube-` |
+| `exclude` | | 空 | 跳过匹配该正则的镜像，如 `apiserver` |
 
 > 📖 每个参数的深入说明、边界情况与示例，见 [使用文档](docs/USAGE.md#输入参数详解)。
 
@@ -214,6 +220,30 @@ platforms:         linux/amd64
 
 ```bash
 skopeo inspect --raw docker://<源镜像> | jq -r '.manifests[]?.platform | "\(.os)/\(.architecture)"'
+```
+
+</details>
+
+<details>
+<summary><b>只同步清单里的一部分镜像</b></summary>
+
+清单是「期望状态的完整记录」，但某一次同步往往只想覆盖其中一部分。用 `filter` / `exclude` 挑，不必为了临时筛选去改动清单文件：
+
+```text
+lockfile:  images.lock.txt
+filter:    kube-          # 只同步 kube-* 组件
+exclude:   apiserver      # 但把 apiserver 排掉
+```
+
+两者都接受正则（ERE），可组合使用（先 filter 后 exclude）。
+
+**被排除的镜像仍会出现在结果表中**，并标注是哪条规则把它排掉的——清单里列了 20 个而结果表只有 19 行，会让人误以为第 20 个已经同步了。看得见的排除才是排除。
+
+本地用法：
+
+```bash
+./scripts/sync.sh --file images.lock.txt --dest <目标仓库> \
+  --filter 'kube-' --exclude 'apiserver'
 ```
 
 </details>
@@ -310,13 +340,21 @@ brew install skopeo regclient   # macOS
 - [x] 批量同步与清单文件
 - [x] 本地 CLI 与 `--dry-run`
 - [x] 完整的 CI 与自动化
+- [x] 可配置的超时、并发与重试
+- [x] 增量跳过（`--skip-existing`）
+- [x] 同步结果通知（钉钉 / 飞书 / Slack）
+- [x] digest 记录与锁文件（`--write-lock`）
+- [x] 一次推送到多个目标仓库
+- [x] 按正则筛选镜像（`--filter` / `--exclude`）
+- [x] 自建 registry 的 TLS 开关（`--tls-verify`）
 
 ### 计划中
 
-- [ ] 支持为源镜像配置独立凭证（同步私有仓库镜像）
-- [ ] 同步结果的历史记录与趋势
-- [ ] 支持一次性推送到多个目标仓库
-- [ ] 可配置的超时与并发度
+完整清单见 [路线图 Issue #4](https://github.com/nicholyx/action-sync-images/issues/4)——那里是面向贡献者的工作清单，每项都对应一个独立 Issue，包含背景、入手位置与验收标准。
+
+- [ ] 支持为源镜像配置独立凭证，同步私有仓库镜像 —— [#20](https://github.com/nicholyx/action-sync-images/issues/20)
+- [ ] 同步结果的历史记录与趋势统计 —— [#21](https://github.com/nicholyx/action-sync-images/issues/21)
+- [ ] 补充更多源仓库的排错条目（**适合首次贡献**）—— [#24](https://github.com/nicholyx/action-sync-images/issues/24)
 
 有想法？欢迎[提 Issue](https://github.com/nicholyx/action-sync-images/issues/new/choose) 讨论。
 
