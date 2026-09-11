@@ -15,8 +15,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # 默认配置
 # ---------------------------------------------------------------------------
-DEST_REGISTRY=""
 DEST_EXACT=""
+declare -a DEST_REGISTRIES=()
 PLATFORMS=""
 STRIP_ATTESTATION="false"
 MAX_RETRIES="3"
@@ -112,11 +112,12 @@ sync.sh —— 容器镜像同步引擎
   ./scripts/sync.sh --file <镜像清单文件> --dest <目标仓库前缀> [选项]
 
 目标地址（必填其一）：
-  -d, --dest <前缀>        目标仓库前缀。最终目标为「前缀 + 源镜像路径（/ 替换为 _）」，
+  -d, --dest <前缀>        目标仓库前缀。最终目标为「前缀 + 源镜像路径（压平）」，
                            例如 registry.cn-shenzhen.aliyuncs.com/nicholyx
+                           **可重复指定以同时推送到多个目标**
       --dest-exact <地址>  精确指定完整目标地址，不再自动拼接源镜像名。
-                           只能搭配单个源镜像使用，例如
-                           harbor.example.com/library/nginx:1.27
+                           只能搭配单个源镜像、且不能与 --dest 混用，
+                           例如 harbor.example.com/library/nginx:1.27
 
 镜像来源（至少提供一项，可同时使用）：
   -s, --src <镜像>         源镜像，可重复指定；也支持逗号 / 分号 / 换行分隔的多个镜像
@@ -190,7 +191,7 @@ parse_args() {
         SOURCE_FILES+=("$2"); shift 2 ;;
       -d|--dest|--dest-registry)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
-        DEST_REGISTRY="$2"; shift 2 ;;
+        DEST_REGISTRIES+=("$2"); shift 2 ;;
       --dest-exact)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         DEST_EXACT="$2"; shift 2 ;;
@@ -702,13 +703,17 @@ resolve_platforms() {
   printf '%s' "$platforms"
 }
 
+# 结果文件的路径。按「镜像序号-目标序号」命名，零填充保证字典序正确。
+result_file_for() {
+  printf '%s/result-%04d-%02d' "$WORK_DIR" "$1" "$2"
+}
+
 process_one() {
   local idx="$1" raw_src="$2"
   local total="$3"
-  local src dest dest_repo platforms start end elapsed status note=""
+  local src dest dest_repo platforms
   local src_digest="" dest_digest=""
-  local result_file
-  result_file="${WORK_DIR}/result-$(printf '%04d' "$idx")"
+  local -a dests=()
 
   src="$(normalize_ref "$raw_src")"
 
@@ -718,67 +723,88 @@ process_one() {
     reason="$(validate_ref "$src" 2>&1 || true)"
     log_error "[${idx}/${total}] 跳过非法镜像引用：${src} —— ${reason}"
     gh_error "镜像引用格式错误：${src}（${reason}）"
-    write_result "$result_file" "$src" "—" "failed" "—" "0" "镜像引用格式错误：${reason}" "" ""
+    write_result "$(result_file_for "$idx" 1)" "$src" "—" "failed" "—" "0" \
+      "镜像引用格式错误：${reason}" "" ""
     return 0
   fi
 
+  # 构造目标列表。支持多目标：每个镜像会对列表中的每个目标各同步一次。
+  dest_repo="$(dest_repo_for "$src")"
   if [[ -n "$DEST_EXACT" ]]; then
-    dest="$DEST_EXACT"
+    dests=("$DEST_EXACT")
   else
-    dest_repo="$(dest_repo_for "$src")"
-    dest="${DEST_REGISTRY}/${dest_repo}"
+    local d
+    for d in "${DEST_REGISTRIES[@]}"; do
+      dests+=("${d}/${dest_repo}")
+    done
   fi
 
   group_start "[${idx}/${total}] ${src}"
-  log_info "目标：${dest}"
 
-  # 增量跳过：目标已经有完全相同的镜像时不必再推一次。
-  # strip-attestation 模式会重建索引，目标 digest 必然与源不同，
-  # 比较 digest 没有意义，因此该模式下不做跳过。
-  if [[ "$SKIP_EXISTING" == "true" && "$STRIP_ATTESTATION" != "true" && "$DRY_RUN" != "true" ]]; then
-    if is_up_to_date "$src" "$dest"; then
-      log_skip "[${idx}/${total}] 目标已是最新，跳过"
-      src_digest="$(compute_digest "$src" || true)"
-      write_result "$result_file" "$src" "$dest" "skipped" "全部（--all）" "0" \
-        "目标已存在相同镜像" "$src_digest" "$src_digest"
-      group_end
-      return 0
-    fi
-  fi
-
+  # 平台取决于源镜像、与目标无关，因此只解析一次
   platforms="$(resolve_platforms "$src")"
-  log_info "平台：${platforms}"
 
-  start="$(date +%s)"
-  if sync_one "$src" "$dest" "$platforms"; then
-    status="success"
-    log_ok "[${idx}/${total}] 同步成功"
-  else
-    status="failed"
-    note="同步失败，详见上方日志"
-    log_error "[${idx}/${total}] 同步失败"
-    gh_error "镜像同步失败：${src}"
-  fi
-  end="$(date +%s)"
-  elapsed=$((end - start))
+  local di=0
+  local dest_total=${#dests[@]}
+  for dest in "${dests[@]}"; do
+    di=$((di + 1))
 
-  # 记录 digest 作为「这次同步的到底是哪一份镜像」的凭据。
-  # 取不到就留空，只影响审计信息的完整度，不影响同步本身的成败。
-  if [[ "$status" == "success" ]]; then
-    src_digest="$(compute_digest "$src" || true)"
-    dest_digest="$(compute_digest "$dest" || true)"
-    if [[ -n "$src_digest" ]]; then
-      log_info "源 digest：${src_digest}"
+    local start end elapsed status note=""
+    local result_file
+    result_file="$(result_file_for "$idx" "$di")"
+
+    if [[ "$dest_total" -gt 1 ]]; then
+      log_info "目标 [${di}/${dest_total}]：${dest}"
+    else
+      log_info "目标：${dest}"
     fi
-    if [[ -n "$src_digest" && -n "$dest_digest" && "$src_digest" != "$dest_digest" ]]; then
-      # 顶层 digest 不同不一定是问题（例如 registry 会重新包装 manifest），
-      # 但值得记一笔，便于日后排查
-      log_dim "  注：目标 digest 与源不同（${dest_digest}），通常由 registry 重新包装 manifest 导致"
-    fi
-  fi
+    log_info "平台：${platforms}"
 
-  write_result "$result_file" "$src" "$dest" "$status" "$platforms" "$elapsed" "$note" \
-    "$src_digest" "$dest_digest"
+    # 增量跳过：目标已经有完全相同的镜像时不必再推一次。
+    # **每个目标独立判定**——某个目标已是最新，不代表其他目标也是。
+    # strip-attestation 模式会重建索引、目标 digest 必然与源不同，因此不做跳过。
+    if [[ "$SKIP_EXISTING" == "true" && "$STRIP_ATTESTATION" != "true" && "$DRY_RUN" != "true" ]]; then
+      if is_up_to_date "$src" "$dest"; then
+        log_skip "  目标已是最新，跳过"
+        src_digest="$(compute_digest "$src" || true)"
+        write_result "$result_file" "$src" "$dest" "skipped" "全部（--all）" "0" \
+          "目标已存在相同镜像" "$src_digest" "$src_digest"
+        continue
+      fi
+    fi
+
+    start="$(date +%s)"
+    if sync_one "$src" "$dest" "$platforms"; then
+      status="success"
+      log_ok "  同步成功"
+    else
+      status="failed"
+      note="同步失败，详见上方日志"
+      log_error "  同步失败"
+      gh_error "镜像同步失败：${src} → ${dest}"
+    fi
+    end="$(date +%s)"
+    elapsed=$((end - start))
+
+    # 记录 digest 作为「这次同步的到底是哪一份镜像」的凭据。
+    # 取不到就留空，只影响审计信息的完整度，不影响同步本身的成败。
+    if [[ "$status" == "success" ]]; then
+      src_digest="$(compute_digest "$src" || true)"
+      dest_digest="$(compute_digest "$dest" || true)"
+      if [[ -n "$src_digest" ]]; then
+        log_info "  源 digest：${src_digest}"
+      fi
+      if [[ -n "$src_digest" && -n "$dest_digest" && "$src_digest" != "$dest_digest" ]]; then
+        # 顶层 digest 不同不一定是问题（例如 registry 会重新包装 manifest），
+        # 但值得记一笔，便于日后排查
+        log_dim "  注：目标 digest 与源不同（${dest_digest}），通常由 registry 重新包装 manifest 导致"
+      fi
+    fi
+
+    write_result "$result_file" "$src" "$dest" "$status" "$platforms" "$elapsed" "$note" \
+      "$src_digest" "$dest_digest"
+  done
+
   group_end
   return 0
 }
@@ -1065,7 +1091,7 @@ write_report() {
     echo "# 镜像同步报告"
     echo ""
     echo "- 生成时间：$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-    echo "- 目标地址：${DEST_EXACT:-$DEST_REGISTRY}"
+    echo "- 目标地址：${DEST_EXACT:-${DEST_REGISTRIES[*]}}"
     echo "- 同步模式：$([[ "$STRIP_ATTESTATION" == "true" ]] && echo 'regctl（剔除 attestation）' || echo 'skopeo（保留全部平台）')"
     echo "- 结果：共 ${total} 个镜像，成功 ${ok} 个，跳过 ${skipped} 个，失败 ${fail} 个"
     echo ""
@@ -1086,7 +1112,7 @@ write_report() {
   {
     printf '{\n'
     printf '  "generated_at": "%s",\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-    printf '  "dest_registry": "%s",\n' "${DEST_EXACT:-$DEST_REGISTRY}"
+    printf '  "dest_registry": "%s",\n' "${DEST_EXACT:-${DEST_REGISTRIES[*]}}"
     printf '  "strip_attestation": %s,\n' "$STRIP_ATTESTATION"
     printf '  "total": %s,\n' "$total"
     printf '  "success": %s,\n' "$ok"
@@ -1116,11 +1142,17 @@ write_report() {
 main() {
   parse_args "$@"
 
-  if [[ -z "$DEST_REGISTRY" && -z "$DEST_EXACT" ]]; then
+  if [[ ${#DEST_REGISTRIES[@]} -eq 0 && -z "$DEST_EXACT" ]]; then
     log_error "缺少必填参数：--dest 或 --dest-exact"
     echo "" >&2
     usage >&2
     exit 1
+  fi
+
+  # 两者语义不同：--dest 是前缀（会被拼接），--dest-exact 是完整地址（不拼接）。
+  # 混用时目标地址会变得含糊，宁可明确报错。
+  if [[ -n "$DEST_EXACT" && ${#DEST_REGISTRIES[@]} -gt 0 ]]; then
+    die "--dest-exact 与 --dest 不能同时使用：前者指定完整目标地址，后者是待拼接的前缀"
   fi
 
   validate_numeric "--concurrency" "$CONCURRENCY"
@@ -1139,8 +1171,19 @@ main() {
     *) die "--tls-verify 只能是 true 或 false，当前为「${TLS_VERIFY}」" ;;
   esac
 
-  DEST_REGISTRY="${DEST_REGISTRY#docker://}"
-  DEST_REGISTRY="${DEST_REGISTRY%/}"
+  # 规范化每个目标：去掉可能误带的 docker:// 前缀与结尾斜杠。
+  # 用重建数组代替按下标原地修改——后者要写下标，容易触发静态检查告警，
+  # 可读性也差一些。
+  if [[ ${#DEST_REGISTRIES[@]} -gt 0 ]]; then
+    local -a normalized=()
+    local item
+    for item in "${DEST_REGISTRIES[@]}"; do
+      item="${item#docker://}"
+      item="${item%/}"
+      normalized+=("$item")
+    done
+    DEST_REGISTRIES=("${normalized[@]}")
+  fi
   DEST_EXACT="${DEST_EXACT#docker://}"
 
   ensure_skopeo
@@ -1168,7 +1211,14 @@ main() {
   fi
 
   local total=${#SOURCE_IMAGES[@]}
-  log_info "待同步镜像 ${total} 个 → ${DEST_EXACT:-$DEST_REGISTRY}"
+  if [[ -n "$DEST_EXACT" ]]; then
+    log_info "待同步镜像 ${total} 个 → ${DEST_EXACT}"
+  else
+    log_info "待同步镜像 ${total} 个 → ${DEST_REGISTRIES[*]}"
+    if [[ ${#DEST_REGISTRIES[@]} -gt 1 ]]; then
+      log_info "共 ${#DEST_REGISTRIES[@]} 个目标，每个镜像都会推送到全部目标"
+    fi
+  fi
   if [[ "$CONCURRENCY" -gt 1 ]]; then
     log_info "并发度：${CONCURRENCY}"
   fi

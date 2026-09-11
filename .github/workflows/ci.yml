@@ -318,6 +318,28 @@ jobs:
           fi
           echo "✓ 内容变化后正确重新同步"
 
+      - name: 多目标同步
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 同一个源同时推送到两个目标
+          ./scripts/sync.sh \
+            --src localhost:5000/source/hello:latest \
+            --dest localhost:5000/mirror-a \
+            --dest localhost:5000/mirror-b \
+            --tls-verify false --concurrency 1
+
+          # 两个目标都应存在——多目标最容易出的问题是「只推了第一个」
+          for repo in mirror-a mirror-b; do
+            dest="localhost:5000/${repo}/localhost_5000_source_hello:latest"
+            if ! skopeo inspect --tls-verify=false "docker://${dest}" >/dev/null 2>&1; then
+              echo "::error::多目标同步后 ${repo} 中缺少镜像：${dest}"
+              exit 1
+            fi
+            echo "✓ ${repo} 中存在目标镜像"
+          done
+
   # ---------------------------------------------------------------------------
   # 提交信息规范
   # 只在 PR 上跑（push 到 main 的提交已经过 PR 校验）。

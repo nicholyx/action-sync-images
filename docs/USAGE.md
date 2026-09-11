@@ -182,6 +182,26 @@ registry.k8s.io/pause:3.9, nginx:1.27, redis:7.4
 
 > 每次同步都会自动记录源与目标的 digest（详见[关于 digest](#关于-digest)），无需额外配置。
 
+### 同时推送到多个目标
+
+`--dest` 可以重复指定——同一个镜像经常需要落在多个地方（阿里云给国内集群、Harbor 做内部归档）：
+
+```bash
+./scripts/sync.sh \
+  --src registry.k8s.io/pause:3.9 \
+  --dest registry.cn-shenzhen.aliyuncs.com/nicholyx \
+  --dest harbor.example.com/mirror
+```
+
+几点需要注意：
+
+- **每个目标独立判定**：A 目标成功、B 目标失败时，报告里能直接看出是哪个目标的问题，而不是笼统的「同步失败」
+- **增量跳过按目标独立执行**：某个目标已是最新，不代表其他目标也是
+- **任一目标失败则整体失败**（退出码 `2`）
+- 源镜像会被拉取多次（每个目标一次）——这是当前实现的取舍，换取的是逻辑简单与失败可定位
+
+> ⚠️ `--dest-exact` 与 `--dest` **不能混用**：前者指定完整目标地址、后者是待拼接的前缀，混在一起会让目标变得含糊。脚本会直接拒绝这种组合，而不是猜你的意图。
+
 **关于 `strip_attestation`：** 什么时候该勾？简单判断法是——如果同步时报了包含 `unknown manifest class` 的错误，就勾上重试。常见需要勾选的有 `ghcr.io/netbirdio/*` 这类用 BuildKit 构建且开启了 provenance 的项目。原理见 [ARCHITECTURE.md](ARCHITECTURE.md#深入理解-attestation-问题)。
 
 **关于 `platforms`：** 留空时会自动读取源镜像的平台列表。只有当自动探测失败（比如源是单平台镜像）时才需要手动指定。如果源镜像只有 `linux/amd64` 而你按默认的 `linux/amd64,linux/arm64` 去同步，会失败——这时候改成只填 `linux/amd64` 即可。
