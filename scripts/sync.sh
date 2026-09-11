@@ -72,6 +72,10 @@ SRC_CRED_ENTRIES=""
 # 环境变量 SYNC_SRC_CREDENTIALS（文件内容）落盘产生的临时文件路径。
 # cleanup 只删这个，绝不动使用者通过 --src-credentials 指定的自有文件
 SRC_CREDENTIALS_TMPFILE=""
+# 多目标中转：prepare_oci_staging 的传出变量（不能用命令替换传——
+# 那是子 shell，赋值传不回父进程，set -u 下读会炸）
+OCI_STAGING_DIR=""
+PULL_ELAPSED=0
 
 # 镜像筛选。二者都是 ERE 正则，作用于源镜像的完整引用。
 FILTER_REGEX=""
@@ -731,8 +735,10 @@ estimate_image_bytes() {
 
 # 多目标中转的准备阶段：把源镜像拉到本地 OCI 目录，一次拉取供全部目标使用。
 #
-# 成功时把目录路径写到 stdout，拉取耗时写入全局 PULL_ELAPSED；
-# 失败时（磁盘不足 / 拉取失败）返回非零，调用方退化为逐目标拉推。
+# 成功时把目录路径写入全局 OCI_STAGING_DIR，拉取耗时写入全局 PULL_ELAPSED，
+# 返回 0；失败时（磁盘不足 / 拉取失败）返回非零，调用方退化为逐目标拉推。
+# **不能用命令替换「stdout 传值」**：那是子 shell，里面的赋值传不回父进程，
+# set -u 下父进程读 PULL_ELAPSED 会直接 unbound variable。
 # 失败路径全部走告警而不是 die——优化失败不该改变同步的结果语义。
 prepare_oci_staging() {
   local src="$1"
@@ -780,7 +786,8 @@ prepare_oci_staging() {
   fi
   end="$(date +%s)"
   PULL_ELAPSED=$((end - start))
-  printf '%s' "$oci_dir"
+  OCI_STAGING_DIR="$oci_dir"
+  return 0
 }
 
 # 提取镜像的「平台 → 子 manifest digest」映射。
@@ -1396,7 +1403,10 @@ process_one() {
   local oci_dir=""
   if [[ ${#pending[@]} -ge 2 && "$STRIP_ATTESTATION" != "true" && "$DRY_RUN" != "true" ]]; then
     log_info "${#pending[@]} 个目标待推送，尝试本地中转（源只拉取一次）"
-    if oci_dir="$(prepare_oci_staging "$src")"; then
+    OCI_STAGING_DIR=""
+    PULL_ELAPSED=0
+    if prepare_oci_staging "$src"; then
+      oci_dir="$OCI_STAGING_DIR"
       pull_elapsed="$PULL_ELAPSED"
       log_ok "源已拉取到本地中转（耗时 ${pull_elapsed}s），逐目标推送"
     fi
