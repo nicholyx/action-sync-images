@@ -545,6 +545,70 @@ jobs:
           fi
           echo "✓ 默认行为不变"
 
+      - name: 验证连续失败计数的判定逻辑
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 跨运行状态无法在单次运行中端到端产生（需要多次真实失败的运行），
+          # 所以与校验一样用「提取生产函数 + 伪造输入」的方式测判定逻辑本身。
+          sed -n '/^readonly FIELD_SEP=/p' scripts/sync.sh > /tmp/notify-fns.sh
+          sed -n '/^count_consecutive_failures()/,/^}/p' scripts/sync.sh >> /tmp/notify-fns.sh
+          sed -n '/^gather_alert_images()/,/^}/p' scripts/sync.sh >> /tmp/notify-fns.sh
+
+          cat > /tmp/test-notify.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          source /tmp/notify-fns.sh
+          log_info() { printf '[信息] %s\n' "$*" >&2; }
+
+          FS="$(printf '\x1f')"
+          NOTIFY_AFTER_FAILURES=3
+
+          # 历史：a 连续失败 2 次；b 上次成功（清零）；c 从未出现
+          hist="$(mktemp)"
+          {
+            printf '2026-09-09T01:00:00Z%sa.example.com/x:1%sfailed\n' "$FS" "$FS"
+            printf '2026-09-09T01:00:00Z%sb.example.com/y:1%sfailed\n' "$FS" "$FS"
+            printf '2026-09-10T01:00:00Z%sa.example.com/x:1%sfailed\n' "$FS" "$FS"
+            printf '2026-09-10T01:00:00Z%sb.example.com/y:1%ssuccess\n' "$FS" "$FS"
+          } > "$hist"
+
+          R_SRC=(a.example.com/x:1 b.example.com/y:1 c.example.com/z:1)
+          R_STATUS=(failed failed failed)
+
+          out="$(gather_alert_images "$hist")"
+
+          grep -q "$(printf 'a.example.com/x:1\x1f3')" <<<"$out" \
+            || { echo "FAIL: a 应为连续 3 次（2 历史 + 1 本次）"; exit 1; }
+          grep -q 'b.example.com' <<<"$out" \
+            && { echo "FAIL: b 上次成功应清零，未达阈值"; exit 1; }
+          grep -q 'c.example.com' <<<"$out" \
+            && { echo "FAIL: c 无历史应按首次处理"; exit 1; }
+
+          # 阈值 1 = 历史行为：全部失败都通知
+          NOTIFY_AFTER_FAILURES=1
+          out="$(gather_alert_images "$hist")"
+          [[ "$(grep -c 'example.com' <<<"$out")" -eq 3 ]] \
+            || { echo "FAIL: 阈值 1 应通知全部 3 个失败"; exit 1; }
+
+          echo "MOCK-OK"
+          SCRIPT
+          bash /tmp/test-notify.sh | grep -q 'MOCK-OK' || {
+            echo "::error::连续失败计数判定不符合预期"
+            exit 1
+          }
+          echo "✓ 连续失败计数正确（累计 / 清零 / 无历史 / 阈值 1 兼容）"
+
+          # 参数校验
+          set +e
+          ./scripts/sync.sh --src nginx:1.27 --dest r.example.com/x \
+            --notify-after-failures 0 --dry-run >/dev/null 2>&1
+          code=$?
+          set -e
+          [[ "$code" -eq 1 ]] || { echo "::error::--notify-after-failures 0 应被拒绝（退出码 1），实际 ${code}"; exit 1; }
+          echo "✓ 非法阈值被拒绝"
+
   # ---------------------------------------------------------------------------
   # 真实同步集成测试
   #

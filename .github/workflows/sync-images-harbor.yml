@@ -33,6 +33,10 @@ on:
         required: false
         type: boolean
         default: false
+      notify_after_failures:
+        description: '同一个镜像连续失败多少次才通知（默认 1 = 每次都通知；调大可对抗通知疲劳）'
+        required: false
+        default: '1'
 
 # 只需要读代码，推送凭证通过 Secrets 注入
 permissions:
@@ -69,6 +73,7 @@ jobs:
           VERIFY: ${{ inputs.verify }}
           DRY_RUN: ${{ inputs.dry_run }}
           NOTIFY_WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK }}
+          NOTIFY_AFTER_FAILURES: ${{ inputs.notify_after_failures }}
           # 可选：源镜像若来自私有仓库，配置这两个 Secrets。
           # 走环境变量而非命令行参数，避免凭证被打印进日志。
           SYNC_SRC_USERNAME: ${{ secrets.SRC_REGISTRY_USERNAME }}
@@ -101,6 +106,11 @@ jobs:
           fi
           if [[ -n "$NOTIFY_WEBHOOK" ]]; then
             args+=(--notify-webhook "$NOTIFY_WEBHOOK")
+            # 连续失败阈值依赖下载本工作流的历史报告，Artifact 名必须对上
+            args+=(--history-artifact sync-report-harbor)
+          fi
+          if [[ -n "$NOTIFY_AFTER_FAILURES" && "$NOTIFY_AFTER_FAILURES" != "1" ]]; then
+            args+=(--notify-after-failures "$NOTIFY_AFTER_FAILURES")
           fi
 
           echo "执行：./scripts/sync.sh ${args[*]}"

@@ -40,6 +40,12 @@ VERIFY="false"
 NOTIFY_WEBHOOK=""
 NOTIFY_TYPE="auto"
 NOTIFY_ON="always"
+# 同一个镜像连续失败多少次才通知。默认 1：每次失败都通知（与历史行为一致）。
+# 调大是为了对抗通知疲劳——上游抖动占了失败原因的一大部分，每次都响的话
+# 群里的通知很快就没有人看了，真正需要关注的问题反而被淹没。
+NOTIFY_AFTER_FAILURES="1"
+# 计算连续失败次数时要下载的历史报告 Artifact 名称（阈值 > 1 时才用到）
+HISTORY_ARTIFACT="sync-report-aliyuncs"
 WRITE_LOCK=""
 declare -a SOURCE_IMAGES=()
 declare -a SOURCE_FILES=()
@@ -218,6 +224,13 @@ sync.sh —— 容器镜像同步引擎
       --notify-type <类型>    钉钉 dingtalk / 飞书 feishu / Slack slack /
                               通用 generic，默认 auto（按 URL 自动识别）
       --notify-on <时机>      always（默认，总是通知）或 failure（仅失败时通知）
+      --notify-after-failures <N>
+                              同一个镜像连续失败多少次才通知，默认 1（每次失败都通知）。
+                              调大可对抗通知疲劳：上游抖动的失败重跑就好，每次都响
+                              的通知很快没人看了。需要能下载历史报告（gh CLI），
+                              拿不到历史时按「连续失败 1 次」处理
+      --history-artifact <名> 历史报告的 Artifact 名称，默认 sync-report-aliyuncs。
+                              仅在 --notify-after-failures 大于 1 时使用
 
   -h, --help               显示本帮助
 
@@ -317,6 +330,12 @@ parse_args() {
       --notify-on)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         NOTIFY_ON="$2"; shift 2 ;;
+      --notify-after-failures)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        NOTIFY_AFTER_FAILURES="$2"; shift 2 ;;
+      --history-artifact)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        HISTORY_ARTIFACT="$2"; shift 2 ;;
       --dry-run|-n)
         DRY_RUN="true"; shift ;;
       --report-dir)
@@ -1352,9 +1371,118 @@ detect_notify_type() {
 }
 
 # 组装通知正文。各平台的差异只在最外层包装，正文共用同一份。
+# ---------------------------------------------------------------------------
+# 连续失败计数
+#
+# 「同一个镜像连续失败 N 次才通知」需要跨运行的状态，而脚本每次运行都是独立的。
+# 这里不复用 history.sh（它是独立的事后查询工具，不是同步流程的库），
+# 而是把「下载报告 + 展开记录」这一小段在此重写——两处对同一数据格式的依赖
+# 由报告 JSON 的 schema（write_report 产出）保证。
+# ---------------------------------------------------------------------------
+
+# 下载最近若干次运行的同步报告，展开为逐条记录，按时间升序写入 $1。
+# 行格式：generated_at<FS>source<FS>status（ISO 时间的字典序即时间序）。
+#
+# 任何一环失败都返回非零——调用方按「拿不到历史」降级，不中断同步。
+# 不是每次运行都在做同步（还有 CI、Release），所以单次下载失败是常态而非异常。
+fetch_sync_history() {
+  local out_file="$1"
+
+  command -v gh >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+
+  local tmpdir id f
+  tmpdir="$(mktemp -d)" || return 1
+
+  local -a run_ids=()
+  while IFS= read -r id; do
+    [[ -n "$id" ]] && run_ids+=("$id")
+  done < <(gh run list --limit 15 --json databaseId --jq '.[].databaseId' 2>/dev/null || true)
+
+  local got=0
+  if [[ ${#run_ids[@]} -gt 0 ]]; then
+    for id in "${run_ids[@]}"; do
+      if gh run download "$id" -n "$HISTORY_ARTIFACT" -D "${tmpdir}/${id}" >/dev/null 2>&1; then
+        got=$((got + 1))
+      fi
+    done
+  fi
+
+  if [[ "$got" -eq 0 ]]; then
+    rm -rf "$tmpdir"
+    return 1
+  fi
+
+  : > "$out_file"
+  while IFS= read -r f; do
+    jq -r 'select(.images != null) | .generated_at as $at
+           | .images[] | [$at, .source, .status] | join("\u001f")' "$f" >> "$out_file" 2>/dev/null || true
+  done < <(find "$tmpdir" -type f -name '*.json' 2>/dev/null)
+
+  rm -rf "$tmpdir"
+  sort -o "$out_file" "$out_file"
+  [[ -s "$out_file" ]]
+}
+
+# 计算某镜像在历史中的连续失败次数（不含本次运行）。
+# 从最新记录往回数，中间遇到任何非 failed 的记录（成功/跳过/排除）即清零——
+# 「中间成功过一次就重新计数」正是这个功能的语义。
+count_consecutive_failures() {
+  local image="$1" history_file="$2"
+  local count=0 line src status
+  local -a lines=()
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && lines+=("$line")
+  done < "$history_file"
+
+  local i
+  for ((i = ${#lines[@]} - 1; i >= 0; i--)); do
+    line="${lines[$i]}"
+    src="${line#*"${FIELD_SEP}"}"          # 跳过 generated_at
+    src="${src%%"${FIELD_SEP}"*}"
+    status="${line##*"${FIELD_SEP}"}"
+    [[ "$src" == "$image" ]] || continue
+    if [[ "$status" == "failed" ]]; then
+      count=$((count + 1))
+    else
+      break
+    fi
+  done
+  printf '%s' "$count"
+}
+
+# 决定本次要通知哪些失败镜像。输出到 stdout，每行「镜像<FS>连续失败次数」。
+#
+# 阈值为 1 时就是全部失败镜像（历史行为）；大于 1 时逐个数连续次数，
+# 未达阈值的失败会被有意地沉默——这正是这个功能存在的意义：
+# 上游抖动的失败重跑就好，每次都响的通知很快就没有人看了。
+#
+# 拿不到历史时全部按「连续 1 次」处理：宁可不通知，也不基于猜测误报。
+gather_alert_images() {
+  local hist_file="$1"
+  local i img cnt
+
+  for i in "${!R_SRC[@]}"; do
+    [[ "${R_STATUS[$i]}" == "failed" ]] || continue
+    img="${R_SRC[$i]}"
+    if [[ -n "$hist_file" && -s "$hist_file" ]]; then
+      cnt="$(count_consecutive_failures "$img" "$hist_file")"
+      cnt=$((cnt + 1))
+    else
+      cnt=1
+    fi
+    if [[ "$cnt" -ge "$NOTIFY_AFTER_FAILURES" ]]; then
+      printf '%s%s%s\n' "$img" "$FIELD_SEP" "$cnt"
+    else
+      log_info "${img} 连续失败 ${cnt} 次，未达阈值 ${NOTIFY_AFTER_FAILURES}，暂不通知"
+    fi
+  done
+}
+
 build_notify_text() {
-  local total="$1" ok="$2" skipped="$3" fail="$4" excluded="${5:-0}"
-  local i text=""
+  local total="$1" ok="$2" skipped="$3" fail="$4" excluded="${5:-0}" alert_detail="$6"
+  local text=""
 
   text="## 镜像同步完成"$'\n\n'
   text+="共 **${total}** 个镜像 ｜ 成功 ${ok} ｜ 跳过 ${skipped} ｜ 失败 ${fail}"$'\n'
@@ -1365,11 +1493,7 @@ build_notify_text() {
 
   if [[ "$fail" -gt 0 ]]; then
     text+=$'\n'"### 失败详情"$'\n\n'
-    for i in "${!R_SRC[@]}"; do
-      if [[ "${R_STATUS[$i]}" == "failed" ]]; then
-        text+="- ${R_SRC[$i]}"$'\n'
-      fi
-    done
+    text+="${alert_detail}"
   fi
 
   # 在 Actions 中运行时附上运行链接，便于收到通知后一键跳转排查
@@ -1391,13 +1515,47 @@ send_notification() {
     return 0
   fi
 
+  # 决定本次要通知哪些失败镜像（详见 gather_alert_images）。
+  local alert_detail="" line img cnt
+  local -a alert_lines=()
+  local hist_file="${WORK_DIR:-}/notify-history.tsv"
+
+  if [[ "$fail" -gt 0 && "$NOTIFY_AFTER_FAILURES" -gt 1 ]]; then
+    # 历史只在此时才需要——下载要花几秒，不该让每次成功的运行都付出这个代价
+    if ! fetch_sync_history "$hist_file"; then
+      log_warn "无法获取历史报告（--history-artifact「${HISTORY_ARTIFACT}」），无法判断连续失败次数，本次不发送失败通知"
+      return 0
+    fi
+  fi
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    img="${line%%"${FIELD_SEP}"*}"
+    cnt="${line##*"${FIELD_SEP}"}"
+    if [[ "$cnt" -gt 1 ]]; then
+      alert_lines+=("- ${img}（**连续第 ${cnt} 次失败**）")
+    else
+      alert_lines+=("- ${img}")
+    fi
+  done < <(gather_alert_images "$hist_file")
+
+  if [[ "$fail" -gt 0 && ${#alert_lines[@]} -eq 0 ]]; then
+    # 有失败但没有任何镜像达到通知阈值——沉默是刻意的
+    log_info "所有失败均未达到连续 ${NOTIFY_AFTER_FAILURES} 次的阈值，本次不通知"
+    return 0
+  fi
+
   local type="$NOTIFY_TYPE"
   if [[ "$type" == "auto" ]]; then
     type="$(detect_notify_type "$NOTIFY_WEBHOOK")"
   fi
 
+  for line in "${alert_lines[@]}"; do
+    alert_detail+="${line}"$'\n'
+  done
+
   local text payload
-  text="$(build_notify_text "$total" "$ok" "$skipped" "$fail" "$excluded")"
+  text="$(build_notify_text "$total" "$ok" "$skipped" "$fail" "$excluded" "$alert_detail")"
 
   # 交给 jq 构造 JSON，转义由它负责，避免镜像名中的特殊字符破坏结构
   case "$type" in
@@ -1663,6 +1821,9 @@ main() {
     always|failure) ;;
     *) die "--notify-on 只能是 always 或 failure，当前为「${NOTIFY_ON}」" ;;
   esac
+
+  validate_numeric "--notify-after-failures" "$NOTIFY_AFTER_FAILURES"
+  [[ "$NOTIFY_AFTER_FAILURES" -ge 1 ]] || die "--notify-after-failures 至少为 1（1 = 每次失败都通知）"
 
   case "$TLS_VERIFY" in
     true|false) ;;

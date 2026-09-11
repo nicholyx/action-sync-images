@@ -35,6 +35,10 @@ on:
         required: false
         type: boolean
         default: false
+      notify_after_failures:
+        description: '同一个镜像连续失败多少次才通知（默认 1 = 每次都通知；调大可对抗通知疲劳）'
+        required: false
+        default: '1'
       filter:
         description: '只同步匹配该正则的镜像（ERE，例如 kube-；留空则全部同步）'
         required: false
@@ -92,6 +96,7 @@ jobs:
           FILTER_REGEX: ${{ inputs.filter }}
           EXCLUDE_REGEX: ${{ inputs.exclude }}
           NOTIFY_WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK }}
+          NOTIFY_AFTER_FAILURES: ${{ inputs.notify_after_failures }}
           # 可选：清单里若有私有仓库的镜像，配置这两个 Secrets 即可。
           # 走环境变量而非命令行参数，避免凭证被打印进日志。
           SYNC_SRC_USERNAME: ${{ secrets.SRC_REGISTRY_USERNAME }}
@@ -139,6 +144,11 @@ jobs:
           fi
           if [[ -n "$NOTIFY_WEBHOOK" ]]; then
             args+=(--notify-webhook "$NOTIFY_WEBHOOK")
+            # 连续失败阈值依赖下载本工作流的历史报告，Artifact 名必须对上
+            args+=(--history-artifact sync-report-batch)
+          fi
+          if [[ -n "$NOTIFY_AFTER_FAILURES" && "$NOTIFY_AFTER_FAILURES" != "1" ]]; then
+            args+=(--notify-after-failures "$NOTIFY_AFTER_FAILURES")
           fi
 
           ./scripts/sync.sh "${args[@]}"
