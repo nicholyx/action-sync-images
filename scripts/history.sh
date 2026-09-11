@@ -26,6 +26,7 @@ LOCAL_DIR=""
 DO_DOWNLOAD="true"
 IMAGE_FILTER=""
 TOP_FAILURES=10
+SLOWEST=""
 REPORT_NAME="sync-report-aliyuncs"
 WORK_DIR=""
 
@@ -61,6 +62,9 @@ history.sh —— 从历次同步报告中汇总趋势
 查询：
       --image <镜像>      只看某个镜像的历史
       --top-failures <N>  只看失败次数最多的 N 个镜像，默认 10
+      --slowest <N>       只看平均耗时最慢的 N 个镜像（跨运行的平均值，
+                          同时给出波动范围——单次异常拉高平均时，看范围
+                          就能分辨「一直慢」还是「偶尔慢」）
   -h, --help              显示本帮助
 
 输出：
@@ -80,6 +84,9 @@ history.sh —— 从历次同步报告中汇总趋势
 
   # 失败的镜像里，哪些最值得先处理
   ./scripts/history.sh --top-failures 5
+
+  # 同步速度被谁拖慢了
+  ./scripts/history.sh --slowest 5
 EOF
 }
 
@@ -105,6 +112,9 @@ parse_args() {
         else
           shift
         fi ;;
+      --slowest)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        SLOWEST="$2"; shift 2 ;;
       -h|--help)
         usage; exit 0 ;;
       *)
@@ -120,6 +130,9 @@ parse_args() {
   fi
   if [[ ! "$TOP_FAILURES" =~ ^[0-9]+$ ]] || [[ "$TOP_FAILURES" -lt 1 ]]; then
     die "--top-failures 必须是正整数，当前为「${TOP_FAILURES}」"
+  fi
+  if [[ -n "$SLOWEST" && ! "$SLOWEST" =~ ^[0-9]+$ ]]; then
+    die "--slowest 必须是正整数，当前为「${SLOWEST}」"
   fi
 }
 
@@ -277,6 +290,56 @@ print_summary() {
   done
 }
 
+# 按平均耗时列出最慢的镜像。
+#
+# 用**平均值**并标注（不用中位数）：样本本来就少（几次运行），平均值的波动
+# 反而是想暴露的信息，同时给出 min~max 让波动可见。
+# 只统计真正同步过的记录——跳过与被排除的耗时恒为 0，会把平均值整个拉低，
+# 让榜单变得毫无意义。
+print_slowest() {
+  local -a files=("$@")
+
+  local rows
+  rows="$(jq -s --argjson n "$SLOWEST" '
+    [.[] | select(.images != null) | .images[]
+         | select(.status != "skipped" and .status != "excluded")]
+    | group_by(.source)
+    | map({
+        source: .[0].source,
+        runs: length,
+        avg: ((map(.seconds // 0) | add) / length),
+        max: (map(.seconds // 0) | max),
+        min: (map(.seconds // 0) | min)
+      })
+    | sort_by(-.avg)
+    | .[:$n]
+  ' "${files[@]}")"
+
+  if [[ "$(jq 'length' <<<"$rows")" -eq 0 ]]; then
+    printf '没有可统计耗时的记录。\n'
+    return 0
+  fi
+
+  printf '### 平均最慢的镜像（前 %s 个，按平均值排序）\n\n' "$SLOWEST"
+  printf '| 镜像 | 平均耗时 | 波动范围 | 同步次数 |\n'
+  printf '| --- | ---: | --- | :---: |\n'
+
+  local n i src avg maxc minc runs
+  n="$(jq 'length' <<<"$rows")"
+  for ((i = 0; i < n; i++)); do
+    src="$(jq -r ".[$i].source" <<<"$rows")"
+    avg="$(jq -r ".[$i].avg" <<<"$rows")"
+    maxc="$(jq -r ".[$i].max" <<<"$rows")"
+    minc="$(jq -r ".[$i].min" <<<"$rows")"
+    runs="$(jq -r ".[$i].runs" <<<"$rows")"
+    printf "| \`%s\` | %.1fs | %ss ~ %ss | %s |\n" \
+      "$src" "$avg" "$minc" "$maxc" "$runs"
+  done
+
+  printf '\n> 平均值对上游抽风很敏感，波动范围比平均更有参考价值。\n'
+  printf '> 单次异常拉高平均时，看范围就能分辨「一直慢」还是「偶尔慢」。\n'
+}
+
 # ---------------------------------------------------------------------------
 
 main() {
@@ -302,7 +365,12 @@ main() {
   log_info "共读取 ${#files[@]} 份报告"
   echo ""
 
-  print_summary "${files[@]}"
+  # --slowest 是独立的查询模式：只看耗时，不再叠加失败排行
+  if [[ -n "$SLOWEST" ]]; then
+    print_slowest "${files[@]}"
+  else
+    print_summary "${files[@]}"
+  fi
   echo ""
 
   # 历史里有失败就返回 2，便于在脚本或 CI 里据此判断。

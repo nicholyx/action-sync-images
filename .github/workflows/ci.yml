@@ -434,6 +434,58 @@ jobs:
           fi
           echo "✓ 查询模式正确"
 
+      - name: 验证耗时排行
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          work="$(mktemp -d)"
+
+          # 构造两份报告：c 镜像一次很快、一次超时（600s），a 镜像稳定地慢。
+          # 期望 --slowest 按**平均**排序把 c 排第一，同时波动范围能暴露出
+          # 它是「偶尔慢」而不是「一直慢」——这正是排行存在的意义。
+          for d in r1 r2; do mkdir -p "${work}/${d}"; done
+          cat > "${work}/r1/sync-report.json" <<'JSON'
+          {"generated_at": "2026-09-11T01:00:00Z", "total": 3, "success": 3, "skipped": 0, "failed": 0,
+           "images": [
+            {"source": "big.example.com/a:1", "dest": "d/a", "status": "success", "seconds": 100},
+            {"source": "mid.example.com/b:1", "dest": "d/b", "status": "success", "seconds": 30},
+            {"source": "flaky.example.com/c:1", "dest": "d/c", "status": "success", "seconds": 5}
+           ]}
+          JSON
+          cat > "${work}/r2/sync-report.json" <<'JSON'
+          {"generated_at": "2026-09-11T02:00:00Z", "total": 3, "success": 2, "skipped": 0, "failed": 1,
+           "images": [
+            {"source": "big.example.com/a:1", "dest": "d/a", "status": "success", "seconds": 200},
+            {"source": "mid.example.com/b:1", "dest": "d/b", "status": "success", "seconds": 26},
+            {"source": "flaky.example.com/c:1", "dest": "d/c", "status": "failed", "seconds": 600}
+           ]}
+          JSON
+
+          out="$(./scripts/history.sh --dir "$work" --slowest 5 2>/dev/null || true)"
+          echo "$out"
+
+          # c 的平均 (5+600)/2=302.5 应排在 a 的平均 150 之前
+          if [[ "$(grep -n 'flaky.example.com' <<<"$out" | head -1 | cut -d: -f1)" -gt \
+                "$(grep -n 'big.example.com' <<<"$out" | head -1 | cut -d: -f1)" ]]; then
+            echo "::error::--slowest 未按平均耗时降序排列"
+            exit 1
+          fi
+          grep -q '302.5s' <<<"$out" || { echo "::error::平均耗时计算不正确"; exit 1; }
+          grep -q '5s ~ 600s' <<<"$out" || { echo "::error::波动范围不正确"; exit 1; }
+          echo "✓ --slowest 按平均排序，波动范围正确"
+
+          # sync.sh 一侧：dry-run 下秒数全为 0，排行应自觉隐去——
+          # 全是 0s 的榜单没有信息量，只会占地方
+          rm -rf /tmp/rank && mkdir -p /tmp/rank
+          ./scripts/sync.sh --src "nginx:1.27,redis:7.4,alpine:3.20" --dest r.example.com/x \
+            --dry-run --report-dir /tmp/rank >/dev/null 2>&1
+          if grep -q '最慢的同步记录' /tmp/rank/sync-report.md; then
+            echo "::error::耗时全为 0 时不应输出排行"
+            exit 1
+          fi
+          echo "✓ 无有效耗时数据时排行自动隐去"
+
   # ---------------------------------------------------------------------------
   # 真实同步集成测试
   #
