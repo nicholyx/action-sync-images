@@ -72,6 +72,10 @@ SRC_CRED_ENTRIES=""
 # 环境变量 SYNC_SRC_CREDENTIALS（文件内容）落盘产生的临时文件路径。
 # cleanup 只删这个，绝不动使用者通过 --src-credentials 指定的自有文件
 SRC_CREDENTIALS_TMPFILE=""
+# 多目标中转：prepare_oci_staging 的传出变量（不能用命令替换传——
+# 那是子 shell，赋值传不回父进程，set -u 下读会炸）
+OCI_STAGING_DIR=""
+PULL_ELAPSED=0
 
 # 镜像筛选。二者都是 ERE 正则，作用于源镜像的完整引用。
 FILTER_REGEX=""
@@ -685,6 +689,110 @@ sync_one() {
   fi
 }
 
+# 推送到单个目标。多目标中转模式下走本地 OCI 目录，否则按常规路径。
+# 中转推送不需要 --src-authfile（本地文件无鉴权），但 --all 不能省——
+# 它同样要保留多架构索引。
+#
+# 常规分支的末尾**不能写 return 0**：sync_one 的退出码是「同步是否成功」
+# 的唯一依据，覆盖它会让失败的同步被记成成功（本 PR 的 CI 当场抓到过）。
+sync_to_dest() {
+  local src="$1" dest="$2" platforms="$3" oci_dir="$4"
+
+  if [[ -z "$oci_dir" ]]; then
+    sync_one "$src" "$dest" "$platforms"
+    return $?
+  fi
+
+  local -a cmd=(skopeo copy --all)
+  if [[ "$TLS_VERIFY" == "false" ]]; then
+    cmd+=(--dest-tls-verify=false)
+  fi
+  cmd+=("oci:${oci_dir}:sync" "docker://${dest}")
+  run_with_timeout "${cmd[@]}"
+}
+
+# 完整 inspect（非 --raw）。同样统一 TLS 与凭证设置——
+# 大小估算用它，漏掉凭证会重演「跳过判定静默失效」。
+skopeo_inspect() {
+  local ref="$1"
+  local -a cmd=(skopeo inspect)
+  if [[ "$TLS_VERIFY" == "false" ]]; then
+    cmd+=(--tls-verify=false)
+  fi
+  if [[ -n "$SRC_AUTHFILE" ]]; then
+    cmd+=(--authfile "$SRC_AUTHFILE")
+  fi
+  cmd+=("docker://${ref}")
+  "${cmd[@]}"
+}
+
+# 估算镜像的未压缩层数据总量（字节）。拿不到就返回空，调用方跳过空间检查——
+# 检查是防止磁盘写满的预检，不该因为估不出大小就拒绝同步。
+# LayersData 的字段大小写在 skopeo 版本间有过变化，候选都试一遍；
+# 全都匹配不上时返回 0，同样跳过检查而不是拒绝同步。
+estimate_image_bytes() {
+  skopeo_inspect "$1" 2>/dev/null \
+    | jq -r '[(.LayersData // .layersData // [])[] | (.size // .Size // 0)] | add // 0' 2>/dev/null \
+    || true
+}
+
+# 多目标中转的准备阶段：把源镜像拉到本地 OCI 目录，一次拉取供全部目标使用。
+#
+# 成功时把目录路径写入全局 OCI_STAGING_DIR，拉取耗时写入全局 PULL_ELAPSED，
+# 返回 0；失败时（磁盘不足 / 拉取失败）返回非零，调用方退化为逐目标拉推。
+# **不能用命令替换「stdout 传值」**：那是子 shell，里面的赋值传不回父进程，
+# set -u 下父进程读 PULL_ELAPSED 会直接 unbound variable。
+# 失败路径全部走告警而不是 die——优化失败不该改变同步的结果语义。
+prepare_oci_staging() {
+  local src="$1"
+  local tmpdir="${TMPDIR:-/tmp}"
+  tmpdir="${tmpdir%/}"
+
+  # 磁盘空间预检：估算层数据量 + 20% 余量 + 100MB 底数。
+  # 并发模式下每个镜像都有各自的中转目录，需求按并发度放大——
+  # 否则 6 个大镜像并发时预检全部通过，实际把磁盘一起写满。
+  # runner 通常有 14GB 可用，但 ML 框架这类镜像能到 10GB 级，写满磁盘
+  # 会让后续所有目标一起失败——那正是这个优化最不该发生的地方。
+  local est
+  est="$(estimate_image_bytes "$src")"
+  if [[ -n "$est" && "$est" -gt 0 ]]; then
+    local need=$(( est * 12 * CONCURRENCY / 10 + 104857600 ))
+    local avail
+    avail="$(df -Pk "$tmpdir" | awk 'NR==2 {print $4 * 1024}')"
+    if [[ -n "$avail" && "$avail" -lt "$need" ]]; then
+      log_warn "临时空间不足（并发 ${CONCURRENCY} 路需约 $((need / 1048576))MB，可用 $((avail / 1048576))MB），退化为逐目标拉取"
+      return 1
+    fi
+  fi
+
+  local oci_dir
+  oci_dir="$(mktemp -d "${tmpdir}/sync-oci.XXXXXX")" || {
+    log_warn "无法创建中转目录，退化为逐目标拉取"
+    return 1
+  }
+
+  local -a cmd=(skopeo copy --all)
+  if [[ "$TLS_VERIFY" == "false" ]]; then
+    cmd+=(--src-tls-verify=false)
+  fi
+  if [[ -n "$SRC_AUTHFILE" ]]; then
+    cmd+=(--src-authfile "$SRC_AUTHFILE")
+  fi
+  cmd+=("docker://${src}" "oci:${oci_dir}:sync")
+
+  local start end
+  start="$(date +%s)"
+  if ! run_with_timeout "${cmd[@]}"; then
+    rm -rf "$oci_dir"
+    log_warn "源镜像拉取到本地中转失败，退化为逐目标拉取（原因见上方日志）"
+    return 1
+  fi
+  end="$(date +%s)"
+  PULL_ELAPSED=$((end - start))
+  OCI_STAGING_DIR="$oci_dir"
+  return 0
+}
+
 # 提取镜像的「平台 → 子 manifest digest」映射。
 #
 # 为什么不直接比较顶层 manifest 的完整 JSON：不同 registry 对 mediaType、
@@ -1227,7 +1335,6 @@ process_one() {
   local total="$3"
   local src dest dest_repo platforms
   local src_digest="" dest_digest=""
-  local -a dests=()
 
   src="$(normalize_ref "$raw_src")"
 
@@ -1244,6 +1351,7 @@ process_one() {
 
   # 构造目标列表。支持多目标：每个镜像会对列表中的每个目标各同步一次。
   dest_repo="$(dest_repo_for "$src")"
+  local -a dests=()
   if [[ -n "$DEST_EXACT" ]]; then
     dests=("$DEST_EXACT")
   else
@@ -1258,14 +1366,15 @@ process_one() {
   # 平台取决于源镜像、与目标无关，因此只解析一次
   platforms="$(resolve_platforms "$src")"
 
+  # ---- 第一遍：逐目标做增量跳过判定，收集真正需要推送的目标 ----
+  # **每个目标独立判定**——某个目标已是最新，不代表其他目标也是。
+  # strip-attestation 模式会重建索引、目标 digest 必然与源不同，因此不做跳过。
   local di=0
   local dest_total=${#dests[@]}
+  local -a pending=()
+  local -a pending_di=()
   for dest in "${dests[@]}"; do
     di=$((di + 1))
-
-    local start end elapsed status note=""
-    local result_file
-    result_file="$(result_file_for "$idx" "$di")"
 
     if [[ "$dest_total" -gt 1 ]]; then
       log_info "目标 [${di}/${dest_total}]：${dest}"
@@ -1274,21 +1383,48 @@ process_one() {
     fi
     log_info "平台：${platforms}"
 
-    # 增量跳过：目标已经有完全相同的镜像时不必再推一次。
-    # **每个目标独立判定**——某个目标已是最新，不代表其他目标也是。
-    # strip-attestation 模式会重建索引、目标 digest 必然与源不同，因此不做跳过。
     if [[ "$SKIP_EXISTING" == "true" && "$STRIP_ATTESTATION" != "true" && "$DRY_RUN" != "true" ]]; then
       if is_up_to_date "$src" "$dest"; then
         log_skip "  目标已是最新，跳过"
         src_digest="$(compute_digest "$src" || true)"
-        write_result "$result_file" "$src" "$dest" "skipped" "全部（--all）" "0" \
+        write_result "$(result_file_for "$idx" "$di")" "$src" "$dest" "skipped" "全部（--all）" "0" \
           "目标已存在相同镜像" "$src_digest" "$src_digest"
         continue
       fi
     fi
+    pending+=("$dest")
+    pending_di+=("$di")
+  done
+
+  # ---- 推送 ----
+  # 多个目标待推送时走本地 OCI 中转：源只拉取一次，逐目标推送。
+  # 中转是**纯优化**——准备阶段的任何失败（磁盘不足、拉取失败）都退化为
+  # 逐目标拉推的旧行为，不改变任何一条结果记录的语义。
+  # 单目标、dry-run 与 strip-attestation 模式不走中转：
+  # 前两者没有收益，第三者要重建索引、regctl 不经过 oci transport。
+  local pull_elapsed=0
+  local oci_dir=""
+  if [[ ${#pending[@]} -ge 2 && "$STRIP_ATTESTATION" != "true" && "$DRY_RUN" != "true" ]]; then
+    log_info "${#pending[@]} 个目标待推送，尝试本地中转（源只拉取一次）"
+    OCI_STAGING_DIR=""
+    PULL_ELAPSED=0
+    if prepare_oci_staging "$src"; then
+      oci_dir="$OCI_STAGING_DIR"
+      pull_elapsed="$PULL_ELAPSED"
+      log_ok "源已拉取到本地中转（耗时 ${pull_elapsed}s），逐目标推送"
+    fi
+  fi
+
+  local start end elapsed status note=""
+  local result_file
+  local p
+  for p in "${!pending[@]}"; do
+    dest="${pending[$p]}"
+    di="${pending_di[$p]}"
+    result_file="$(result_file_for "$idx" "$di")"
 
     start="$(date +%s)"
-    if sync_one "$src" "$dest" "$platforms"; then
+    if sync_to_dest "$src" "$dest" "$platforms" "$oci_dir"; then
       status="success"
       log_ok "  同步成功"
     else
@@ -1299,6 +1435,13 @@ process_one() {
     fi
     end="$(date +%s)"
     elapsed=$((end - start))
+
+    # 拉取耗时计入第一个待推送目标，并在备注里注明——
+    # 总耗时几乎总是由它主导，藏进日志会让耗时排行看起来不合理
+    if [[ "$p" -eq 0 && "$pull_elapsed" -gt 0 ]]; then
+      elapsed=$((elapsed + pull_elapsed))
+      note="含源镜像拉取 ${pull_elapsed}s"
+    fi
 
     # 完整性校验：skopeo 返回 0 不代表每个平台都完整推上去了。
     # 校验放在 digest 记录之前——校验失败会直接改写 status，此时 digest
@@ -1342,6 +1485,9 @@ process_one() {
     write_result "$result_file" "$src" "$dest" "$status" "$platforms" "$elapsed" "$note" \
       "$src_digest" "$dest_digest"
   done
+
+  # 中转目录里是完整镜像（可能数 GB），推送循环一结束就删，不等退出兜底
+  [[ -n "$oci_dir" ]] && rm -rf "$oci_dir"
 
   group_end
   return 0

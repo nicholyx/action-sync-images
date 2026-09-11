@@ -732,6 +732,13 @@ jobs:
           fi
           echo "✓ 真实同步 + 校验通过"
 
+          # 单目标没有中转的收益，必须保持常规路径
+          if grep -q '本地中转' <<<"$output"; then
+            echo "::error::单目标同步不应走本地中转"
+            exit 1
+          fi
+          echo "✓ 单目标保持常规路径"
+
       - name: 断言目标存在且内容与源一致
         run: |
           #!/usr/bin/env bash
@@ -798,14 +805,34 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
 
-          # 同一个源同时推送到两个目标
-          ./scripts/sync.sh \
+          # 同一个源同时推送到两个目标。两个目标都需要推送，
+          # 会走本地 OCI 中转——源只拉取一次，这是多目标的默认行为。
+          # 注意 set +e 包裹：sync.sh 有失败时退出码非 0，而 output="$(…)"
+          # 的退出码就是它的退出码，errexit 会在这里直接中断步骤、
+          # 吞掉全部输出——排查时只剩一句 exit code 1。
+          set +e
+          output="$(./scripts/sync.sh \
             --src localhost:5000/source/hello:latest \
             --dest localhost:5000/mirror-a \
             --dest localhost:5000/mirror-b \
-            --tls-verify false --concurrency 1
+            --tls-verify false --concurrency 1 2>&1)"
+          sync_code=$?
+          set -e
+          echo "$output"
 
-          # 两个目标都应存在——多目标最容易出的问题是「只推了第一个」
+          if [[ "$sync_code" -ne 0 ]]; then
+            echo "::error::多目标中转同步失败（退出码 ${sync_code}），输出见上"
+            exit 1
+          fi
+
+          if ! grep -q '源已拉取到本地中转' <<<"$output"; then
+            echo "::error::多目标同步未走本地中转（源被多次拉取）"
+            exit 1
+          fi
+          echo "✓ 多目标走了本地中转（源只拉取一次）"
+
+          # 两个目标都应存在——多目标最容易出的问题是「只推了第一个」。
+          # 中转改写了推送路径，更要确认每个目标的内容都完整。
           for repo in mirror-a mirror-b; do
             dest="localhost:5000/${repo}/localhost_5000_source_hello:latest"
             if ! skopeo inspect --tls-verify=false "docker://${dest}" >/dev/null 2>&1; then
@@ -814,6 +841,17 @@ jobs:
             fi
             echo "✓ ${repo} 中存在目标镜像"
           done
+
+          # 中转推送的内容必须与源一致（逐目标比对平台摘要）
+          output="$(./scripts/sync.sh \
+            --src localhost:5000/source/hello:latest \
+            --dest localhost:5000/mirror-a \
+            --tls-verify false --skip-existing 2>&1)"
+          if ! grep -q '目标已是最新' <<<"$output"; then
+            echo "::error::中转推送的内容与源不一致（增量跳过未生效）"
+            exit 1
+          fi
+          echo "✓ 中转推送内容与源一致"
 
       # -----------------------------------------------------------------------
       # 私有源：走到认证这条真实路径上
