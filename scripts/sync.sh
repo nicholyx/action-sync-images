@@ -27,6 +27,7 @@ REGCTL_VERSION="v0.11.6"
 CONCURRENCY="1"
 TIMEOUT="600"
 SKIP_EXISTING="false"
+TLS_VERIFY="true"
 NOTIFY_WEBHOOK=""
 NOTIFY_TYPE="auto"
 NOTIFY_ON="always"
@@ -129,6 +130,8 @@ sync.sh —— 容器镜像同步引擎
       --skip-existing      目标仓库已有完全相同的镜像时直接跳过，不重复推送。
                            默认的 skopeo 路径支持此优化；--strip-attestation
                            会重建索引，目标 digest 必然不同，因此不做跳过
+      --tls-verify <bool>  是否校验 registry 的 TLS 证书，默认 true。
+                           自建 HTTP 仓库（如本地 registry:2）填 false
 
 性能与可靠性：
   -c, --concurrency <N>    并发同步的镜像数量，默认 1（串行）。
@@ -198,6 +201,9 @@ parse_args() {
         STRIP_ATTESTATION="true"; shift ;;
       --skip-existing)
         SKIP_EXISTING="true"; shift ;;
+      --tls-verify)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        TLS_VERIFY="$2"; shift 2 ;;
       -c|--concurrency)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         CONCURRENCY="$2"; shift 2 ;;
@@ -260,29 +266,50 @@ normalize_ref() {
 
 # 由源镜像推导目标仓库名。
 #
-# 阿里云个人版仓库不支持多级路径，因此把 / 全部替换为 _。
+# 阿里云个人版仓库不支持多级路径，因此把路径分隔符压平。
 #
-# 另外要**剥掉 digest**：目标需要的是一个可寻址的名字，而不是不可变引用。
-# 带着 @sha256:… 拼出来的目标地址是非法的，推送会失败——这个问题在使用
-# 锁文件（源引用天然带 digest）时会立刻暴露。
+# 有两处容易忽略的细节：
+#
+# 1. **剥掉 digest**：目标需要的是可寻址的名字而非不可变引用，
+#    带着 @sha256:… 拼出来的目标地址是非法的，推送必然失败。
+#    这个问题在使用锁文件（源引用天然带 digest）时会立刻暴露。
+#
+# 2. **端口后的冒号也要处理**：仓库名允许的字符集是
+#    [a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*，**不含冒号**。而 registry 地址
+#    可以带端口（如 localhost:5000），若只替换 / 就会生成
+#    `localhost:5000_source_hello` 这种非法仓库名。
+#    因此必须先分离出 tag——只有落在**最后一个 / 之后**的冒号才是 tag
+#    分隔符——对名称部分同时替换 / 和 :，最后再拼回 tag。
 dest_repo_for() {
-  local ref="$1" digest="" base short
+  local ref="$1" digest="" name="" tag="" short=""
 
+  # 剥掉 digest
   if [[ "$ref" == *"@"* ]]; then
     digest="${ref#*@}"
     ref="${ref%%@*}"
   fi
 
-  base="${ref//\//_}"
+  # 分离 tag：只有最后一个 / 之后的冒号才是 tag 分隔符
+  local last_segment="${ref##*/}"
+  if [[ "$last_segment" == *:* ]]; then
+    tag=":${last_segment#*:}"
+    name="${ref%:*}"
+  else
+    name="$ref"
+  fi
+
+  # 压平：/ 和 : 都换成 _（仓库名不允许冒号，也不支持多级路径）
+  name="${name//\//_}"
+  name="${name//:/_}"
 
   # 源只给了 digest 没给 tag（形如 nginx@sha256:…）时，
   # 用 digest 前缀生成一个可读的 tag，避免目标没有 tag
-  if [[ "$base" != *:* && -n "$digest" ]]; then
+  if [[ -z "$tag" && -n "$digest" ]]; then
     short="${digest#sha256:}"
-    base="${base}:${short:0:12}"
+    tag=":${short:0:12}"
   fi
 
-  printf '%s' "$base"
+  printf '%s%s' "$name" "$tag"
 }
 
 # 判断字符串是否符合镜像引用的大致格式。
@@ -397,12 +424,22 @@ run_with_timeout() {
 # 常规路径：skopeo 原样搬运，--all 保证 multi-arch 索引完整保留
 sync_via_skopeo() {
   local src="$1" dest="$2"
+  # 用数组拼参数而不是条件分支重复整条命令：
+  # 这样也不会踩到「空数组在 set -u 下展开出错」的坑
+  local -a cmd=(skopeo copy --all --retry-times "$MAX_RETRIES")
+
+  if [[ "$TLS_VERIFY" == "false" ]]; then
+    cmd+=(--src-tls-verify=false --dest-tls-verify=false)
+  fi
+
+  cmd+=("docker://${src}" "docker://${dest}")
+
   if [[ "$DRY_RUN" == "true" ]]; then
-    log_dim "  [dry-run] skopeo copy --all --retry-times ${MAX_RETRIES} docker://${src} docker://${dest}"
+    log_dim "  [dry-run] ${cmd[*]}"
     return 0
   fi
-  run_with_timeout skopeo copy --all --retry-times "$MAX_RETRIES" \
-    "docker://${src}" "docker://${dest}"
+
+  run_with_timeout "${cmd[@]}"
 }
 
 # 特殊路径：用 regctl 重建索引，只包含指定平台，
@@ -1076,6 +1113,11 @@ main() {
   case "$NOTIFY_ON" in
     always|failure) ;;
     *) die "--notify-on 只能是 always 或 failure，当前为「${NOTIFY_ON}」" ;;
+  esac
+
+  case "$TLS_VERIFY" in
+    true|false) ;;
+    *) die "--tls-verify 只能是 true 或 false，当前为「${TLS_VERIFY}」" ;;
   esac
 
   DEST_REGISTRY="${DEST_REGISTRY#docker://}"

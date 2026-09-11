@@ -413,6 +413,24 @@ brew install skopeo regclient
   --strip-attestation
 ```
 
+### 同步到自建的 HTTP registry
+
+自建 registry（例如本地起的 `registry:2` 容器）通常走 HTTP 而非 HTTPS，需要显式关闭 TLS 校验：
+
+```bash
+# 本地起一个 registry 试试
+docker run -d -p 5000:5000 --name registry registry:2
+
+./scripts/sync.sh \
+  --src docker.io/library/nginx:1.27 \
+  --dest localhost:5000/mirror \
+  --tls-verify false
+```
+
+> ⚠️ **只在可信网络中对自建仓库使用 `--tls-verify false`。** 对公网仓库关闭证书校验会让中间人攻击成为可能。
+
+另外注意：目标仓库名由源镜像推导，其中**端口号里的冒号也会被替换掉**（仓库名不允许含冒号），所以上面的例子会同步到 `localhost:5000/mirror/docker.io_library_nginx:1.27`。
+
 完整参数见 `./scripts/sync.sh --help`。
 
 ---

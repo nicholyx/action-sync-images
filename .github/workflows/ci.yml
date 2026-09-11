@@ -203,6 +203,122 @@ jobs:
           check_reject "精确目标配多个镜像" ./scripts/sync.sh --src "nginx:1.27,redis:7.4" --dest-exact h.example.com/a --dry-run
 
   # ---------------------------------------------------------------------------
+  # 真实同步集成测试
+  #
+  # 与冒烟测试的关键区别：这里**真的会推送镜像**。
+  #
+  # v1.1.0 期间暴露的三个缺陷——跳过判定失效、目标地址携带 digest、结果文件
+  # 字段错位——全部发生在真实推送路径上，而 dry-run 刻意绕开了那条路径，
+  # 因此一个都抓不到。这个 job 用本地 registry 容器补上这段验证，
+  # 不需要任何外部凭证。
+  # ---------------------------------------------------------------------------
+  integration-test:
+    name: 真实同步集成测试
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repos
+        uses: actions/checkout@v7
+
+      - name: 启动本地 registry
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          docker run -d -p 5000:5000 --name registry registry:2
+
+          # 等 registry 就绪，最多 30 秒
+          for _ in $(seq 1 30); do
+            if curl -sf http://localhost:5000/v2/ >/dev/null 2>&1; then
+              echo "✓ 本地 registry 已就绪"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "::error::本地 registry 启动超时"
+          docker logs registry
+          exit 1
+
+      - name: 准备源镜像
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          # hello-world 极小，适合作为测试素材
+          skopeo copy --dest-tls-verify=false \
+            docker://docker.io/library/hello-world:latest \
+            docker://localhost:5000/source/hello:latest
+
+      - name: 首次同步（真实推送）
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          ./scripts/sync.sh \
+            --src localhost:5000/source/hello:latest \
+            --dest localhost:5000/dest \
+            --tls-verify false --concurrency 1
+
+      - name: 断言目标存在且内容与源一致
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          dest="localhost:5000/dest/localhost_5000_source_hello:latest"
+
+          if ! skopeo inspect --tls-verify=false "docker://${dest}" >/dev/null 2>&1; then
+            echo "::error::目标镜像不存在：${dest}"
+            exit 1
+          fi
+
+          src_sum="$(skopeo inspect --raw --tls-verify=false docker://localhost:5000/source/hello:latest | openssl dgst -sha256 | awk '{print $NF}')"
+          dest_sum="$(skopeo inspect --raw --tls-verify=false "docker://${dest}" | openssl dgst -sha256 | awk '{print $NF}')"
+
+          if [[ "$src_sum" != "$dest_sum" ]]; then
+            echo "::error::源与目标内容不一致（${src_sum} != ${dest_sum}）"
+            exit 1
+          fi
+          echo "✓ 目标存在，且内容与源完全一致"
+
+      - name: 再次同步应被跳过
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          output="$(./scripts/sync.sh \
+            --src localhost:5000/source/hello:latest \
+            --dest localhost:5000/dest \
+            --tls-verify false --skip-existing 2>&1)"
+          echo "$output"
+
+          # 这正是 #13 要防住的回归：跳过判定曾因多层原因完全失效
+          if ! grep -q '跳过 1 个' <<<"$output"; then
+            echo "::error::第二次同步未被跳过，增量同步已失效"
+            exit 1
+          fi
+          echo "✓ 增量跳过生效"
+
+      - name: 源内容变化后应重新同步
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 用另一个镜像覆盖同一个 tag，内容随之改变
+          skopeo copy --dest-tls-verify=false \
+            docker://docker.io/library/alpine:latest \
+            docker://localhost:5000/source/hello:latest
+
+          output="$(./scripts/sync.sh \
+            --src localhost:5000/source/hello:latest \
+            --dest localhost:5000/dest \
+            --tls-verify false --skip-existing 2>&1)"
+          echo "$output"
+
+          if ! grep -q '成功 1 个' <<<"$output"; then
+            echo "::error::源内容已变化却仍被跳过，跳过判定过于宽松"
+            exit 1
+          fi
+          echo "✓ 内容变化后正确重新同步"
+
+  # ---------------------------------------------------------------------------
   # 提交信息规范
   # 只在 PR 上跑（push 到 main 的提交已经过 PR 校验）。
   # squash merge 后 PR 标题会成为提交信息，所以标题也要一并校验。
@@ -236,7 +352,7 @@ jobs:
   ci-summary:
     name: CI 总览
     runs-on: ubuntu-latest
-    needs: [actionlint, yamllint, shellcheck, smoke-test, commit-messages]
+    needs: [actionlint, yamllint, shellcheck, smoke-test, integration-test, commit-messages]
     if: always()
     steps:
       - name: 汇总各检查结果
@@ -245,13 +361,14 @@ jobs:
           R_YAMLLINT: ${{ needs.yamllint.result }}
           R_SHELLCHECK: ${{ needs.shellcheck.result }}
           R_SMOKE: ${{ needs.smoke-test.result }}
+          R_INTEGRATION: ${{ needs.integration-test.result }}
           R_COMMITS: ${{ needs.commit-messages.result }}
         run: |
           #!/usr/bin/env bash
           set -euo pipefail
 
-          declare -a names=(工作流静态检查 YAML风格检查 Shell脚本检查 冒烟测试 提交信息规范)
-          declare -a results=("$R_ACTIONLINT" "$R_YAMLLINT" "$R_SHELLCHECK" "$R_SMOKE" "$R_COMMITS")
+          declare -a names=(工作流静态检查 YAML风格检查 Shell脚本检查 冒烟测试 集成测试 提交信息规范)
+          declare -a results=("$R_ACTIONLINT" "$R_YAMLLINT" "$R_SHELLCHECK" "$R_SMOKE" "$R_INTEGRATION" "$R_COMMITS")
 
           failed=0
 
