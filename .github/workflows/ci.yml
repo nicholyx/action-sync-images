@@ -330,6 +330,50 @@ jobs:
           done
           echo "✓ 多平台全部传递，未丢弃最后一个"
 
+      - name: 验证重试参数的作用范围
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # regctl 路径下 --retries 到不了 regclient，必须告警而不是静默忽略。
+          # 静默失效比直接报错更危险：使用者会以为自己控制住了重试次数，
+          # 而这个错误认知要等到真正需要重试时才暴露。
+          output="$(./scripts/sync.sh --src nginx:1.27 --dest r.example.com/x \
+            --strip-attestation --platforms linux/amd64 \
+            --retries 10 --retry-delay 5s --dry-run 2>&1)"
+
+          if ! grep -q 'retries 10 在 regctl 路径下不生效' <<<"$output"; then
+            echo "::error::regctl 路径下显式传入 --retries 时应给出告警"
+            echo "$output"
+            exit 1
+          fi
+          if ! grep -q 'retry-delay 5s 仅对 skopeo 生效' <<<"$output"; then
+            echo "::error::regctl 路径下显式传入 --retry-delay 时应给出告警"
+            echo "$output"
+            exit 1
+          fi
+          echo "✓ regctl 路径下失效的参数有明确告警"
+
+          # 未显式指定时不该打扰使用者——默认值不生效是预期内的，不值得每次都刷屏
+          output="$(./scripts/sync.sh --src nginx:1.27 --dest r.example.com/x \
+            --strip-attestation --platforms linux/amd64 --dry-run 2>&1)"
+          if grep -q '不生效' <<<"$output"; then
+            echo "::error::未显式传入 --retries / --retry-delay 时不应产生告警"
+            echo "$output"
+            exit 1
+          fi
+          echo "✓ 默认情况下不产生多余告警"
+
+          # skopeo 路径下 --retry-delay 必须真的进入命令
+          output="$(./scripts/sync.sh --src nginx:1.27 --dest r.example.com/x \
+            --retry-delay 10s --dry-run 2>&1)"
+          if ! grep -q -- '--retry-delay 10s' <<<"$output"; then
+            echo "::error::--retry-delay 未传递给 skopeo"
+            echo "$output"
+            exit 1
+          fi
+          echo "✓ --retry-delay 正确传递给 skopeo"
+
   # ---------------------------------------------------------------------------
   # 真实同步集成测试
   #
