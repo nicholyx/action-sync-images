@@ -286,6 +286,50 @@ jobs:
           fi
           echo "✓ 排除项不会被误判为失败"
 
+      - name: 验证 regctl 路径的平台列表解析
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 这组断言守的是一个曾经长期存在的缺陷：平台列表用
+          #   printf '%s' "$platforms" | tr ',' '\n'
+          # 逐行读取，而 printf 不输出结尾换行，read 读到没有换行收尾的最后一段时
+          # 会返回非零、循环体不执行。结果：单平台一个都读不到而直接失败，
+          # 多平台则**静默丢掉最后一个**——arm64 没同步，却没有任何报错。
+          #
+          # 之所以能守住，是因为 dry-run 现在打印的是真正会执行的 platform_args，
+          # 而不是拿输入去复述一遍。dry-run 一旦与实际行为脱节就失去意义。
+
+          # 单平台：曾经完全无法使用
+          output="$(./scripts/sync.sh --src nginx:1.27 --dest r.example.com/x \
+            --strip-attestation --platforms linux/amd64 --dry-run 2>&1)"
+          echo "$output"
+          if ! grep -q -- '--platform linux/amd64' <<<"$output"; then
+            echo "::error::单平台未能解析出任何平台"
+            exit 1
+          fi
+          echo "✓ 单平台解析正确"
+
+          # 多平台：曾经丢掉最后一个
+          output="$(./scripts/sync.sh --src nginx:1.27 --dest r.example.com/x \
+            --strip-attestation --platforms linux/amd64,linux/arm64,linux/arm/v7 --dry-run 2>&1)"
+          echo "$output"
+
+          count="$(grep -o -- '--platform ' <<<"$output" | wc -l | tr -d ' ')"
+          if [[ "$count" -ne 3 ]]; then
+            echo "::error::期望传递 3 个平台，实际 ${count} 个——最后一个平台很可能被丢弃了"
+            exit 1
+          fi
+
+          # 只数个数还不够：三个位置都对才算真的没丢
+          for p in linux/amd64 linux/arm64 linux/arm/v7; do
+            if ! grep -q -- "--platform ${p}" <<<"$output"; then
+              echo "::error::平台 ${p} 未被传递"
+              exit 1
+            fi
+          done
+          echo "✓ 多平台全部传递，未丢弃最后一个"
+
   # ---------------------------------------------------------------------------
   # 真实同步集成测试
   #
