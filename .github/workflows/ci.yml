@@ -374,6 +374,66 @@ jobs:
           fi
           echo "✓ --retry-delay 正确传递给 skopeo"
 
+      - name: 验证 history.sh 能从报告中聚合趋势
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          work="$(mktemp -d)"
+
+          # 造两份报告：一份全成功，一份含一个非法镜像（会被记为失败）
+          ./scripts/sync.sh --src "nginx:1.27,redis:7.4" --dest r.example.com/x \
+            --dry-run --report-dir "${work}/run1" >/dev/null 2>&1
+
+          # 这一条**故意**要失败（那份报告里得有一条 failed 记录），
+          # 所以它返回 2 是预期内的。不关掉 errexit 的话，下面所有断言都不会执行——
+          # 而失败信息只会是一句没头没尾的「exit code 2」。
+          set +e
+          ./scripts/sync.sh --src "nginx:1.27,https://bad.example.com/x:1" --dest r.example.com/x \
+            --dry-run --report-dir "${work}/run2" >/dev/null 2>&1
+          set -e
+
+          set +e
+          out="$(./scripts/history.sh --dir "$work" 2>/dev/null)"
+          code=$?
+          set -e
+
+          echo "$out"
+
+          # 累计应为 4 个镜像次（2 + 2）
+          if ! grep -q '累计同步 \*\*4\*\* 个镜像次' <<<"$out"; then
+            echo "::error::history.sh 的累计统计不正确"
+            exit 1
+          fi
+
+          # 失败过的镜像必须出现在表里——聚合的意义正在于此
+          if ! grep -q 'bad.example.com' <<<"$out"; then
+            echo "::error::history.sh 未列出失败过的镜像"
+            exit 1
+          fi
+
+          # 历史中有失败即以退出码 2 结束，便于在脚本或 CI 里据此判断
+          if [[ "$code" -ne 2 ]]; then
+            echo "::error::历史中有失败时应以退出码 2 结束，实际 ${code}"
+            exit 1
+          fi
+          echo "✓ 汇总与退出码正确"
+
+          # 单镜像查询
+          out="$(./scripts/history.sh --dir "$work" --image nginx:1.27 2>/dev/null || true)"
+          if ! grep -q 'nginx:1.27' <<<"$out"; then
+            echo "::error::--image 查询未返回结果"
+            exit 1
+          fi
+
+          # 查询一个不存在的镜像应给出提示，而不是空表
+          out="$(./scripts/history.sh --dir "$work" --image no-such:1.0 2>/dev/null || true)"
+          if ! grep -q '没有找到镜像' <<<"$out"; then
+            echo "::error::--image 查不到时应给出明确提示"
+            exit 1
+          fi
+          echo "✓ 查询模式正确"
+
   # ---------------------------------------------------------------------------
   # 真实同步集成测试
   #
