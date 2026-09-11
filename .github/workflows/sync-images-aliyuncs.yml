@@ -39,6 +39,10 @@ on:
         required: false
         type: boolean
         default: false
+      notify_after_failures:
+        description: '同一个镜像连续失败多少次才通知（默认 1 = 每次都通知；调大可对抗通知疲劳）'
+        required: false
+        default: '1'
 
 # 只需要读代码，推送凭证通过 Secrets 注入
 permissions:
@@ -83,6 +87,7 @@ jobs:
           # 可选：在仓库 Secrets 中配置 NOTIFY_WEBHOOK 即可启用结果通知。
           # 未配置时为空字符串，脚本不会发送任何通知。
           NOTIFY_WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK }}
+          NOTIFY_AFTER_FAILURES: ${{ inputs.notify_after_failures }}
           # 可选：同步私有源镜像时，在仓库 Secrets 中配置这两个。
           # 用环境变量而不是命令行参数传：参数既对同机进程可见，也会被下面那句
           # 「执行：./scripts/sync.sh ${args[*]}」原样打进日志。
@@ -115,6 +120,11 @@ jobs:
           fi
           if [[ -n "$NOTIFY_WEBHOOK" ]]; then
             args+=(--notify-webhook "$NOTIFY_WEBHOOK")
+            # 连续失败阈值依赖下载本工作流的历史报告，Artifact 名必须对上
+            args+=(--history-artifact sync-report-aliyuncs)
+          fi
+          if [[ -n "$NOTIFY_AFTER_FAILURES" && "$NOTIFY_AFTER_FAILURES" != "1" ]]; then
+            args+=(--notify-after-failures "$NOTIFY_AFTER_FAILURES")
           fi
 
           echo "执行：./scripts/sync.sh ${args[*]}"
