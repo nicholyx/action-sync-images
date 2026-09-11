@@ -62,6 +62,7 @@ jobs:
           CONCURRENCY: ${{ inputs.concurrency }}
           SKIP_EXISTING: ${{ inputs.skip_existing }}
           DRY_RUN: ${{ inputs.dry_run }}
+          NOTIFY_WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK }}
         run: |
           #!/usr/bin/env bash
           set -euo pipefail
@@ -84,6 +85,9 @@ jobs:
           fi
           if [[ "$DRY_RUN" == "true" ]]; then
             args+=(--dry-run)
+          fi
+          if [[ -n "$NOTIFY_WEBHOOK" ]]; then
+            args+=(--notify-webhook "$NOTIFY_WEBHOOK")
           fi
 
           echo "执行：./scripts/sync.sh ${args[*]}"
