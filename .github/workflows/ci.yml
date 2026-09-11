@@ -486,6 +486,65 @@ jobs:
           fi
           echo "✓ 无有效耗时数据时排行自动隐去"
 
+      - name: 验证完整性校验的差异判定
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # verify_integrity 的核心逻辑用 mock 验证：真实环境里「目标与源不一致」
+          # 这个状态没法稳定端到端构造——校验紧跟同步执行，而同步本身会覆盖掉
+          # 不一致的目标。mock 的对象是 skopeo_inspect_raw（inspect 的唯一入口），
+          # 平台摘要提取走的仍是生产代码里的 platform_digest_map。
+          sed -n '/^platform_digest_map()/,/^}/p' scripts/sync.sh > /tmp/verify-fns.sh
+          sed -n '/^verify_integrity()/,/^}/p' scripts/sync.sh >> /tmp/verify-fns.sh
+
+          cat > /tmp/test-verify.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          source /tmp/verify-fns.sh
+          skopeo_inspect_raw() {
+            case "$1" in
+              *good*)    printf '{"manifests":[{"platform":{"os":"linux","architecture":"amd64"},"digest":"sha256:aaa"},{"platform":{"os":"linux","architecture":"arm64"},"digest":"sha256:bbb"}]}' ;;
+              *missing*) printf '{"manifests":[{"platform":{"os":"linux","architecture":"amd64"},"digest":"sha256:aaa"}]}' ;;
+              *empty*)   printf '' ;;
+              *)         printf '{"manifests":[]}' ;;
+            esac
+          }
+          run() { set +e; detail="$(verify_integrity "$1" "$2" 2>/dev/null)"; rc=$?; set -e; }
+
+          run good-src good-dest
+          [[ $rc -eq 0 ]] || { echo "FAIL: 一致场景应为 rc=0，实际 $rc"; exit 1; }
+
+          run good-src missing-dest
+          [[ $rc -eq 1 ]] || { echo "FAIL: 缺平台场景应为 rc=1，实际 $rc"; exit 1; }
+          grep -q 'linux/arm64' <<<"$detail" || { echo "FAIL: 未指出缺失的平台"; exit 1; }
+
+          run empty-src good-dest
+          [[ $rc -eq 2 ]] || { echo "FAIL: 源不可读应为 rc=2，实际 $rc"; exit 1; }
+
+          run good-src empty-dest
+          [[ $rc -eq 2 ]] || { echo "FAIL: 目标不可读应为 rc=2，实际 $rc"; exit 1; }
+
+          run plain-src plain-dest
+          [[ $rc -eq 0 ]] || { echo "FAIL: 单平台一致应为 rc=0，实际 $rc"; exit 1; }
+
+          echo "MOCK-OK"
+          SCRIPT
+          bash /tmp/test-verify.sh | grep -q 'MOCK-OK' || {
+            echo "::error::完整性校验的差异判定不符合预期"
+            exit 1
+          }
+          echo "✓ 校验的差异判定正确（一致 / 缺平台 / 不可校验 / 单平台）"
+
+          # --verify 未开启时行为完全不变：输出里不应出现校验相关字样
+          output="$(./scripts/sync.sh --src "nginx:1.27,redis:7.4,alpine:3.20" --dest r.example.com/x \
+            --dry-run 2>&1)"
+          if grep -q '校验' <<<"$output"; then
+            echo "::error::未开启 --verify 时不应出现校验行为"
+            exit 1
+          fi
+          echo "✓ 默认行为不变"
+
   # ---------------------------------------------------------------------------
   # 真实同步集成测试
   #
@@ -536,10 +595,19 @@ jobs:
         run: |
           #!/usr/bin/env bash
           set -euo pipefail
-          ./scripts/sync.sh \
+          # 顺带走一遍 --verify 的真实路径：mock 只能证明判定逻辑正确，
+          # 这里证明 inspect + 比对在真实 registry 上也能跑通
+          output="$(./scripts/sync.sh \
             --src localhost:5000/source/hello:latest \
             --dest localhost:5000/dest \
-            --tls-verify false --concurrency 1
+            --tls-verify false --concurrency 1 --verify 2>&1)"
+          echo "$output"
+
+          if ! grep -q '校验通过' <<<"$output"; then
+            echo "::error::开启 --verify 后未看到校验通过"
+            exit 1
+          fi
+          echo "✓ 真实同步 + 校验通过"
 
       - name: 断言目标存在且内容与源一致
         run: |
