@@ -1,0 +1,182 @@
+---
+name: maintain-loop
+description: action-sync-images 项目的维护闭环流程——规划、实现、发布、继续规划的完整循环，以及踩坑沉淀的硬规则。当需要在项目中继续迭代（新功能、修缺陷、补文档）、发布新版本、盘点未完成事项，或有人说「继续」「走维护流程」「按开源流程开发」时使用。
+---
+
+# 维护闭环（maintain-loop）
+
+本项目（action-sync-images，仓库 `nicholyx/action-sync-images`）按真实开源项目的方式维护：
+小批量提交、PR 驱动、CI 门禁、Issue 追踪、里程碑与版本发布。
+
+**核心闭环**：`规划 → 实现 → 发布 → 继续规划`。每一轮迭代围绕一个主题（如 v1.4.0 = 同步质量），
+走完一轮再开下一轮。下面是每个阶段的操作规范，以及踩过坑之后沉淀的硬规则——**规则部分优先级最高**。
+
+开始前，若对本项目的设计不熟，先读 `docs/ARCHITECTURE.md` 与 `docs/MAINTAINER_GUIDE.md`。
+
+---
+
+## 一、盘点现状（每轮开始与用户询问「还剩什么没做」时）
+
+```bash
+gh issue list --state open --json number,title
+gh api repos/nicholyx/action-sync-images/milestones --jq '.[] | "\(.title): 完成 \(.closed_issues) / 待办 \(.open_issues)"'
+gh release list
+gh run list --branch main --workflow=ci.yml --limit 3
+git status --short && git log --oneline -3
+```
+
+检查点：本地与远端是否一致、main 的 CI 是否绿、`[Unreleased]` 是否积压了未发布的改动
+（积压即说明「发布」这一步欠着，优先补上）。
+
+## 二、规划
+
+1. **建里程碑**：`gh api repos/nicholyx/action-sync-images/milestones -f title="vX.Y.Z" -f state=open -f description="主题"`
+2. **建 Issue**，每项一个，结构固定为：
+   - **背景**：为什么（引用真实痛点，不写空话）
+   - **期望**：做成什么样（带验收标准 checkbox）
+   - **入手位置**：涉及哪些文件/函数
+   - **难度**：简单 / 中等 / 中偏难，标注「适合首次贡献」
+   - `--milestone "vX.Y.Z"`，打上 `enhancement` / `bug` / `documentation` 标签
+3. **看板**：Issue 加入 Projects 看板（项目编号 `1`，owner `@me`）：
+   `gh project item-add 1 --owner @me --url https://github.com/nicholyx/action-sync-images/issues/N`
+4. **更新 Roadmap（Issue #4）**：它是路线图的**单一事实来源**。规划后把新条目写进「计划中」，
+   完成后移入「已完成」，已完成条目带上 Issue 链接。README 的路线图段落同步指向 Issue #4。
+
+## 三、实现
+
+- **一个 Issue 对应一个分支、一个 PR**。分支名 `feat/*`、`fix/*`、`docs/*`、`chore/*`。
+- **动手前先核实 Issue 的前提**。曾有 Issue 断言「重试没有退避」，核实后发现两条路径本来就有
+  指数退避——前提不成立时，在 Issue 里留言说明并改写范围，而不是硬着头皮实现错误的目标。
+- 实现中偏离 Issue 计划（如发现了更严重的相关缺陷），先起一个独立 Issue 记录，再决定顺序。
+
+### 设计原则（本项目已确立的判断，新功能必须延续）
+
+- **排除/筛掉的东西必须可见**：被 `--filter`/`--exclude` 排除的镜像仍出现在结果表并标注原因。
+  悄悄消失是最危险的——使用者会以为它同步了。
+- **参数被接受却不生效必须告警**：静默失效比报错更危险（`--retries` 在 regctl 路径失效的教训）。
+  但默认值不生效不值得打扰，只在**显式传入**时告警。
+- **不引入新的存储**：历史趋势读报告 Artifact、连续失败次数从历史报告推算。
+  需要跨运行状态时先问：已有数据源能不能回答？
+- **凭证不进命令行、不进日志**：写进 600 权限临时文件（authfile），脚本退出即删；
+  CI 用环境变量传参，因为命令行参数对同机进程可见、也会被日志语句原样打印。
+- **退出码语义**：`0` 全部成功（含跳过）、`1` 参数/环境错误、`2` 至少一个镜像失败。
+  用户的有意操作（排除）不算失败。
+
+### 测试策略
+
+- **无法端到端构造的场景**（如「目标与源不一致」——校验紧跟同步，同步会覆盖掉不一致；
+  「跨运行的连续失败」——需要多次真实失败）：提取生产函数（`sed -n '/^fn()/,/^}/p'`）
+  加伪造输入做单测，CI 步骤里内联执行。
+- **真实路径**：集成测试 job 用本地 `registry:2` 容器真的推送。dry-run 覆盖不到真实推送路径——
+  v1.1.0 的三个缺陷全部发生在那里。
+- **每条 CI 断言先在本地复现**再提交，包括 `bash -e` 语义下的行为（GitHub Actions 的 `run:` 默认 errexit）。
+
+### bash 编码硬规则（兼容 macOS 自带 bash 3.2）
+
+- 禁用 `declare -A`、`mapfile`、`wait -n`、`tac`。去重用 `awk '!seen[$0]++'`，倒序用数组下标循环。
+- `printf '%s'` **不输出结尾换行**，配 `while IFS= read -r` 会**丢掉最后一段**（read 遇 EOF 返回非零）。
+  必须写 `printf '%s\n'`。曾导致 regctl 路径静默丢平台（Issue #27）。
+- 结果文件字段分隔用 `$'\x1f'`（Unit Separator）。tab 是 IFS 空白，空字段会让后续字段整体左移。
+- 结果数组按序号对齐（下标同时决定结果文件序号），**标记而非删除**。
+- bash 内嵌 Markdown 反引号写在 `printf` 的**双引号**格式串里，避免 shellcheck SC2016。
+- `--dry-run` 的输出必须复述**真正会执行的参数数组**，不是拿输入重新拼一遍——两者看似一样，
+  脱节时 dry-run 就失去了全部意义（丢平台缺陷长期未被发现正是因为它）。
+
+### 中文内容质量（本项目高频踩坑）
+
+- **每次编辑中文内容（代码注释、文档、Issue/PR 正文）后，全仓扫描 U+FFFD**：
+
+  ```bash
+  python3 -c "
+  import pathlib
+  bad=[str(p) for p in pathlib.Path('.').rglob('*') if p.is_file() and '.git' not in p.parts
+       and chr(0xfffd) in p.read_text(encoding='utf-8', errors='ignore')]
+  print(bad if bad else 'OK')
+  "
+  ```
+
+  多轮迭代中反复出现「写入时混入替换字符」，这条必须执行，不要省。
+- 排错文档保留**报错原文**（使用者拿报错搜索），并写明「什么情况下不该用这个方案」。
+
+### 提交与 PR
+
+- 提交信息遵循 Conventional Commits（校验脚本 `scripts/check-commit-msg.sh`，CI 会查）。
+  正文写**为什么**，不只是改了什么。
+- 提交前本地跑 `./scripts/lint.sh`（actionlint + yamllint + shellcheck + bash -n）。
+- PR 正文结构：为什么 → 做了什么 → 关键取舍（含被否掉的方案）→ 测试策略。
+- **CHANGELOG**：每个用户可感知的改动都要记入 `[Unreleased]`，分类固定为
+  新增/变更/弃用/移除/修复/安全，不自创分类。修复类条目写清「此前错在哪、有什么后果」。
+
+## 四、CI 与合并
+
+- CI 全绿才合并：`gh pr checks <N>` 或 `gh pr view <N> --json statusCheckRollup`。
+- 合并用 `gh pr merge <N> --squash --delete-branch`。
+- squash 后 PR 标题会成为提交信息，所以标题也要符合规范（CI 会校验）。
+
+### CI 故障排查（真实踩过）
+
+- **「CI 总览」job 卡 in_progress 而 run 汇总显示 success**：GitHub 状态不一致。
+  `gh pr close <N> && gh pr reopen <N>` 重新触发即可恢复。
+- **分支保护拒绝合并、提示 not up to date**：`git rebase main` 后
+  `git push --force-with-lease`。合并远端分支前先 `git fetch --prune`。
+- **`gh pr merge --auto` 报 Auto merge is not allowed**：仓库未开启该功能，
+  改为等待检查完成后再合并。
+- **`gh run view --log` 的输出混着源码行**：过滤 `[36;1m`（ANSI 回显）再看实际输出。
+- **日志只显示 `exit code 2` 没有任何输出**：多半是 `set -e` 下某条命令失败导致整个步骤中断。
+  「故意要失败的命令」（造失败数据）必须包在 `set +e` / `set -e` 之间。
+- **网络抖动是常态**：`gh` / `git push` 失败就重试，模式：
+
+  ```bash
+  for i in 1 2 3 4 5; do
+    if out="$(<命令> 2>&1)"; then echo "$out" | tail -1; break; fi
+    echo "第 ${i} 次失败，重试..."; sleep 5
+  done
+  ```
+
+  注意非幂等操作的重复执行风险（见发布幂等）。
+
+## 五、发布
+
+1. 从最新 main 切 `chore/release-vX.Y.Z` 分支。
+2. 把 CHANGELOG 的 `[Unreleased]` 归入 `[X.Y.Z] - 日期`，段首加一句话概述本轮主题；
+   `[Unreleased]` 恢复为空壳。
+3. 提交信息 `chore(release): 发布 vX.Y.Z`，建发布 PR 并走完整 CI。
+4. squash merge 后打标签并推送：
+   `git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`
+5. `release.yml` 自动生成发布说明：CHANGELOG 手写部分 + GitHub 原生 PR 清单 + 可选 AI 摘要
+   （配了 `ANTHROPIC_API_KEY` 才有，未配置走降级路径，不影响发布）。
+6. 验证：`gh release view vX.Y.Z` 确认三段式内容齐全、`gh run list --workflow=release.yml` 确认成功。
+
+### 发布幂等（Issue #41 的教训）
+
+网络抖动时 `git push` 可能「显示失败、远端已成功」，重试会重复推送 tag → 触发两次发布工作流，
+第二次 `gh release create` 因 Release 已存在而 422。工作流已做「先查后建」（已存在改走 edit），
+**推送 tag 前先用 `git ls-remote --tags origin vX.Y.Z` 确认不存在**，避免制造无意义的失败运行。
+
+## 六、发布后：继续规划
+
+- 更新 Roadmap（Issue #4）：本轮条目移入「已完成」。
+- 建下一版本里程碑与 Issue（回到第二步）。
+- 看板同步（新 Issue 加入、项目状态与里程碑一致）。
+
+---
+
+## 红线（来自 docs/MAINTAINER_GUIDE.md，任何时候不得违反）
+
+- 不给同步工作流添加自动触发器（schedule 等），同步必须显式触发
+- `${{ }}` 表达式不直接写进 `run:`，一律经 `env:` 中转（表达式注入）
+- 不在日志中输出 Secret；webhook URL 视同凭证
+- 不弱化 `pull_request_target` 的安全性
+- 凭证 / 内网地址不进代码、不进 Issue、不进日志
+
+## 快速命令参考
+
+| 操作 | 命令 |
+| --- | --- |
+| 本地全量检查 | `./scripts/lint.sh` |
+| 建里程碑 | `gh api repos/nicholyx/action-sync-images/milestones -f title=... -f state=open` |
+| Issue 入看板 | `gh project item-add 1 --owner @me --url <issue-url>` |
+| 合并 PR | `gh pr merge <N> --squash --delete-branch` |
+| 发布 | tag `vX.Y.Z` 推送即触发 release.yml |
+| 历史趋势 | `./scripts/history.sh [--image X] [--top-failures N] [--slowest N]` |
+| 乱码扫描 | 见「中文内容质量」一节的 python 命令 |
