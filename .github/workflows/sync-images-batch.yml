@@ -86,6 +86,10 @@ jobs:
           FILTER_REGEX: ${{ inputs.filter }}
           EXCLUDE_REGEX: ${{ inputs.exclude }}
           NOTIFY_WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK }}
+          # 可选：清单里若有私有仓库的镜像，配置这两个 Secrets 即可。
+          # 走环境变量而非命令行参数，避免凭证被打印进日志。
+          SYNC_SRC_USERNAME: ${{ secrets.SRC_REGISTRY_USERNAME }}
+          SYNC_SRC_PASSWORD: ${{ secrets.SRC_REGISTRY_PASSWORD }}
         run: |
           #!/usr/bin/env bash
           set -euo pipefail

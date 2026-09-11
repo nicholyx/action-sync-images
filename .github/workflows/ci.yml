@@ -512,6 +512,111 @@ jobs:
             echo "✓ ${repo} 中存在目标镜像"
           done
 
+      # -----------------------------------------------------------------------
+      # 私有源：走到认证这条真实路径上
+      #
+      # 前面所有步骤用的都是匿名 registry，凭证相关的代码一次都没被执行过。
+      # 这里起一个需要 htpasswd 认证的 registry，验证三件事：
+      # 无凭证确实会失败、有凭证确实能成功、凭证不出现在日志里。
+      # -----------------------------------------------------------------------
+      - name: 启动需要认证的源 registry
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # registry 的 htpasswd 认证只认 bcrypt。openssl 只能生成 apr1，
+          # 用它写出的密码文件会让每一次登录都失败——而且失败得毫无线索。
+          sudo apt-get install -y -qq apache2-utils
+
+          mkdir -p /tmp/registry-auth
+          htpasswd -Bbn testuser 's3cr3t-pass' > /tmp/registry-auth/htpasswd
+
+          docker run -d -p 5001:5000 --name registry-auth \
+            -v /tmp/registry-auth:/auth \
+            -e REGISTRY_AUTH=htpasswd \
+            -e REGISTRY_AUTH_HTPASSWD_REALM=Registry-Realm \
+            -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd \
+            registry:2
+
+          for _ in $(seq 1 30); do
+            # 401 正是「服务已就绪且鉴权生效」的标志——这里期望的就是匿名被拒
+            code="$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5001/v2/ || true)"
+            if [[ "$code" == "401" ]]; then
+              echo "✓ 认证 registry 已就绪（匿名访问被拒）"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "::error::认证 registry 启动超时"
+          docker logs registry-auth
+          exit 1
+
+      - name: 推送一个镜像作为私有源
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          skopeo copy --dest-tls-verify=false \
+            --dest-creds 'testuser:s3cr3t-pass' \
+            docker://docker.io/library/hello-world:latest \
+            docker://localhost:5001/private/hello:latest
+
+      - name: 未提供凭证时应失败
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          set +e
+          ./scripts/sync.sh \
+            --src localhost:5001/private/hello:latest \
+            --dest localhost:5000/from-private \
+            --tls-verify false --concurrency 1 >/dev/null 2>&1
+          code=$?
+          set -e
+
+          if [[ "$code" -ne 2 ]]; then
+            echo "::error::未提供凭证时同步私有镜像应失败（期望退出码 2，实际 ${code}）"
+            exit 1
+          fi
+          echo "✓ 无凭证时正确失败，没有假装成功"
+
+      - name: 提供凭证后应成功，且凭证不落日志
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          output="$(./scripts/sync.sh \
+            --src localhost:5001/private/hello:latest \
+            --dest localhost:5000/from-private \
+            --tls-verify false --concurrency 1 \
+            --src-username testuser --src-password 's3cr3t-pass' 2>&1)"
+          echo "$output"
+
+          if ! grep -q '成功 1 个' <<<"$output"; then
+            echo "::error::提供凭证后仍未同步成功"
+            exit 1
+          fi
+          echo "✓ 私有源同步成功"
+
+          # 这两条是硬约束：凭证一旦进了日志就等于泄露，
+          # 而 Actions 日志是留存 90 天、对仓库协作者可见的。
+          if grep -q 's3cr3t-pass' <<<"$output"; then
+            echo "::error::密码出现在了日志中"
+            exit 1
+          fi
+          if grep -q 'testuser' <<<"$output"; then
+            echo "::error::用户名出现在了日志中"
+            exit 1
+          fi
+          echo "✓ 日志中不含凭证"
+
+          dest="localhost:5000/from-private/localhost_5001_private_hello:latest"
+          if ! skopeo inspect --tls-verify=false "docker://${dest}" >/dev/null 2>&1; then
+            echo "::error::目标镜像不存在：${dest}"
+            exit 1
+          fi
+          echo "✓ 目标镜像已真实存在于 registry 中"
+
   # ---------------------------------------------------------------------------
   # 提交信息规范
   # 只在 PR 上跑（push 到 main 的提交已经过 PR 校验）。

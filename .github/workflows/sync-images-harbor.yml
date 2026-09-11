@@ -63,6 +63,10 @@ jobs:
           SKIP_EXISTING: ${{ inputs.skip_existing }}
           DRY_RUN: ${{ inputs.dry_run }}
           NOTIFY_WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK }}
+          # 可选：源镜像若来自私有仓库，配置这两个 Secrets。
+          # 走环境变量而非命令行参数，避免凭证被打印进日志。
+          SYNC_SRC_USERNAME: ${{ secrets.SRC_REGISTRY_USERNAME }}
+          SYNC_SRC_PASSWORD: ${{ secrets.SRC_REGISTRY_PASSWORD }}
         run: |
           #!/usr/bin/env bash
           set -euo pipefail
