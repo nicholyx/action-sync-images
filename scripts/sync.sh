@@ -27,6 +27,9 @@ REGCTL_VERSION="v0.11.6"
 CONCURRENCY="1"
 TIMEOUT="600"
 SKIP_EXISTING="false"
+NOTIFY_WEBHOOK=""
+NOTIFY_TYPE="auto"
+NOTIFY_ON="always"
 declare -a SOURCE_IMAGES=()
 declare -a SOURCE_FILES=()
 
@@ -131,10 +134,17 @@ sync.sh —— 容器镜像同步引擎
   -t, --timeout <秒>       单个镜像的超时时间，默认 600 秒（10 分钟）
   -r, --retries <次数>     单个镜像的失败重试次数，默认 3
 
-输出：
+输出与通知：
       --dry-run            只打印将要执行的命令，不实际推送
       --report-dir <目录>  把同步报告写入该目录（同时生成 .md 与 .json）
       --regctl-version <v> 指定 regctl 版本，默认 v0.11.6
+
+      --notify-webhook <url>  同步结束后把结果推送到这个 webhook。
+                              不指定则完全不发送任何通知。
+      --notify-type <类型>    钉钉 dingtalk / 飞书 feishu / Slack slack /
+                              通用 generic，默认 auto（按 URL 自动识别）
+      --notify-on <时机>      always（默认，总是通知）或 failure（仅失败时通知）
+
   -h, --help               显示本帮助
 
 退出码：
@@ -193,6 +203,15 @@ parse_args() {
       -r|--retries)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         MAX_RETRIES="$2"; shift 2 ;;
+      --notify-webhook)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        NOTIFY_WEBHOOK="$2"; shift 2 ;;
+      --notify-type)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        NOTIFY_TYPE="$2"; shift 2 ;;
+      --notify-on)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        NOTIFY_ON="$2"; shift 2 ;;
       --dry-run|-n)
         DRY_RUN="true"; shift ;;
       --report-dir)
@@ -684,6 +703,105 @@ load_results() {
   done
 }
 
+# ---------------------------------------------------------------------------
+# 结果通知
+#
+# 同步是无人值守的：定时跑、或者随手点一下就走开。这带来一个很实际的盲区——
+# 失败了没人知道，往往要等到集群拉不到镜像才发现，中间可能已经隔了好几天。
+#
+# 这里有一条硬约束：**通知失败绝不能影响同步结果**。webhook 挂了、网络不通、
+# 平台改了格式，都只是附加能力的失败，不该让一次成功的同步变成红色运行。
+# ---------------------------------------------------------------------------
+
+# 按 webhook 地址识别服务商
+detect_notify_type() {
+  local url="$1"
+  case "$url" in
+    *oapi.dingtalk.com*)         printf 'dingtalk' ;;
+    *feishu.cn*|*larksuite.com*) printf 'feishu' ;;
+    *hooks.slack.com*)           printf 'slack' ;;
+    *)                           printf 'generic' ;;
+  esac
+}
+
+# 组装通知正文。各平台的差异只在最外层包装，正文共用同一份。
+build_notify_text() {
+  local total="$1" ok="$2" skipped="$3" fail="$4"
+  local i text=""
+
+  text="## 镜像同步完成"$'\n\n'
+  text+="共 **${total}** 个镜像 ｜ 成功 ${ok} ｜ 跳过 ${skipped} ｜ 失败 ${fail}"$'\n'
+
+  if [[ "$fail" -gt 0 ]]; then
+    text+=$'\n'"### 失败详情"$'\n\n'
+    for i in "${!R_SRC[@]}"; do
+      if [[ "${R_STATUS[$i]}" == "failed" ]]; then
+        text+="- ${R_SRC[$i]}"$'\n'
+      fi
+    done
+  fi
+
+  # 在 Actions 中运行时附上运行链接，便于收到通知后一键跳转排查
+  if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
+    local base="${GITHUB_SERVER_URL:-https://github.com}"
+    text+=$'\n'"[查看运行详情](${base}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID})"$'\n'
+  fi
+
+  printf '%s' "$text"
+}
+
+send_notification() {
+  local total="$1" ok="$2" skipped="$3" fail="$4"
+
+  [[ -n "$NOTIFY_WEBHOOK" ]] || return 0
+
+  if [[ "$NOTIFY_ON" == "failure" && "$fail" -eq 0 ]]; then
+    log_info "本次没有失败，按 --notify-on failure 的配置跳过通知"
+    return 0
+  fi
+
+  local type="$NOTIFY_TYPE"
+  if [[ "$type" == "auto" ]]; then
+    type="$(detect_notify_type "$NOTIFY_WEBHOOK")"
+  fi
+
+  local text payload
+  text="$(build_notify_text "$total" "$ok" "$skipped" "$fail")"
+
+  # 交给 jq 构造 JSON，转义由它负责，避免镜像名中的特殊字符破坏结构
+  case "$type" in
+    dingtalk)
+      payload="$(jq -n --arg t "$text" '{msgtype:"markdown",markdown:{title:"镜像同步完成",text:$t}}')" ;;
+    feishu)
+      payload="$(jq -n --arg t "$text" '{msg_type:"text",content:{text:$t}}')" ;;
+    slack|generic)
+      payload="$(jq -n --arg t "$text" '{text:$t}')" ;;
+    *)
+      log_warn "未知的通知类型：${type}（可选：dingtalk / feishu / slack / generic）"
+      return 0 ;;
+  esac
+
+  # webhook 地址本身就是凭证——知道地址就能往群里发消息，
+  # 因此日志里只记录类型与结果，绝不输出 URL。
+  # 注意不要写成 `... || printf '000'`：curl 的 -w '%{http_code}' 在连接失败时
+  # 本身就会输出 000，再补一个会拼成 000000 这种看不懂的东西。
+  local http_code
+  http_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+    -H 'Content-Type: application/json' \
+    --max-time 15 \
+    -d "$payload" "$NOTIFY_WEBHOOK" 2>/dev/null)" || true
+  http_code="${http_code:-000}"
+
+  if [[ "$http_code" =~ ^2 ]]; then
+    log_info "同步结果已推送到 ${type}"
+  else
+    log_warn "通知发送失败（HTTP ${http_code}），同步结果不受影响"
+    gh_warning "同步结果通知发送失败：HTTP ${http_code}"
+  fi
+
+  return 0
+}
+
 emit_summary() {
   local total=${#R_SRC[@]}
   local ok=0 fail=0 skipped=0 i
@@ -747,6 +865,9 @@ emit_summary() {
   if [[ -n "$REPORT_DIR" ]]; then
     write_report "$total" "$ok" "$skipped" "$fail"
   fi
+
+  # ---- 结果通知 ----
+  send_notification "$total" "$ok" "$skipped" "$fail"
 
   [[ "$fail" -eq 0 ]] || return 2
   return 0
@@ -823,6 +944,11 @@ main() {
   validate_numeric "--retries" "$MAX_RETRIES"
 
   [[ "$CONCURRENCY" -ge 1 ]] || die "--concurrency 至少为 1"
+
+  case "$NOTIFY_ON" in
+    always|failure) ;;
+    *) die "--notify-on 只能是 always 或 failure，当前为「${NOTIFY_ON}」" ;;
+  esac
 
   DEST_REGISTRY="${DEST_REGISTRY#docker://}"
   DEST_REGISTRY="${DEST_REGISTRY%/}"

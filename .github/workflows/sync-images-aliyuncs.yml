@@ -74,6 +74,9 @@ jobs:
           CONCURRENCY: ${{ inputs.concurrency }}
           SKIP_EXISTING: ${{ inputs.skip_existing }}
           DRY_RUN: ${{ inputs.dry_run }}
+          # 可选：在仓库 Secrets 中配置 NOTIFY_WEBHOOK 即可启用结果通知。
+          # 未配置时为空字符串，脚本不会发送任何通知。
+          NOTIFY_WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK }}
         run: |
           #!/usr/bin/env bash
           set -euo pipefail
@@ -95,6 +98,9 @@ jobs:
           fi
           if [[ "$DRY_RUN" == "true" ]]; then
             args+=(--dry-run)
+          fi
+          if [[ -n "$NOTIFY_WEBHOOK" ]]; then
+            args+=(--notify-webhook "$NOTIFY_WEBHOOK")
           fi
 
           echo "执行：./scripts/sync.sh ${args[*]}"
