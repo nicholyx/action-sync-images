@@ -61,8 +61,17 @@ declare -a SOURCE_FILES=()
 SRC_USERNAME=""
 SRC_PASSWORD=""
 SRC_REGISTRY=""
+# 按源仓库映射凭证的文件路径（--src-credentials），每行「host 用户名 密码」。
+# 与单一凭证的关系是互斥而非叠加：混用时的语义只有猜，宁可报错。
+SRC_CREDENTIALS_FILE=""
 # 由 setup_src_auth 生成的临时认证文件（600 权限），脚本退出时删除
 SRC_AUTHFILE=""
+# 解析出的凭证条目（TSV，内含明文凭证），同样退出即删。
+# 放在独立变量而不是 WORK_DIR 下：setup_src_auth 的调用点早于 WORK_DIR 的创建
+SRC_CRED_ENTRIES=""
+# 环境变量 SYNC_SRC_CREDENTIALS（文件内容）落盘产生的临时文件路径。
+# cleanup 只删这个，绝不动使用者通过 --src-credentials 指定的自有文件
+SRC_CREDENTIALS_TMPFILE=""
 
 # 镜像筛选。二者都是 ERE 正则，作用于源镜像的完整引用。
 FILTER_REGEX=""
@@ -194,10 +203,19 @@ sync.sh —— 容器镜像同步引擎
                            并把结果列在日志里；如果清单里混有公开仓库，
                            建议显式指定，避免凭证被发往并不需要的仓库
 
-      以上三项也可用环境变量传入：SYNC_SRC_USERNAME / SYNC_SRC_PASSWORD /
-      SYNC_SRC_REGISTRY。CI 等自动化场景**应当**用环境变量——命令行参数
-      对同机其他进程可见，也容易被调用方的日志语句原样打印出去。
-      无论走哪条路，凭证都不会出现在本脚本的日志里（写入临时的 600 权限文件）
+      --src-credentials <文件>
+                           按源仓库映射凭证：每行「host 用户名 密码或Token」，
+                           # 开头为注释。清单里混有多个私有源（公司 Harbor +
+                           私有 GHCR）时使用；未匹配到凭证的 host 走匿名。
+                           与 --src-username 互斥，混用直接报错。
+                           文件权限建议 600；格式错误的行会指明行号
+
+      以上各项也可用环境变量传入：SYNC_SRC_USERNAME / SYNC_SRC_PASSWORD /
+      SYNC_SRC_REGISTRY / SYNC_SRC_CREDENTIALS（最后一个的值是**文件内容**
+      而非路径，方便 CI 里从 Secret 直接注入）。CI 等自动化场景**应当**用
+      环境变量——命令行参数对同机其他进程可见，也容易被调用方的日志语句
+      原样打印出去。无论走哪条路，凭证都不会出现在本脚本的日志里
+      （写入临时的 600 权限文件）
 
 性能与可靠性：
   -c, --concurrency <N>    并发同步的镜像数量，默认 1（串行）。
@@ -306,6 +324,9 @@ parse_args() {
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         SRC_REGISTRY="${2#docker://}"; SRC_REGISTRY="${SRC_REGISTRY%/}"
         shift 2 ;;
+      --src-credentials)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        SRC_CREDENTIALS_FILE="$2"; shift 2 ;;
       -c|--concurrency)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         CONCURRENCY="$2"; shift 2 ;;
@@ -937,9 +958,109 @@ apply_filters() {
 #    源是别人的系统。把目标仓库的凭证发往源仓库，等于把「往我仓库推送」的权限
 #    交给一个你并不信任的第三方，哪怕实践中两者偶尔相同也不该默认如此。
 # ---------------------------------------------------------------------------
-setup_src_auth() {
-  [[ -n "$SRC_USERNAME" || -n "$SRC_PASSWORD" || -n "$SRC_REGISTRY" ]] || return 0
+# 解析凭证映射文件，输出 TSV（host<FS>user<FS>pass）到 stdout。
+#
+# 两个安全细节：
+#   - 格式错误的行**只报行号与字段数，绝不回显行内容**——行里有密码，
+#     而错误信息会进日志
+#   - host 会做与 normalize_ref 一致的前缀清理，避免「同一个仓库两种写法
+#     匹配不上」这种最难排查的静默失败
+parse_src_credentials() {
+  local file="$1"
+  local lineno=0 line host user pass rest
 
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lineno=$((lineno + 1))
+    # 去首尾空白（内联三段式，避免为它引入子进程）
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+
+    [[ -z "$line" || "$line" == \#* ]] && continue
+
+    # 按空白切分。字段数不对就拒绝——静默跳过是最糟的：凭证没配上的仓库
+    # 会以 401 失败，而使用者根本不知道是文件写错还是权限不够。
+    host="${line%%[[:space:]]*}"
+    rest="${line#"$host"}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    user="${rest%%[[:space:]]*}"
+    rest="${rest#"$user"}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    pass="${rest%%[[:space:]]*}"
+    rest="${rest#"$pass"}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+
+    if [[ -z "$user" || -z "$pass" || -n "$rest" ]]; then
+      die "凭证文件 ${file} 第 ${lineno} 行格式错误（应为 3 个字段：host 用户名 密码，空白分隔）。已停止同步——错误的凭证映射比没有更危险"
+    fi
+
+    host="${host#docker://}"
+    host="${host%/}"
+    printf '%s%s%s%s%s\n' "$host" "$FIELD_SEP" "$user" "$FIELD_SEP" "$pass"
+  done < "$file"
+}
+
+# 把凭证条目（TSV：host<FS>user<FS>pass）写成 skopeo 用的 authfile。
+write_src_authfile() {
+  local entries_file="$1"
+
+  # TMPDIR 常以 / 结尾，拼路径前先去掉，否则会生成 // 这种双斜杠路径
+  local tmpdir="${TMPDIR:-/tmp}"
+  tmpdir="${tmpdir%/}"
+
+  SRC_AUTHFILE="$(mktemp "${tmpdir}/sync-src-auth.XXXXXX")" || die "无法创建临时认证文件"
+  chmod 600 "$SRC_AUTHFILE"
+
+  # auth.json 里的凭据是 base64 编码的「用户名:密码」，且不能带换行。
+  # 交给 jq 拼 JSON：手工拼接的话，用户名里的引号或反斜杠会直接破坏文件结构
+  if ! jq -R . "$entries_file" | jq -rs 'map(split("\u001f")) | map({(.[0]): {auth: ((.[1] + ":" + .[2]) | @base64)}}) | {auths: (add // {})}' \
+      > "$SRC_AUTHFILE"; then
+    die "生成源仓库认证文件失败"
+  fi
+
+  # 只报「配了哪些仓库」。用户名不打印，密码更不打印。
+  local count
+  count="$(wc -l < "$entries_file" | tr -d ' ')"
+  log_info "源仓库凭证已装载（${count} 个仓库）：$(cut -d"$FIELD_SEP" -f1 "$entries_file" | sort -u | paste -sd' ' -)"
+}
+
+setup_src_auth() {
+  [[ -n "$SRC_USERNAME" || -n "$SRC_PASSWORD" || -n "$SRC_REGISTRY" \
+    || -n "$SRC_CREDENTIALS_FILE" ]] || return 0
+
+  # 互斥而非叠加：混用时「文件里有 private.io、命令行又给了另一个用户名」
+  # 的语义只能靠猜。宁可拒绝，让使用者把意图写清楚。
+  if [[ -n "$SRC_CREDENTIALS_FILE" && ( -n "$SRC_USERNAME" || -n "$SRC_PASSWORD" || -n "$SRC_REGISTRY" ) ]]; then
+    die "--src-credentials 与 --src-username / --src-password / --src-registry 互斥：前者按仓库映射多套凭证，后者是单套，混用的语义只能靠猜"
+  fi
+
+  # 凭证条目用独立的临时文件：本函数的调用点早于 WORK_DIR 的创建。
+  # 文件内含明文凭证，cleanup() 负责删除。
+  local tmpdir="${TMPDIR:-/tmp}"
+  tmpdir="${tmpdir%/}"
+  local entries
+  entries="$(mktemp "${tmpdir}/sync-src-cred.XXXXXX")" || die "无法创建临时凭证文件"
+  chmod 600 "$entries"
+  SRC_CRED_ENTRIES="$entries"
+
+  if [[ -n "$SRC_CREDENTIALS_FILE" ]]; then
+    [[ -f "$SRC_CREDENTIALS_FILE" ]] || die "凭证文件不存在：${SRC_CREDENTIALS_FILE}"
+
+    # 权限过宽只告警不拒绝：CI 里它是 Secret 注入的临时文件（600），
+    # 本地则可能是使用者有意放宽的；真正的硬约束由解析和 authfile 的
+    # 600 权限兜住。
+    # 注意不能看 find 的退出码——它只表示「遍历成功」，与是否匹配无关
+    # （这点和 grep 不同），必须看输出是否非空。
+    if [[ -n "$(find "$SRC_CREDENTIALS_FILE" -perm -0044 2>/dev/null)" ]]; then
+      log_warn "凭证文件 ${SRC_CREDENTIALS_FILE} 对同组/其他用户可读，建议 chmod 600"
+    fi
+
+    parse_src_credentials "$SRC_CREDENTIALS_FILE" >> "$entries"
+    [[ -s "$entries" ]] || die "凭证文件 ${SRC_CREDENTIALS_FILE} 中没有任何有效条目（是否全为注释或空行？）"
+    write_src_authfile "$entries"
+    return 0
+  fi
+
+  # ---- 以下为单一凭证模式（v1.3.0 的行为，保持不变）----
   if [[ -n "$SRC_REGISTRY" && -z "$SRC_USERNAME" ]]; then
     die "--src-registry 需要与 --src-username / --src-password 一起使用"
   fi
@@ -967,28 +1088,14 @@ setup_src_auth() {
     fi
   done < <(printf '%s\n' "${hosts[@]}" | sort -u)
 
-  # TMPDIR 常以 / 结尾，拼路径前先去掉，否则会生成 // 这种双斜杠路径
-  local tmpdir="${TMPDIR:-/tmp}"
-  tmpdir="${tmpdir%/}"
+  local uh
+  for uh in "${uniq_hosts[@]}"; do
+    printf '%s%s%s%s%s\n' "$uh" "$FIELD_SEP" "$SRC_USERNAME" "$FIELD_SEP" "$SRC_PASSWORD" >> "$entries"
+  done
+  write_src_authfile "$entries"
 
-  SRC_AUTHFILE="$(mktemp "${tmpdir}/sync-src-auth.XXXXXX")" || die "无法创建临时认证文件"
-  chmod 600 "$SRC_AUTHFILE"
-
-  # auth.json 里的凭据是 base64 编码的「用户名:密码」，且不能带换行
-  local auth_b64
-  auth_b64="$(printf '%s:%s' "$SRC_USERNAME" "$SRC_PASSWORD" | base64 | tr -d '\n')"
-
-  # 交给 jq 拼 JSON：手工拼接的话，用户名里的引号或反斜杠会直接破坏文件结构
-  if ! printf '%s\n' "${uniq_hosts[@]}" | jq -R . | jq -s \
-      --arg auth "$auth_b64" \
-      '{auths: (map({(.): {auth: $auth}}) | add)}' > "$SRC_AUTHFILE"; then
-    die "生成源仓库认证文件失败"
-  fi
-
-  # 只报「配了哪些仓库」。用户名不打印，密码更不打印。
-  log_info "源仓库凭证已装载（${#uniq_hosts[@]} 个）：${uniq_hosts[*]:-}"
   if [[ -z "$SRC_REGISTRY" && "${#uniq_hosts[@]}" -gt 1 ]]; then
-    log_warn "凭证被应用到多个源仓库。若不希望如此，请用 --src-registry 指定其中之一"
+    log_warn "凭证被应用到多个源仓库。若不希望如此，请用 --src-registry 指定其中之一，或改用 --src-credentials 按仓库映射"
   fi
 }
 
@@ -997,6 +1104,8 @@ setup_src_auth() {
 # 不必再去核对 trap 那行字符串的展开时机。
 cleanup() {
   [[ -n "${SRC_AUTHFILE:-}" ]] && rm -f "$SRC_AUTHFILE"
+  [[ -n "${SRC_CRED_ENTRIES:-}" ]] && rm -f "$SRC_CRED_ENTRIES"
+  [[ -n "${SRC_CREDENTIALS_TMPFILE:-}" ]] && rm -f "$SRC_CREDENTIALS_TMPFILE"
   [[ -n "${WORK_DIR:-}" ]] && rm -rf "$WORK_DIR"
   return 0
 }
@@ -1792,6 +1901,20 @@ main() {
   if [[ -z "$SRC_REGISTRY" && -n "${SYNC_SRC_REGISTRY:-}" ]]; then
     SRC_REGISTRY="${SYNC_SRC_REGISTRY#docker://}"
     SRC_REGISTRY="${SRC_REGISTRY%/}"
+  fi
+  # SYNC_SRC_CREDENTIALS 的值是**文件内容**而非路径：CI 里 Secret 是一整段文本，
+  # 落成 600 权限的临时文件再走同一条解析路径，避免为 Secret 单独开一条分支。
+  # 这个临时文件同样由 cleanup() 删除。
+  if [[ -z "$SRC_CREDENTIALS_FILE" && -n "${SYNC_SRC_CREDENTIALS:-}" ]]; then
+    local _tmpdir="${TMPDIR:-/tmp}"
+    _tmpdir="${_tmpdir%/}"
+    SRC_CREDENTIALS_FILE="$(mktemp "${_tmpdir}/sync-src-cred-env.XXXXXX")" \
+      || die "无法创建临时凭证文件（来自 SYNC_SRC_CREDENTIALS）"
+    chmod 600 "$SRC_CREDENTIALS_FILE"
+    printf '%s\n' "$SYNC_SRC_CREDENTIALS" > "$SRC_CREDENTIALS_FILE"
+    # 记录这是我们自己创建的临时文件——cleanup 只删它，绝不动使用者
+    # 通过 --src-credentials 指定的自有文件
+    SRC_CREDENTIALS_TMPFILE="$SRC_CREDENTIALS_FILE"
   fi
 
   if [[ ${#DEST_REGISTRIES[@]} -eq 0 && -z "$DEST_EXACT" ]]; then
