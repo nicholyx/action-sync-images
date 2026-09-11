@@ -609,6 +609,65 @@ jobs:
           [[ "$code" -eq 1 ]] || { echo "::error::--notify-after-failures 0 应被拒绝（退出码 1），实际 ${code}"; exit 1; }
           echo "✓ 非法阈值被拒绝"
 
+      - name: 验证凭证映射文件
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          cred="$(mktemp)"
+          chmod 600 "$cred"
+          { echo "# 注释行"
+            echo "harbor.internal.example.com  alice   token-a"
+            echo ""
+            echo "ghcr.io bob ghp_xxx"
+          } > "$cred"
+
+          # 多 host 映射：装载列表只含文件中的 host，
+          # 未匹配的镜像走匿名——这是按仓库映射存在的意义
+          output="$(./scripts/sync.sh \
+            --src "harbor.internal.example.com/lib/a:1,ghcr.io/b/b:2,nginx:1.27" \
+            --dest r.example.com/x --src-credentials "$cred" --dry-run 2>&1)"
+          echo "$output"
+
+          grep -q '凭证已装载（2 个仓库）' <<<"$output" \
+            || { echo "::error::凭证映射未正确装载两个 host"; exit 1; }
+          echo "✓ 多 host 映射正确，公开镜像走匿名"
+
+          # 与 --src-username 互斥：混用的语义只能靠猜，直接拒绝
+          set +e
+          ./scripts/sync.sh --src nginx:1.27 --dest r.example.com/x \
+            --src-credentials "$cred" --src-username alice --dry-run >/dev/null 2>&1
+          code=$?
+          set -e
+          [[ "$code" -eq 1 ]] || { echo "::error::混用应退出码 1，实际 ${code}"; exit 1; }
+          echo "✓ 与单值凭证互斥"
+
+          # 格式错误的行：指明行号、中止同步，且不回显行内容（行里有密码）
+          bad="$(mktemp)"
+          chmod 600 "$bad"
+          { echo "host1 u1 p1"; echo "host2 只有俩"; } > "$bad"
+          set +e
+          output="$(./scripts/sync.sh --src nginx:1.27 --dest r.example.com/x \
+            --src-credentials "$bad" --dry-run 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 1 ]] || { echo "::error::格式错误应退出码 1，实际 ${code}"; exit 1; }
+          grep -q '第 2 行格式错误' <<<"$output" \
+            || { echo "::error::未指明出错的行号"; exit 1; }
+          if grep -q '只有俩' <<<"$output"; then
+            echo "::error::错误信息回显了行内容（含密码）"
+            exit 1
+          fi
+          echo "✓ 格式错误报行号且不回显行内容"
+
+          # 环境变量方式（CI 的 Secret 注入路径）：值为内容而非路径。
+          # cred 内容有两条有效条目，无论 --src 用到哪条，装载的都是全部
+          output="$(SYNC_SRC_CREDENTIALS="$(cat "$cred")" \
+            ./scripts/sync.sh --src "ghcr.io/b/b:2" --dest r.example.com/x --dry-run 2>&1)"
+          grep -q '凭证已装载（2 个仓库）' <<<"$output" \
+            || { echo "::error::SYNC_SRC_CREDENTIALS 未生效"; exit 1; }
+          echo "✓ 环境变量注入（Secret 场景）可用"
+
   # ---------------------------------------------------------------------------
   # 真实同步集成测试
   #

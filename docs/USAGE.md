@@ -109,12 +109,27 @@
 
 上面几条讲的都是**同步到**哪里，这一条讲的是**从哪里同步**。
 
-公司内部 Harbor、私有 GHCR 包这类需要认证的源，匿名拉取会在第一步就 401。配置一对凭证即可：
+公司内部 Harbor、私有 GHCR 包这类需要认证的源，匿名拉取会在第一步就 401。两种配置方式：
+
+**方式一：单一凭证**（源仓库只有一家时最简单）
 
 | Secret | 值 |
 | --- | --- |
 | `SRC_REGISTRY_USERNAME` | 源仓库的用户名 |
 | `SRC_REGISTRY_PASSWORD` | 源仓库的密码或 Token |
+
+**方式二：按仓库映射**（清单混有多个私有源时）
+
+配置一个 Secret `SRC_CREDENTIALS`，内容为多行文本：
+
+```text
+harbor.internal.example.com  alice   token-a
+ghcr.io                      bob     ghp_xxx
+```
+
+每行三个字段：**host 用户名 密码**，`#` 开头为注释。同步时按源镜像的 registry host 匹配凭证，**没匹配到的走匿名**——公开镜像不受影响，也不必为每个私有源拆分运行。
+
+> ⚠️ 两种方式**互斥**：同时配置会直接报错。前者把一套凭证发给所有（或指定的那个）源仓库，后者按仓库各配各的——混用的语义只能靠猜，脚本一律拒绝。
 
 配置后三个同步工作流都会自动带上它们，无需改动任何工作流文件。
 
@@ -126,12 +141,25 @@
 [信息] 源仓库凭证已装载（1 个）：harbor.internal.example.com
 ```
 
-如果清单里**混有公开镜像**（比如同时有 `docker.io` 和内部 Harbor），建议固定到一个仓库。否则凭证会被发往所有源仓库，其中并不需要凭证的那些反而可能因为凭证不匹配而失败：
+凭证会被发往哪些仓库？日志里会列出来（本地单一凭证模式）：
 
-```yaml
-env:
-  SYNC_SRC_REGISTRY: harbor.internal.example.com
+```text
+[信息] 源仓库凭证已装载（1 个仓库）：harbor.internal.example.com
 ```
+
+本地单一凭证模式下，如果清单里**混有公开镜像**（比如同时有 `docker.io` 和内部 Harbor），凭证会被发往所有源仓库，其中并不需要凭证的那些反而可能因为凭证不匹配而失败。两个解法：
+
+```bash
+# 解法一：固定到一个仓库（--src-registry）
+SYNC_SRC_USERNAME=alice SYNC_SRC_PASSWORD='…' SYNC_SRC_REGISTRY=harbor.internal.example.com \
+  ./scripts/sync.sh --file images.lock.txt --dest <目标仓库>
+
+# 解法二：按仓库映射（--src-credentials，或环境变量值为文件内容）
+SYNC_SRC_CREDENTIALS="$(cat src-credentials.txt)" \
+  ./scripts/sync.sh --file images.lock.txt --dest <目标仓库>
+```
+
+映射方式下这个问题天然不存在：没匹配到的 host 根本不会收到凭证。
 
 > 💡 凭证**不会出现在命令行或日志里**。脚本把它写进一个 600 权限的临时文件，用 `--src-authfile` 交给 skopeo——命令行参数对同机其他进程可见（`ps aux`），也容易被调用方的日志语句原样打印出去。该文件在脚本退出时删除。
 

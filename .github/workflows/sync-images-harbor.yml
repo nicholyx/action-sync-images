@@ -78,6 +78,10 @@ jobs:
           # 走环境变量而非命令行参数，避免凭证被打印进日志。
           SYNC_SRC_USERNAME: ${{ secrets.SRC_REGISTRY_USERNAME }}
           SYNC_SRC_PASSWORD: ${{ secrets.SRC_REGISTRY_PASSWORD }}
+          # 可选：清单混有多个私有源时，配置 SRC_CREDENTIALS（内容为
+          # 「host 用户名 密码」多行文本）替代上面两个单值 Secret。
+          # 两者同时配置会直接报错——语义只能靠猜的用法一律拒绝
+          SYNC_SRC_CREDENTIALS: ${{ secrets.SRC_CREDENTIALS }}
         run: |
           #!/usr/bin/env bash
           set -euo pipefail
