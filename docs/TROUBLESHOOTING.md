@@ -18,6 +18,7 @@
 | `denied` / `forbidden` | [权限不足](#错误denied-requested-access-to-the-resource-is-denied) |
 | `manifest unknown` / `not found` | [镜像不存在](#错误manifest-unknown) |
 | `platform ... not found` | [平台不匹配](#错误platform-not-found) |
+| `toomanyrequests` / `pull rate limit` | [Docker Hub 限流](#错误toomanyrequests-you-have-reached-your-pull-rate-limit) |
 | `context deadline exceeded` / `timeout` | [网络问题](#错误context-deadline-exceeded--timeout) |
 | `skopeo: command not found` | [缺少依赖](#错误skopeo-command-not-found) |
 
@@ -87,11 +88,22 @@ docker buildx imagetools inspect <目标镜像地址>
 
 ## 错误：`unauthorized: authentication required`
 
-### 原因
+### 先分清是哪一端报的
 
-登录目标仓库失败。可能是凭证错误、凭证过期，或者 Secret 名字写错了。
+这个报错有**两个完全不同的来源**，处理方式也完全不同。先看日志里有没有 `目标：…` 那一行：
 
-### 排查步骤
+| 报错位置 | 来源 | 跳转到 |
+| --- | --- | --- |
+| 已出现 `目标：…`，在推送时报错 | 目标仓库 | [目标仓库](#目标仓库) |
+| 刚打印 `[1/N] 镜像名` 就报错，没有 `目标：` | **源仓库** | [源仓库](#源仓库私有镜像) |
+
+分不清的话，往下按目标仓库查一遍通常也能看出端倪——目标仓库的凭证问题更常见。
+
+### 目标仓库
+
+可能是凭证错误、凭证过期，或者 Secret 名字写错了。
+
+**排查步骤**
 
 1. **确认 Secret 存在且名字正确**
 
@@ -121,6 +133,36 @@ docker buildx imagetools inspect <目标镜像地址>
    ```
 
    本地能成功说明凭证没问题，问题在 GitHub 侧的配置。
+
+### 源仓库（私有镜像）
+
+如果源镜像来自公司内部 Harbor、私有 GHCR 包这类需要认证的仓库，匿名拉取就是这个报错。
+
+**解决**：配置一对源仓库凭证。注意它们与目标仓库的凭证是**分开的两套**：
+
+| Secret | 值 |
+| --- | --- |
+| `SRC_REGISTRY_USERNAME` | 源仓库用户名 |
+| `SRC_REGISTRY_PASSWORD` | 源仓库密码或 Token |
+
+本地则用环境变量（比命令行参数稳妥，见下）：
+
+```bash
+SYNC_SRC_USERNAME=alice SYNC_SRC_PASSWORD='…' \
+  ./scripts/sync.sh --src harbor.internal.example.com/library/nginx:1.27 --dest <目标>
+```
+
+配置生效后，日志里会出现一行确认：
+
+```text
+[信息] 源仓库凭证已装载（1 个）：harbor.internal.example.com
+```
+
+如果这一行没出现，说明凭证根本没传进来——检查 Secret 名字，或者本地环境变量是否真的导出了。
+
+> ⚠️ **不要把目标仓库的凭证拿去当源仓库的凭证。** 目标是你的仓库，源是别人的系统；把「往我仓库推送」的权限交给第三方，是拿自己的仓库冒险。所以脚本刻意没有提供「复用」的捷径。
+
+> 💡 凭证**不会进日志**。脚本把它写进 600 权限的临时文件，用 `--src-authfile` 交给 skopeo；CI 里则走环境变量而非命令行参数——命令行参数对同机进程可见（`ps aux`），也容易被日志语句原样打印出去。
 
 ---
 
@@ -213,6 +255,45 @@ unknown/unknown      ← 这就是 attestation，不要写进 platforms
 
 ---
 
+## 错误：`toomanyrequests: You have reached your pull rate limit`
+
+### 完整报错长这样
+
+```text
+toomanyrequests: You have reached your pull rate limit.
+You may increase the limit by authenticating and upgrading:
+https://www.docker.com/increase-rate-limit
+```
+
+### 原因
+
+Docker Hub 对**匿名拉取**有速率限制（按 IP 计），而 GitHub Actions 的 runner 用的是共享 IP，很容易撞上。
+
+关键是要意识到：**这跟你的仓库没有关系**，是上游 Docker Hub 在限你。所以查目标仓库的配置、改 Secret，都不会有任何效果。
+
+### 解决
+
+**方案一：配置 Docker Hub 凭证。** 登录后的额度按账号算，比匿名高一个数量级。
+
+用源仓库凭证即可（`SRC_REGISTRY_USERNAME` / `SRC_REGISTRY_PASSWORD`）：
+
+```text
+SRC_REGISTRY_USERNAME = 你的 Docker Hub 用户名
+SRC_REGISTRY_PASSWORD = Access Token，**不是**登录密码
+```
+
+> 💡 Token 在 Docker Hub → Account Settings → Security → New Access Token 创建。用 Token 而不是密码，因为它可以随时吊销、权限可控，泄露了也不会连带账号本身。
+
+**方案二：换一个上游。** 很多镜像有官方镜像站或国内同步源，从那里拉根本不经过 Docker Hub。通常比配凭证更省事，也更稳定。
+
+**不要靠加大 `--retries` 解决。** 限流是窗口式的，短时间内重试只会继续撞在同一个窗口边界上。真要重试，配合 `--retry-delay` 拉长间隔才有效果——见[使用指南](USAGE.md#场景十调整重试行为)。
+
+### 怎么确认是这个问题
+
+报错里只要出现 `toomanyrequests` 或 `pull rate limit`，就是它，不必再往下查。
+
+---
+
 ## 错误：`context deadline exceeded` / `timeout`
 
 ### 原因
@@ -290,6 +371,58 @@ GitHub 官方的 `ubuntu-latest` 运行器**预装了 skopeo**，正常情况下
 3. **注意 fork 场景的限制**
 
    来自 fork 的 PR，在 `pull_request` 事件下拿到的 `GITHUB_TOKEN` 是**只读**的。这就是本项目的 `labeler.yml` 和 `welcome.yml` 使用 `pull_request_target` 的原因（它们不 checkout PR 代码，因此是安全的）。
+
+---
+
+## 自建 registry：密码填对了却始终 `unauthorized`
+
+### 现象
+
+自建 registry 启用了 htpasswd 认证。用同样的用户名密码 `docker login` 能成功，
+但脚本同步时始终 401，日志里看不出任何线索——就是一个普通的认证失败。
+
+### 原因
+
+**密码文件的哈希算法不对。**
+
+Docker Registry 的 htpasswd 实现**只认 bcrypt**（哈希以 `$2y$` 或 `$2a$` 开头）。
+而 Apache 的 `htpasswd` 不加参数时默认生成 MD5（`$apr1$`），`openssl passwd` 更是只能生成 `$apr1$`。
+
+用这些方式生成的密码文件，registry 加载时不报错、启动也完全正常，
+但**任何一次登录都会失败**——而且失败得毫无线索。
+
+### 解决
+
+生成时显式指定 bcrypt：
+
+```bash
+htpasswd -Bbn <用户名> '<密码>' > /path/to/htpasswd
+```
+
+关键是 `-B` 这个参数。生成完检查一下：
+
+```bash
+head -1 /path/to/htpasswd
+```
+
+- 看到 `$2y$…` 或 `$2a$…` → 正确
+- 看到 `$apr1$…` → 用错了工具或漏了 `-B`，registry 不会认
+
+机器上没有 `htpasswd` 的话：
+
+```bash
+apt-get install -y apache2-utils   # Debian / Ubuntu
+brew install httpd                 # macOS（htpasswd 随 httpd 一起提供）
+```
+
+### 为什么要专门记这一条
+
+因为它**不报错**。registry 启动正常、`docker login` 本地可能也是用别的凭据成功的，
+只有同步路径上才表现为 401。很容易被误判成「Secret 配错了」，然后在一个根本
+不是问题的地方反复排查。
+
+> 💡 这个坑是在给本项目写集成测试时踩到的：CI 里本来打算用 `openssl passwd -apr1`
+> 生成密码文件（省得装 apache2-utils），结果 registry 每一次认证都失败。
 
 ---
 
