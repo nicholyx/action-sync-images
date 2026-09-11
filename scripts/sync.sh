@@ -502,17 +502,28 @@ sync_via_regctl() {
   # regctl 要求 --platform 重复传递，不能用逗号分隔的单个参数。
   # 这里把逗号换成换行后逐行读取，而不是临时改 IFS——
   # 改 IFS 会连带影响后面 "${cmd[*]}" 的展开，导致日志里的命令被逗号连成一串。
+  #
+  # **结尾的换行不能省。** read 在读到「没有换行符收尾的最后一段」时会返回
+  # 非零（表示遇到 EOF 而非完整行），while 便不再执行循环体。少这个换行会导致：
+  #   - 单个平台：一段都读不到，platform_args 为空，直接判定为解析失败
+  #   - 多个平台：最后一段被静默丢弃（表现为 arm64 没同步，但毫无报错）
+  # 注意 sources 一侧同样没有结尾换行——detect_platforms 用 paste -sd, - 生成，
+  # 所以这里必须自己补上，不能指望输入。
   while IFS= read -r p; do
     p="${p// /}"
     if [[ -n "$p" ]]; then
       platform_args+=(--platform "$p")
     fi
-  done < <(printf '%s' "$platforms" | tr ',' '\n')
+  done < <(printf '%s\n' "$platforms" | tr ',' '\n')
 
   [[ ${#platform_args[@]} -gt 0 ]] || die "平台列表解析结果为空：${platforms}"
 
   if [[ "$DRY_RUN" == "true" ]]; then
-    log_dim "  [dry-run] regctl index create ${dest} --ref ${src} ${platforms//,/ --platform }"
+    # 这里打印 platform_args 本身，而不是把 ${platforms} 的逗号换成 --platform。
+    # 两者看起来一样，但来源不同：后者是「按输入的想当然」，前者才是真正会执行的参数。
+    # 上面那个丢平台的缺陷之所以长期没被发现，正是因为 dry-run 一直在按输入复述，
+    # 而不是复述实际参数——dry-run 一旦与实际行为脱节，就失去了它全部的意义。
+    log_dim "  [dry-run] regctl index create ${dest} --ref ${src} ${platform_args[*]}"
     return 0
   fi
 
