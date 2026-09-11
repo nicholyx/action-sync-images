@@ -180,6 +180,8 @@ registry.k8s.io/pause:3.9, nginx:1.27, redis:7.4
 | `skip_existing` | | `true` | 跳过目标仓库中已存在且完全相同的镜像 |
 | `dry_run` | | `false` | 只打印将要执行的命令，不实际推送。用于确认目标地址是否正确 |
 
+> 每次同步都会自动记录源与目标的 digest（详见[关于 digest](#关于-digest)），无需额外配置。
+
 **关于 `strip_attestation`：** 什么时候该勾？简单判断法是——如果同步时报了包含 `unknown manifest class` 的错误，就勾上重试。常见需要勾选的有 `ghcr.io/netbirdio/*` 这类用 BuildKit 构建且开启了 provenance 的项目。原理见 [ARCHITECTURE.md](ARCHITECTURE.md#深入理解-attestation-问题)。
 
 **关于 `platforms`：** 留空时会自动读取源镜像的平台列表。只有当自动探测失败（比如源是单平台镜像）时才需要手动指定。如果源镜像只有 `linux/amd64` 而你按默认的 `linux/amd64,linux/arm64` 去同步，会失败——这时候改成只填 `linux/amd64` 即可。
@@ -268,7 +270,56 @@ ALIYUNCS_REGISTRY = registry.cn-hangzhou.aliyuncs.com/your-company
 
 确认无误后取消勾选，再正式跑一次。
 
-### 场景七：让批量同步跑得更快
+### 场景七：锁定一份镜像，用于精确复现
+
+tag 是**可以变**的——上游重新构建一次，同一个 `v1.2.3` 背后可能就是完全不同的镜像。
+digest 不会。
+
+每次同步都会在报告中记录源与目标的 digest。如果需要把「当时那一份」固定下来，
+用 `--write-lock` 生成锁文件：
+
+```bash
+./scripts/sync.sh \
+  --src registry.k8s.io/pause:3.9 \
+  --dest registry.cn-shenzhen.aliyuncs.com/nicholyx \
+  --write-lock images.lock.resolved.txt
+```
+
+生成的内容形如：
+
+```
+registry.k8s.io/pause:3.9@sha256:dff9de1091914871…
+```
+
+这个文件可以**直接回喂给脚本**，实现精确复现：
+
+```bash
+./scripts/sync.sh --file images.lock.resolved.txt --dest <目标仓库>
+```
+
+此时源用的是 `镜像@digest`，无论上游怎么改名重建，拉到的都是同一份内容。
+
+> 💡 把锁文件提交到仓库，就等于给「这份环境当时用的是哪些镜像」留了一份可查证的记录。
+
+### 关于 digest
+
+| 概念 | 是否可变 | 用途 |
+| --- | --- | --- |
+| tag（`v1.2.3`） | ✅ 可被覆盖 | 日常使用 |
+| digest（`sha256:…`） | ❌ 不可变 | 审计、复现、校验 |
+
+同步报告中的 digest 有两个用途：
+
+- **审计**：出问题时能查清「三天前同步的那份 `latest` 到底是哪个」
+- **验证**：比对源与目标的 digest 是否一致
+
+> ⚠️ 需要说明的是，**目标 digest 与源不一致不一定是故障**。部分 registry
+> （如阿里云 ACR 对 Windows 平台）会重新包装 manifest，导致顶层 digest 变化，
+> 而实际的镜像内容是一致的。脚本遇到这种情况会在日志中提示，不会判定为失败。
+
+拿不到 digest 时（例如网络问题）不会影响同步本身，只会在报告中留空。
+
+### 场景八：让批量同步跑得更快
 
 同步镜像的时间几乎全花在网络等待上，所以**并发**和**跳过**是最有效的两个手段。
 

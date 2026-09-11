@@ -30,6 +30,7 @@ SKIP_EXISTING="false"
 NOTIFY_WEBHOOK=""
 NOTIFY_TYPE="auto"
 NOTIFY_ON="always"
+WRITE_LOCK=""
 declare -a SOURCE_IMAGES=()
 declare -a SOURCE_FILES=()
 
@@ -45,6 +46,8 @@ declare -a R_STATUS=()
 declare -a R_PLATFORM=()
 declare -a R_SECONDS=()
 declare -a R_NOTE=()
+declare -a R_SRC_DIGEST=()
+declare -a R_DEST_DIGEST=()
 
 # ---------------------------------------------------------------------------
 # 输出辅助
@@ -137,6 +140,7 @@ sync.sh —— 容器镜像同步引擎
 输出与通知：
       --dry-run            只打印将要执行的命令，不实际推送
       --report-dir <目录>  把同步报告写入该目录（同时生成 .md 与 .json）
+      --write-lock <路径>  把镜像与 digest 写成锁文件，可用于精确复现
       --regctl-version <v> 指定 regctl 版本，默认 v0.11.6
 
       --notify-webhook <url>  同步结束后把结果推送到这个 webhook。
@@ -203,6 +207,9 @@ parse_args() {
       -r|--retries)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         MAX_RETRIES="$2"; shift 2 ;;
+      --write-lock)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        WRITE_LOCK="$2"; shift 2 ;;
       --notify-webhook)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         NOTIFY_WEBHOOK="$2"; shift 2 ;;
@@ -252,10 +259,30 @@ normalize_ref() {
 }
 
 # 由源镜像推导目标仓库名。
+#
 # 阿里云个人版仓库不支持多级路径，因此把 / 全部替换为 _。
+#
+# 另外要**剥掉 digest**：目标需要的是一个可寻址的名字，而不是不可变引用。
+# 带着 @sha256:… 拼出来的目标地址是非法的，推送会失败——这个问题在使用
+# 锁文件（源引用天然带 digest）时会立刻暴露。
 dest_repo_for() {
-  local ref="$1"
-  printf '%s' "${ref//\//_}"
+  local ref="$1" digest="" base short
+
+  if [[ "$ref" == *"@"* ]]; then
+    digest="${ref#*@}"
+    ref="${ref%%@*}"
+  fi
+
+  base="${ref//\//_}"
+
+  # 源只给了 digest 没给 tag（形如 nginx@sha256:…）时，
+  # 用 digest 前缀生成一个可读的 tag，避免目标没有 tag
+  if [[ "$base" != *:* && -n "$digest" ]]; then
+    short="${digest#sha256:}"
+    base="${base}:${short:0:12}"
+  fi
+
+  printf '%s' "$base"
 }
 
 # 判断字符串是否符合镜像引用的大致格式。
@@ -557,11 +584,44 @@ collect_images() {
 # 单个镜像的处理（可能在子进程中运行）
 # ---------------------------------------------------------------------------
 
+# 计算镜像的内容摘要（digest）。
+#
+# digest 是不可变的——同一个 tag 今天是 sha256:aaa，明天可能变成 sha256:bbb
+# （上游重新构建了）。不记录它，就丢失了「这次同步的到底是哪一份镜像」。
+#
+# 这里对 --raw 拿到的原始 manifest 字节做 sha256，与 OCI 的 digest 定义一致。
+# 拿不到就返回空，由调用方决定是否显示为「未知」——**不应因此让同步失败**。
+compute_digest() {
+  local ref="$1" raw
+  raw="$(skopeo inspect --raw "docker://${ref}" 2>/dev/null)" || return 1
+  [[ -n "$raw" ]] || return 1
+  printf 'sha256:%s' "$(printf '%s' "$raw" | openssl dgst -sha256 2>/dev/null | awk '{print $NF}')"
+}
+
+# 短摘要，用于在表格里展示。完整的值留在报告文件中。
+short_digest() {
+  local d="$1"
+  [[ -n "$d" ]] || { printf '—'; return 0; }
+  printf '%s' "${d:0:19}…"
+}
+
+# 结果文件的分隔符。
+#
+# 这里**不能用制表符**：bash 把 IFS 中的空白字符（空格、tab、换行）视为
+# 「可合并的空白」，相邻的两个 tab 会被当作一个分隔符。而 note 为空时正好
+# 会产生连续的 tab，导致其后所有字段整体左移——实测表现为目标 digest
+# 被读成空值。改用 ASCII 的 Unit Separator（0x1f）这种非空白字符，
+# bash 才会严格按字符切分，空字段得以保留。
+readonly FIELD_SEP=$'\x1f'
+
 write_result() {
   local file="$1" src="$2" dest="$3" status="$4" platform="$5" seconds="$6" note="$7"
-  # note 里若混入制表符会破坏字段分隔，统一换成空格
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$src" "$dest" "$status" "$platform" "$seconds" "${note//$'\t'/ }" > "$file"
+  local src_digest="$8" dest_digest="$9"
+  # note 里若混入分隔符会破坏字段结构，统一换成空格
+  printf '%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n' \
+    "$src" "$FIELD_SEP" "$dest" "$FIELD_SEP" "$status" "$FIELD_SEP" \
+    "$platform" "$FIELD_SEP" "$seconds" "$FIELD_SEP" "${note//$FIELD_SEP/ }" "$FIELD_SEP" \
+    "$src_digest" "$FIELD_SEP" "$dest_digest" > "$file"
 }
 
 # 解析本镜像要使用的平台列表
@@ -590,6 +650,7 @@ process_one() {
   local idx="$1" raw_src="$2"
   local total="$3"
   local src dest dest_repo platforms start end elapsed status note=""
+  local src_digest="" dest_digest=""
   local result_file
   result_file="${WORK_DIR}/result-$(printf '%04d' "$idx")"
 
@@ -601,7 +662,7 @@ process_one() {
     reason="$(validate_ref "$src" 2>&1 || true)"
     log_error "[${idx}/${total}] 跳过非法镜像引用：${src} —— ${reason}"
     gh_error "镜像引用格式错误：${src}（${reason}）"
-    write_result "$result_file" "$src" "—" "failed" "—" "0" "镜像引用格式错误：${reason}"
+    write_result "$result_file" "$src" "—" "failed" "—" "0" "镜像引用格式错误：${reason}" "" ""
     return 0
   fi
 
@@ -621,7 +682,9 @@ process_one() {
   if [[ "$SKIP_EXISTING" == "true" && "$STRIP_ATTESTATION" != "true" && "$DRY_RUN" != "true" ]]; then
     if is_up_to_date "$src" "$dest"; then
       log_skip "[${idx}/${total}] 目标已是最新，跳过"
-      write_result "$result_file" "$src" "$dest" "skipped" "全部（--all）" "0" "目标已存在相同镜像"
+      src_digest="$(compute_digest "$src" || true)"
+      write_result "$result_file" "$src" "$dest" "skipped" "全部（--all）" "0" \
+        "目标已存在相同镜像" "$src_digest" "$src_digest"
       group_end
       return 0
     fi
@@ -643,7 +706,23 @@ process_one() {
   end="$(date +%s)"
   elapsed=$((end - start))
 
-  write_result "$result_file" "$src" "$dest" "$status" "$platforms" "$elapsed" "$note"
+  # 记录 digest 作为「这次同步的到底是哪一份镜像」的凭据。
+  # 取不到就留空，只影响审计信息的完整度，不影响同步本身的成败。
+  if [[ "$status" == "success" ]]; then
+    src_digest="$(compute_digest "$src" || true)"
+    dest_digest="$(compute_digest "$dest" || true)"
+    if [[ -n "$src_digest" ]]; then
+      log_info "源 digest：${src_digest}"
+    fi
+    if [[ -n "$src_digest" && -n "$dest_digest" && "$src_digest" != "$dest_digest" ]]; then
+      # 顶层 digest 不同不一定是问题（例如 registry 会重新包装 manifest），
+      # 但值得记一笔，便于日后排查
+      log_dim "  注：目标 digest 与源不同（${dest_digest}），通常由 registry 重新包装 manifest 导致"
+    fi
+  fi
+
+  write_result "$result_file" "$src" "$dest" "$status" "$platforms" "$elapsed" "$note" \
+    "$src_digest" "$dest_digest"
   group_end
   return 0
 }
@@ -680,7 +759,7 @@ dispatch_all() {
 # 结果汇总与报告
 # ---------------------------------------------------------------------------
 load_results() {
-  local f src dest status platform seconds note
+  local f src dest status platform seconds note src_digest dest_digest
   local -a files=()
 
   # glob 排序后是字典序，因此文件名用零填充保证 1、2、…、10 的顺序正确
@@ -693,14 +772,57 @@ load_results() {
 
   for f in "${files[@]}"; do
     src=""; dest=""; status=""; platform=""; seconds="0"; note=""
-    IFS=$'\t' read -r src dest status platform seconds note < "$f" || true
+    src_digest=""; dest_digest=""
+    IFS="$FIELD_SEP" read -r src dest status platform seconds note src_digest dest_digest < "$f" || true
     R_SRC+=("${src:-}")
     R_DEST+=("${dest:-}")
     R_STATUS+=("${status:-unknown}")
     R_PLATFORM+=("${platform:-}")
     R_SECONDS+=("${seconds:-0}")
     R_NOTE+=("${note:-}")
+    R_SRC_DIGEST+=("${src_digest:-}")
+    R_DEST_DIGEST+=("${dest_digest:-}")
   done
+}
+
+# 把本次同步的镜像与 digest 写成锁文件。
+#
+# 用途是「精确复现」：tag 是可以被上游覆盖的，digest 不会。
+# 把 digest 锁定下来之后，无论上游怎么重新构建，都能拉回完全相同的那一份镜像。
+# 写出的格式与 --file 读取的格式兼容，可直接回喂给脚本。
+write_lockfile() {
+  local path="$1" i
+  local dir
+  dir="$(dirname "$path")"
+  if [[ ! -d "$dir" ]]; then
+    mkdir -p "$dir" || { log_warn "锁文件目录不存在且创建失败：${dir}"; return 0; }
+  fi
+
+  {
+    echo "# 由 scripts/sync.sh 生成于 $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo "#"
+    echo "# 每行是「镜像@digest」。digest 指向不可变的内容，"
+    echo "# 即便上游重新构建了同名 tag，这里锁定的仍是当时那一份。"
+    echo "# 可直接用 --file 读取本文件实现精确复现："
+    echo "#   ./scripts/sync.sh --file ${path} --dest <目标仓库>"
+    echo ""
+    for i in "${!R_SRC[@]}"; do
+      # 跳过失败的条目：没有可靠的 digest 可锁
+      if [[ "${R_STATUS[$i]}" == "failed" ]]; then
+        echo "# [失败] ${R_SRC[$i]}"
+        continue
+      fi
+      if [[ -z "${R_SRC_DIGEST[$i]}" ]]; then
+        echo "# [无 digest] ${R_SRC[$i]}"
+        continue
+      fi
+      # 源引用本身可能已经带 digest，先剥掉再重新拼接，避免出现两个 @
+      echo "${R_SRC[$i]%%@*}@${R_SRC_DIGEST[$i]}"
+    done
+  } > "$path"
+
+  log_info "锁文件已写入：${path}"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -841,8 +963,8 @@ emit_summary() {
     {
       echo "## 镜像同步报告"
       echo ""
-      echo "| 源镜像 | 目标镜像 | 结果 | 平台 | 耗时 |"
-      echo "| --- | --- | :---: | --- | --- |"
+      echo "| 源镜像 | 目标镜像 | 结果 | 平台 | Digest | 耗时 |"
+      echo "| --- | --- | :---: | --- | --- | --- |"
       for i in "${!R_SRC[@]}"; do
         local icon="✅"
         case "${R_STATUS[$i]}" in
@@ -850,7 +972,7 @@ emit_summary() {
           success) icon="✅" ;;
           *)       icon="❌" ;;
         esac
-        echo "| \`${R_SRC[$i]}\` | \`${R_DEST[$i]}\` | ${icon} | ${R_PLATFORM[$i]:-—} | ${R_SECONDS[$i]}s |"
+        echo "| \`${R_SRC[$i]}\` | \`${R_DEST[$i]}\` | ${icon} | ${R_PLATFORM[$i]:-—} | \`$(short_digest "${R_SRC_DIGEST[$i]:-}")\` | ${R_SECONDS[$i]}s |"
       done
       echo ""
       echo "**合计**：${total} 个镜像 · 成功 ${ok} · 跳过 ${skipped} · 失败 ${fail}"
@@ -864,6 +986,11 @@ emit_summary() {
   # ---- 报告文件 ----
   if [[ -n "$REPORT_DIR" ]]; then
     write_report "$total" "$ok" "$skipped" "$fail"
+  fi
+
+  # ---- 锁文件 ----
+  if [[ -n "$WRITE_LOCK" ]]; then
+    write_lockfile "$WRITE_LOCK"
   fi
 
   # ---- 结果通知 ----
@@ -886,8 +1013,8 @@ write_report() {
     echo "- 同步模式：$([[ "$STRIP_ATTESTATION" == "true" ]] && echo 'regctl（剔除 attestation）' || echo 'skopeo（保留全部平台）')"
     echo "- 结果：共 ${total} 个镜像，成功 ${ok} 个，跳过 ${skipped} 个，失败 ${fail} 个"
     echo ""
-    echo "| 源镜像 | 目标镜像 | 结果 | 平台 | 耗时 |"
-    echo "| --- | --- | :---: | --- | --- |"
+    echo "| 源镜像 | 目标镜像 | 结果 | 平台 | 源 Digest | 目标 Digest | 耗时 |"
+    echo "| --- | --- | :---: | --- | --- | --- | --- |"
     for i in "${!R_SRC[@]}"; do
       local icon="✅"
       case "${R_STATUS[$i]}" in
@@ -895,7 +1022,7 @@ write_report() {
         success) icon="✅" ;;
         *)       icon="❌" ;;
       esac
-      echo "| \`${R_SRC[$i]}\` | \`${R_DEST[$i]}\` | ${icon} | ${R_PLATFORM[$i]:-—} | ${R_SECONDS[$i]}s |"
+      echo "| \`${R_SRC[$i]}\` | \`${R_DEST[$i]}\` | ${icon} | ${R_PLATFORM[$i]:-—} | \`${R_SRC_DIGEST[$i]:-—}\` | \`${R_DEST_DIGEST[$i]:-—}\` | ${R_SECONDS[$i]}s |"
     done
   } > "$md"
 
@@ -911,8 +1038,9 @@ write_report() {
     printf '  "failed": %s,\n' "$fail"
     printf '  "images": [\n'
     for i in "${!R_SRC[@]}"; do
-      printf '    {"source": "%s", "dest": "%s", "status": "%s", "platforms": "%s", "seconds": %s}' \
-        "${R_SRC[$i]}" "${R_DEST[$i]}" "${R_STATUS[$i]}" "${R_PLATFORM[$i]:-}" "${R_SECONDS[$i]}"
+      printf '    {"source": "%s", "dest": "%s", "status": "%s", "platforms": "%s", "source_digest": "%s", "dest_digest": "%s", "seconds": %s}' \
+        "${R_SRC[$i]}" "${R_DEST[$i]}" "${R_STATUS[$i]}" "${R_PLATFORM[$i]:-}" \
+        "${R_SRC_DIGEST[$i]:-}" "${R_DEST_DIGEST[$i]:-}" "${R_SECONDS[$i]}"
       if [[ "$i" -lt $((${#R_SRC[@]} - 1)) ]]; then
         printf ','
       fi
