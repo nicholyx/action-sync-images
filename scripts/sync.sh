@@ -20,6 +20,11 @@ declare -a DEST_REGISTRIES=()
 PLATFORMS=""
 STRIP_ATTESTATION="false"
 MAX_RETRIES="3"
+RETRY_DELAY=""
+# 记录使用者是否显式指定过这两个参数。regctl 路径对它们无能为力，
+# 而「默认值没生效」不值得打扰使用者，「显式指定的值没生效」必须说清楚。
+RETRIES_EXPLICIT="false"
+RETRY_DELAY_EXPLICIT="false"
 DRY_RUN="false"
 REPORT_DIR=""
 REPORT_NAME="sync-report"
@@ -157,7 +162,14 @@ sync.sh —— 容器镜像同步引擎
                            批量同步几十个镜像时调大能显著缩短总耗时，
                            建议值 4~8，过高可能触发上游限流
   -t, --timeout <秒>       单个镜像的超时时间，默认 600 秒（10 分钟）
-  -r, --retries <次数>     单个镜像的失败重试次数，默认 3
+  -r, --retries <次数>     单个镜像的失败重试次数，默认 3。
+                           **仅对默认的 skopeo 路径生效**：--strip-attestation
+                           走的是 regctl，而 regclient 自带重试策略（默认 5 次），
+                           此时本参数会被忽略并给出告警
+      --retry-delay <时长> 两次重试之间的固定间隔，例如 10s / 1m。默认不指定，
+                           此时 skopeo 按失败次数指数退避——多数场景下这就够好，
+                           只有窗口式限流的自建仓库才需要固定间隔。
+                           同样仅对 skopeo 路径生效
 
 输出与通知：
       --dry-run            只打印将要执行的命令，不实际推送
@@ -241,7 +253,10 @@ parse_args() {
         TIMEOUT="$2"; shift 2 ;;
       -r|--retries)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
-        MAX_RETRIES="$2"; shift 2 ;;
+        MAX_RETRIES="$2"; RETRIES_EXPLICIT="true"; shift 2 ;;
+      --retry-delay)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        RETRY_DELAY="$2"; RETRY_DELAY_EXPLICIT="true"; shift 2 ;;
       --write-lock)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         WRITE_LOCK="$2"; shift 2 ;;
@@ -475,6 +490,12 @@ sync_via_skopeo() {
   # 用数组拼参数而不是条件分支重复整条命令：
   # 这样也不会踩到「空数组在 set -u 下展开出错」的坑
   local -a cmd=(skopeo copy --all --retry-times "$MAX_RETRIES")
+
+  # 不指定 --retry-delay 时，skopeo 的等待时间随失败次数指数增长。
+  # 显式指定则固定间隔——这是为窗口式限流的仓库准备的，不是默认选项。
+  if [[ -n "$RETRY_DELAY" ]]; then
+    cmd+=(--retry-delay "$RETRY_DELAY")
+  fi
 
   if [[ "$TLS_VERIFY" == "false" ]]; then
     cmd+=(--src-tls-verify=false --dest-tls-verify=false)
@@ -1359,6 +1380,18 @@ main() {
 
   if [[ "$SKIP_EXISTING" == "true" && "$STRIP_ATTESTATION" == "true" ]]; then
     log_warn "--skip-existing 在 --strip-attestation 模式下不可用（索引会被重建，digest 必然不同），本次将忽略"
+  fi
+
+  # regctl 路径用的是 regclient 自己的重试策略，脚本层面的这两个参数到不了它那里。
+  # 默认值被忽略不值得打扰，但使用者**显式传入**却没生效必须说出来——
+  # 「参数被接受却不起作用」比直接报错更危险：它让人对系统行为产生错误认知。
+  if [[ "$STRIP_ATTESTATION" == "true" ]]; then
+    if [[ "$RETRIES_EXPLICIT" == "true" ]]; then
+      log_warn "--retries ${MAX_RETRIES} 在 regctl 路径下不生效：regclient 有自己的重试策略（默认 5 次），本次将忽略"
+    fi
+    if [[ "$RETRY_DELAY_EXPLICIT" == "true" ]]; then
+      log_warn "--retry-delay ${RETRY_DELAY} 仅对 skopeo 生效，regctl 路径将忽略（regclient 会遵循 registry 返回的 Retry-After）"
+    fi
   fi
 
   # 报「实际要同步」的数量，而不是清单里的总数——筛选之后这两个值常常不同
