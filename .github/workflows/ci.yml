@@ -660,10 +660,11 @@ jobs:
           fi
           echo "✓ 格式错误报行号且不回显行内容"
 
-          # 环境变量方式（CI 的 Secret 注入路径）：值为内容而非路径
+          # 环境变量方式（CI 的 Secret 注入路径）：值为内容而非路径。
+          # cred 内容有两条有效条目，无论 --src 用到哪条，装载的都是全部
           output="$(SYNC_SRC_CREDENTIALS="$(cat "$cred")" \
             ./scripts/sync.sh --src "ghcr.io/b/b:2" --dest r.example.com/x --dry-run 2>&1)"
-          grep -q '凭证已装载（1 个仓库）' <<<"$output" \
+          grep -q '凭证已装载（2 个仓库）' <<<"$output" \
             || { echo "::error::SYNC_SRC_CREDENTIALS 未生效"; exit 1; }
           echo "✓ 环境变量注入（Secret 场景）可用"
 
