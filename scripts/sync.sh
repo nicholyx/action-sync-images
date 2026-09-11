@@ -324,12 +324,31 @@ validate_ref() {
   return 0
 }
 
+# 统一的 skopeo inspect --raw 调用。
+#
+# 之所以要包一层：**TLS 设置必须与 copy 保持一致**。曾经 --tls-verify false
+# 只传给了 skopeo copy，而跳过判定等处的 inspect 仍在用默认的 TLS 校验，
+# 于是对 HTTP registry 的探测全部失败，「目标是否已是最新」永远判为否，
+# 增量跳过形同虚设。
+#
+# 这个问题是 CI 的真实同步集成测试抓出来的——dry-run 不执行跳过判定，
+# 本地 mock 又绕开了真实 TLS，两者都覆盖不到。
+skopeo_inspect_raw() {
+  local ref="$1"
+  local -a cmd=(skopeo inspect --raw)
+  if [[ "$TLS_VERIFY" == "false" ]]; then
+    cmd+=(--tls-verify=false)
+  fi
+  cmd+=("docker://${ref}")
+  "${cmd[@]}"
+}
+
 # 探测源镜像包含哪些平台。
 # 仅当源是 manifest list / OCI index 时才有意义；单平台镜像返回空。
 # 依赖 skopeo 与 jq。
 detect_platforms() {
   local ref="$1" raw
-  raw="$(skopeo inspect --raw "docker://${ref}" 2>/dev/null)" || return 1
+  raw="$(skopeo_inspect_raw "$ref" 2>/dev/null)" || return 1
   printf '%s' "$raw" | jq -r '
     .manifests[]?.platform
     | select(.architecture != null and .architecture != "unknown")
@@ -498,7 +517,7 @@ sync_one() {
 # 说明 manifest 在传输过程中被重新生成了。把它纳入比较只会让跳过永远
 # 不生效，而本项目面向的是国内 Linux 容器环境，用不到 Windows 镜像。
 platform_digest_map() {
-  skopeo inspect --raw "docker://$1" 2>/dev/null \
+  skopeo_inspect_raw "$1" 2>/dev/null \
     | jq -r '
         .manifests[]?
         | select(.platform.architecture != null and .platform.architecture != "unknown")
@@ -538,10 +557,10 @@ is_up_to_date() {
 
   # 单平台镜像没有 manifests 字段，退化为比较规范化后的 manifest JSON。
   # 同样只看内容而不看退出码，理由见上。
-  src_norm="$(skopeo inspect --raw "docker://${src}" 2>/dev/null | jq -S -c . 2>/dev/null || true)"
+  src_norm="$(skopeo_inspect_raw "$src" 2>/dev/null | jq -S -c . 2>/dev/null || true)"
   [[ -n "$src_norm" ]] || return 1
 
-  dest_norm="$(skopeo inspect --raw "docker://${dest}" 2>/dev/null | jq -S -c . 2>/dev/null || true)"
+  dest_norm="$(skopeo_inspect_raw "$dest" 2>/dev/null | jq -S -c . 2>/dev/null || true)"
   [[ -n "$dest_norm" ]] || return 1
 
   [[ "$src_norm" == "$dest_norm" ]]
@@ -630,7 +649,7 @@ collect_images() {
 # 拿不到就返回空，由调用方决定是否显示为「未知」——**不应因此让同步失败**。
 compute_digest() {
   local ref="$1" raw
-  raw="$(skopeo inspect --raw "docker://${ref}" 2>/dev/null)" || return 1
+  raw="$(skopeo_inspect_raw "$ref" 2>/dev/null)" || return 1
   [[ -n "$raw" ]] || return 1
   printf 'sha256:%s' "$(printf '%s' "$raw" | openssl dgst -sha256 2>/dev/null | awk '{print $NF}')"
 }
