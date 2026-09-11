@@ -935,6 +935,47 @@ short_digest() {
 # bash 才会严格按字符切分，空字段得以保留。
 readonly FIELD_SEP=$'\x1f'
 
+# 生成「最慢的同步记录」表格行（不含表头），输出到 stdout。
+#
+# 为什么是「记录」而不是「镜像」：多目标下同一个镜像会有多条记录，各自的耗时
+# 是独立的；混在一起聚合反而看不清是哪个目标慢。排序的对象是记录，展示时
+# 把目标也带上。
+#
+# 两个不输出的条件，都是为了避免噪音：
+#   - 有效记录不足 3 条：两三个镜像肉眼就能看出快慢，排行只是干扰
+#   - 全部为 0 秒（dry-run 的常态）：没有真实耗时数据，排出来的全是 0s
+duration_ranking_rows() {
+  local max="${1:-5}"
+  local -a rows=()
+  local i r nonzero=0
+
+  for i in "${!R_SRC[@]}"; do
+    # 跳过与排除的耗时恒为 0，参与排序只会污染榜单
+    case "${R_STATUS[$i]}" in
+      skipped|excluded) continue ;;
+    esac
+    rows+=("${R_SECONDS[$i]}${FIELD_SEP}${i}")
+  done
+
+  [[ ${#rows[@]} -ge 3 ]] || return 0
+
+  for r in "${rows[@]}"; do
+    [[ "${r%%"${FIELD_SEP}"*}" -gt 0 ]] && nonzero=$((nonzero + 1))
+  done
+  [[ "$nonzero" -gt 0 ]] || return 0
+
+  # 借助 sort 排序而不是在 bash 里手写：数字降序恰好是它的强项，
+  # 而且避免为了兼容 bash 3.2 而手写排序循环
+  printf '%s\n' "${rows[@]}" \
+    | sort -t"$FIELD_SEP" -k1,1rn \
+    | head -n "$max" \
+    | while IFS= read -r r; do
+        local idx="${r##*"${FIELD_SEP}"}"
+        printf "| %ss | \`%s\` → \`%s\` |\n" \
+          "${R_SECONDS[$idx]}" "${R_SRC[$idx]}" "${R_DEST[$idx]}"
+      done
+}
+
 write_result() {
   local file="$1" src="$2" dest="$3" status="$4" platform="$5" seconds="$6" note="$7"
   local src_digest="$8" dest_digest="$9"
@@ -1353,6 +1394,20 @@ emit_summary() {
         echo ""
         echo "> 另有 ${excluded} 个镜像被 \`--filter\` / \`--exclude\` 排除，未参与本次同步。"
       fi
+
+      # 耗时排行。一批镜像的总耗时几乎总是被其中一两个主导——
+      # 找出它们是优化同步速度的第一步，逐个翻表格反而看不出来。
+      local ranking
+      ranking="$(duration_ranking_rows 5)"
+      if [[ -n "$ranking" ]]; then
+        echo ""
+        echo "### 最慢的同步记录"
+        echo ""
+        echo "| 耗时 | 镜像 → 目标 |"
+        echo "| ---: | --- |"
+        echo "$ranking"
+      fi
+
       echo ""
       if [[ "$DRY_RUN" == "true" ]]; then
         echo "> ⚠️ 本次为 dry-run，未实际推送任何镜像。"
@@ -1410,6 +1465,17 @@ write_report() {
       esac
       echo "| \`${R_SRC[$i]}\` | \`${R_DEST[$i]}\` | ${icon} | ${R_PLATFORM[$i]:-—} | \`${R_SRC_DIGEST[$i]:-—}\` | \`${R_DEST_DIGEST[$i]:-—}\` | ${R_SECONDS[$i]}s |"
     done
+
+    local ranking
+    ranking="$(duration_ranking_rows 5)"
+    if [[ -n "$ranking" ]]; then
+      echo ""
+      echo "## 最慢的同步记录"
+      echo ""
+      echo "| 耗时 | 镜像 → 目标 |"
+      echo "| ---: | --- |"
+      echo "$ranking"
+    fi
   } > "$md"
 
   local json="${REPORT_DIR}/${REPORT_NAME}.json"
