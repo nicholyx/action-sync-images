@@ -384,8 +384,14 @@ jobs:
           # 造两份报告：一份全成功，一份含一个非法镜像（会被记为失败）
           ./scripts/sync.sh --src "nginx:1.27,redis:7.4" --dest r.example.com/x \
             --dry-run --report-dir "${work}/run1" >/dev/null 2>&1
+
+          # 这一条**故意**要失败（那份报告里得有一条 failed 记录），
+          # 所以它返回 2 是预期内的。不关掉 errexit 的话，下面所有断言都不会执行——
+          # 而失败信息只会是一句没头没尾的「exit code 2」。
+          set +e
           ./scripts/sync.sh --src "nginx:1.27,https://bad.example.com/x:1" --dest r.example.com/x \
             --dry-run --report-dir "${work}/run2" >/dev/null 2>&1
+          set -e
 
           set +e
           out="$(./scripts/history.sh --dir "$work" 2>/dev/null)"
