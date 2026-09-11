@@ -692,12 +692,15 @@ sync_one() {
 # 推送到单个目标。多目标中转模式下走本地 OCI 目录，否则按常规路径。
 # 中转推送不需要 --src-authfile（本地文件无鉴权），但 --all 不能省——
 # 它同样要保留多架构索引。
+#
+# 常规分支的末尾**不能写 return 0**：sync_one 的退出码是「同步是否成功」
+# 的唯一依据，覆盖它会让失败的同步被记成成功（本 PR 的 CI 当场抓到过）。
 sync_to_dest() {
   local src="$1" dest="$2" platforms="$3" oci_dir="$4"
 
   if [[ -z "$oci_dir" ]]; then
     sync_one "$src" "$dest" "$platforms"
-    return 0
+    return $?
   fi
 
   local -a cmd=(skopeo copy --all)
