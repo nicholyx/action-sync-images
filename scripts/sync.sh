@@ -33,6 +33,10 @@ CONCURRENCY="1"
 TIMEOUT="600"
 SKIP_EXISTING="false"
 TLS_VERIFY="true"
+# 同步后逐平台校验目标与源的内容一致性。默认关闭：
+# 校验要为每个镜像多做两次 inspect，大清单下开销明显；
+# 且「同步成功」对多数使用者已经够用，需要精确性的场景再打开。
+VERIFY="false"
 NOTIFY_WEBHOOK=""
 NOTIFY_TYPE="auto"
 NOTIFY_ON="always"
@@ -170,6 +174,11 @@ sync.sh —— 容器镜像同步引擎
                            会重建索引，目标 digest 必然不同，因此不做跳过
       --tls-verify <bool>  是否校验 registry 的 TLS 证书，默认 true。
                            自建 HTTP 仓库（如本地 registry:2）填 false
+      --verify             同步后逐平台比对源与目标的子 manifest digest，
+                           不一致时该镜像判定为失败。要为每个镜像多做两次
+                           inspect，大清单下会明显变慢，默认关闭。
+                           Windows 平台被排除在比对之外（其 manifest 在传输中
+                           必然重新生成）；拿不到 digest 时只告警不判失败
 
 源仓库凭证（同步私有镜像时使用）：
       --src-username <名>  源仓库的用户名，需与 --src-password 同时提供
@@ -269,6 +278,8 @@ parse_args() {
         STRIP_ATTESTATION="true"; shift ;;
       --skip-existing)
         SKIP_EXISTING="true"; shift ;;
+      --verify)
+        VERIFY="true"; shift ;;
       --tls-verify)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         TLS_VERIFY="$2"; shift 2 ;;
@@ -698,6 +709,76 @@ is_up_to_date() {
   [[ "$src_norm" == "$dest_norm" ]]
 }
 
+# 同步后的完整性校验：逐平台比对源与目标的子 manifest digest。
+#
+# 为什么需要它：`skopeo copy` 返回 0 只说明命令跑完了，不代表每个平台都完整
+# 推上去了——传输中断、目标 registry 重新包装、限流导致的静默截断，都可能
+# 只影响部分平台。而报告里记录的 digest 从来只是记录、没有比对。
+#
+# 退出码：
+#   0  一致（或源与目标都是单平台且内容一致）
+#   1  存在差异（差异详情已写到 stdout，调用方负责展示）
+#   2  无法校验（拿不到 digest）——**不判定失败**，理由与 digest 记录一致：
+#      网络抖动是常态，校验本身不该比同步更容易失败
+#
+# 与增量跳过共用 platform_digest_map，因此天然继承两个关键取舍：
+# 按子 manifest 的 digest 比对（顶层 digest 会因 registry 重新包装而变化）、
+# 排除 Windows 平台（其 manifest 在传输中必然重新生成）。
+verify_integrity() {
+  local src="$1" dest="$2"
+  local src_map dest_map src_norm dest_norm
+
+  src_map="$(platform_digest_map "$src" || true)"
+
+  # 单平台镜像没有 manifests 列表，退化为比对规范化后的 manifest JSON，
+  # 与 is_up_to_date 的单平台路径保持同一逻辑
+  if [[ -z "$src_map" ]]; then
+    src_norm="$(skopeo_inspect_raw "$src" 2>/dev/null | jq -S -c . 2>/dev/null || true)"
+    if [[ -z "$src_norm" ]]; then
+      return 2
+    fi
+    dest_norm="$(skopeo_inspect_raw "$dest" 2>/dev/null | jq -S -c . 2>/dev/null || true)"
+    if [[ -z "$dest_norm" ]]; then
+      return 2
+    fi
+    if [[ "$src_norm" == "$dest_norm" ]]; then
+      return 0
+    fi
+    printf '单平台 manifest 内容不一致\n'
+    return 1
+  fi
+
+  dest_map="$(platform_digest_map "$dest" || true)"
+  if [[ -z "$dest_map" ]]; then
+    return 2
+  fi
+
+  # 源有而目标没有 → 平台缺失；反之 → 目标多出意料之外的平台
+  local missing extra
+  missing="$(comm -23 <(printf '%s\n' "$src_map") <(printf '%s\n' "$dest_map"))"
+  extra="$(comm -13 <(printf '%s\n' "$src_map") <(printf '%s\n' "$dest_map"))"
+
+  if [[ -z "$missing" && -z "$extra" ]]; then
+    return 0
+  fi
+
+  local p problems=""
+  if [[ -n "$missing" ]]; then
+    problems+="目标缺失的平台："
+    while IFS= read -r p; do
+      [[ -n "$p" ]] && problems+=$'\n'"  ${p%% *}（digest ${p#* }）"
+    done <<<"$missing"
+  fi
+  if [[ -n "$extra" ]]; then
+    problems+="${problems:+$'\n'}目标多出的平台："
+    while IFS= read -r p; do
+      [[ -n "$p" ]] && problems+=$'\n'"  ${p%% *}（digest ${p#* }）"
+    done <<<"$extra"
+  fi
+  printf '%s' "$problems"
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # 镜像列表收集
 # ---------------------------------------------------------------------------
@@ -1090,6 +1171,30 @@ process_one() {
     fi
     end="$(date +%s)"
     elapsed=$((end - start))
+
+    # 完整性校验：skopeo 返回 0 不代表每个平台都完整推上去了。
+    # 校验放在 digest 记录之前——校验失败会直接改写 status，此时 digest
+    # 的取值路径要跟最终状态一致。
+    if [[ "$status" == "success" && "$VERIFY" == "true" ]]; then
+      local diff_detail verify_rc=0
+      diff_detail="$(verify_integrity "$src" "$dest")" || verify_rc=$?
+      case "$verify_rc" in
+        0)
+          log_ok "  校验通过（逐平台一致）"
+          ;;
+        1)
+          status="failed"
+          note="完整性校验失败：${diff_detail//$'\n'/; }"
+          log_error "  完整性校验失败"
+          printf '%s\n' "$diff_detail" | sed 's/^/    /' >&2
+          gh_error "完整性校验失败：${src} → ${dest}（${diff_detail//$'\n'/; }）"
+          ;;
+        2)
+          # 拿不到 digest 多半是网络抖动，校验不该比同步本身更容易失败
+          log_warn "  无法完成完整性校验（拿不到 digest），不影响结果"
+          ;;
+      esac
+    fi
 
     # 记录 digest 作为「这次同步的到底是哪一份镜像」的凭据。
     # 取不到就留空，只影响审计信息的完整度，不影响同步本身的成败。

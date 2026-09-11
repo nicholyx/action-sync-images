@@ -25,6 +25,11 @@ on:
         required: false
         type: boolean
         default: true
+      verify:
+        description: '同步后逐平台校验目标与源的内容一致（每个镜像多两次 inspect，大清单会变慢）'
+        required: false
+        type: boolean
+        default: false
       dry_run:
         description: '仅预览将要执行的命令，不实际推送'
         required: false
@@ -82,6 +87,7 @@ jobs:
           LOCKFILE: ${{ inputs.lockfile }}
           CONCURRENCY: ${{ inputs.concurrency }}
           SKIP_EXISTING: ${{ inputs.skip_existing }}
+          VERIFY: ${{ inputs.verify }}
           DRY_RUN: ${{ inputs.dry_run }}
           FILTER_REGEX: ${{ inputs.filter }}
           EXCLUDE_REGEX: ${{ inputs.exclude }}
@@ -118,6 +124,9 @@ jobs:
           fi
           if [[ "$SKIP_EXISTING" == "true" ]]; then
             args+=(--skip-existing)
+          fi
+          if [[ "$VERIFY" == "true" ]]; then
+            args+=(--verify)
           fi
           if [[ "$DRY_RUN" == "true" ]]; then
             args+=(--dry-run)
