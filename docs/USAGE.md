@@ -227,6 +227,8 @@ registry.k8s.io/pause:3.9, nginx:1.27, redis:7.4
 | `concurrency` | | `6` | 并发同步的镜像数量 |
 | `skip_existing` | | `true` | 跳过已存在的相同镜像 |
 | `dry_run` | | `false` | 同上 |
+| `filter` | | 空 | 只同步匹配该正则的镜像（ERE）。详见[场景九](#场景九只同步清单里的一部分镜像) |
+| `exclude` | | 空 | 跳过匹配该正则的镜像（ERE） |
 
 ---
 
@@ -358,6 +360,49 @@ registry.k8s.io/pause:3.9@sha256:dff9de1091914871…
 **超时** —— 单个镜像默认 600 秒。某个镜像特别大、或者上游偶尔抽风时，
 超时能让它快速失败并继续处理其余镜像，而不是卡住整个任务。
 工作流没有暴露这个参数，需要时可在本地用 `--timeout` 指定。
+
+---
+
+### 场景九：只同步清单里的一部分镜像
+
+清单文件是「期望状态的完整记录」，但**某一次同步**往往只想覆盖其中一部分：
+这次只补同步 `kube-*` 组件、临时跳过某个已知有问题的镜像、只同步某个 registry 下的东西。
+
+与其反复编辑清单文件（改完还得记得改回来，而且很容易忘），不如把筛选条件写在命令上：
+
+```bash
+# 只同步 kube-* 组件
+./scripts/sync.sh --file images.lock.txt --dest <目标仓库> \
+  --filter 'kube-'
+
+# 从清单里临时排掉 apiserver
+./scripts/sync.sh --file images.lock.txt --dest <目标仓库> \
+  --exclude 'apiserver'
+
+# 组合使用：先 filter 后 exclude
+./scripts/sync.sh --file images.lock.txt --dest <目标仓库> \
+  --filter '^registry\.k8s\.io/' --exclude 'apiserver'
+```
+
+两者都接受 **ERE 正则**，匹配的是源镜像的**完整引用**（`registry.io/ns/name:tag`）。
+
+**被排除的镜像仍会出现在结果表和报告中**，标为 `⊘ 已排除` 并注明是哪条规则把它排掉的：
+
+```text
+ ✓ registry.k8s.io/kube-scheduler:v1.31.0
+ ⊘ registry.k8s.io/kube-apiserver:v1.31.0
+   匹配 --exclude「apiserver」
+```
+
+这一点是刻意的：清单里列了 20 个镜像、结果表只出现 19 行，使用者会以为第 20 个同步了。
+**看得见的排除才是排除，看不见的排除是隐患。**
+
+> ⚠️ 正则写错会立即以退出码 `1` 报错，不会跑到一半才发现。
+> 如果筛选条件把**全部**镜像都排掉了，同样按参数错误处理——静默地「什么都没同步然后报成功」
+> 是最糟的结果。
+
+> 💡 排除不等于失败。筛选是有意为之的操作，因此不会影响退出码：
+> 只要剩下的镜像都同步成功，退出码就是 `0`。
 
 ---
 
