@@ -6,9 +6,11 @@ run-name: 发布 ${{ github.ref_name }}
 # 怎样触发工作流
 on:
   push:
-    # 只有形如 v1.2.3 的 tag 才会触发发布
+    # 形如 v1.2.3 的 tag 触发发布。
+    # 末尾的 * 是必要的：没有它，v1.2.3-rc.1 这类预发布版本根本不会触发本
+    # 工作流，下面那段预发布处理逻辑就成了永远走不到的死代码。
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
 
 # 创建 Release 需要写 contents 的权限
 permissions:
@@ -22,19 +24,24 @@ jobs:
       - name: Checkout Repos
         uses: actions/checkout@v7
         with:
-          # 需要完整历史，便于 GitHub 自动生成对比链接
+          # 需要完整历史：既要定位上一个 tag，也要让 GitHub 生成对比链接
           fetch-depth: 0
 
-      - name: 从 CHANGELOG 提取本版本说明
+      # -----------------------------------------------------------------------
+      # ① 从 CHANGELOG 提取本版本的手写说明
+      #
+      # 这是面向使用者的归纳，位于发布说明的主体位置。
+      # -----------------------------------------------------------------------
+      - name: 提取 CHANGELOG 中本版本的说明
+        id: changelog
         env:
           TAG: ${{ github.ref_name }}
         run: |
           #!/usr/bin/env bash
           set -euo pipefail
 
-          # tag 形如 v1.2.3，CHANGELOG 中的标题形如 ## [1.2.3] - 2026-09-11
           version="${TAG#v}"
-          echo "从 CHANGELOG.md 提取版本 ${version} 的说明"
+          echo "从 CHANGELOG.md 提取 ${version} 的说明"
 
           # 取出版本标题之后、下一个版本标题之前的内容
           awk -v ver="$version" '
@@ -44,19 +51,188 @@ jobs:
               if (index($0, "[" ver "]") > 0) { found = 1; next }
             }
             found { print }
-          ' CHANGELOG.md > release-notes.md
+          ' CHANGELOG.md > changelog-section.md
 
-          if [[ ! -s release-notes.md ]]; then
-            echo "::warning::CHANGELOG.md 中没有找到 ${version} 的条目，将改用 GitHub 自动生成的说明"
-            {
-              echo "本版本未在 CHANGELOG.md 中登记，以下为自动生成的变更列表。"
-              echo ""
-              echo "> 维护者请在发布后补充 CHANGELOG 条目。"
-            } > release-notes.md
+          if [[ -s changelog-section.md ]]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "已提取 $(wc -l < changelog-section.md) 行"
           else
-            echo "已提取 $(wc -l < release-notes.md) 行说明"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CHANGELOG.md 中没有 ${version} 的条目，发布说明将只包含变更清单"
           fi
 
+      # -----------------------------------------------------------------------
+      # ② 用 GitHub 原生 API 生成变更清单
+      #
+      # releases/generate-notes 会返回自上一个 tag 以来的 PR 列表、贡献者，
+      # 以及 Full Changelog 对比链接。自己拼这些既麻烦又容易漏。
+      # -----------------------------------------------------------------------
+      - name: 生成变更清单
+        id: prs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 找上一个 tag（按版本号排序，排除当前这个）
+          prev="$(git tag --sort=-v:refname | grep -v "^${TAG}$" | head -n 1 || true)"
+
+          if [[ -z "$prev" ]]; then
+            echo "::notice::没有找到上一个 tag，跳过变更清单"
+            : > pr-list.md
+            exit 0
+          fi
+
+          echo "上一个版本：${prev}"
+          echo "prev_tag=${prev}" >> "$GITHUB_OUTPUT"
+
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+              -f tag_name="$TAG" \
+              -f previous_tag_name="$prev" \
+              --jq '.body' > pr-list.md; then
+            echo "::warning::变更清单生成失败，发布说明将不含 PR 列表"
+            : > pr-list.md
+            exit 0
+          fi
+
+          echo "已生成 $(wc -l < pr-list.md) 行变更清单"
+
+      # -----------------------------------------------------------------------
+      # ③ AI 摘要（可选）
+      #
+      # 未配置 ANTHROPIC_API_KEY 时静默跳过。
+      # **任何失败都不影响发布**——摘要只是锦上添花，不该成为发布的单点故障。
+      # -----------------------------------------------------------------------
+      - name: 生成发布摘要
+        id: summary
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          : > summary.md
+
+          if [[ -z "$ANTHROPIC_API_KEY" ]]; then
+            echo "未配置 ANTHROPIC_API_KEY，跳过 AI 摘要（发布流程不受影响）"
+            exit 0
+          fi
+
+          # 准备素材：CHANGELOG 段落 + PR 清单
+          {
+            echo "版本：${TAG}"
+            echo ""
+            if [[ -s changelog-section.md ]]; then
+              echo "## CHANGELOG 记录"
+              echo ""
+              cat changelog-section.md
+              echo ""
+            fi
+            if [[ -s pr-list.md ]]; then
+              echo "## 包含的 PR"
+              echo ""
+              cat pr-list.md
+            fi
+          } > ai-input.txt
+
+          # 控制输入规模，避免异常长的 CHANGELOG 让请求过大
+          head -c 12000 ai-input.txt > ai-input-trimmed.txt
+
+          cat > ai-prompt.txt <<'PROMPT'
+          你是开源项目的维护者，正在为一次版本发布撰写摘要。
+
+          请根据下面提供的材料，写一段中文摘要，要求：
+          - 2~3 句话，不超过 150 字
+          - 面向使用者，说明这个版本主要解决了什么问题、带来什么变化
+          - 抓住主线，不要逐条罗列改动
+          - 语气平实，不要营销腔，不要用「重磅」「震撼」这类词
+          - 直接输出摘要正文，不要标题、不要代码块、不要 markdown 标记
+
+          材料如下：
+
+          PROMPT
+          cat ai-input-trimmed.txt >> ai-prompt.txt
+
+          payload="$(jq -n \
+            --arg model "claude-sonnet-5" \
+            --rawfile prompt ai-prompt.txt \
+            '{model: $model, max_tokens: 1024, messages: [{role: "user", content: $prompt}]}')"
+
+          echo "调用 Claude API 生成摘要..."
+          response="$(curl -sS --max-time 90 \
+            -X POST "https://api.anthropic.com/v1/messages" \
+            -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "$payload" 2>/dev/null)" || {
+              echo "::warning::AI 摘要生成失败（网络问题），发布流程继续"
+              exit 0
+            }
+
+          summary="$(printf '%s' "$response" | jq -r '.content[0].text // empty' 2>/dev/null || true)"
+
+          if [[ -z "$summary" ]]; then
+            # 把 API 的返回原样打出来便于排查，但注意其中可能含错误信息
+            echo "::warning::AI 摘要生成失败，发布流程继续"
+            printf '%s\n' "$response" | head -c 500
+            exit 0
+          fi
+
+          printf '%s\n' "$summary" > summary.md
+          echo "✓ 摘要已生成（$(printf '%s' "$summary" | wc -m) 字）"
+
+      # -----------------------------------------------------------------------
+      # ④ 组装最终的发布说明
+      # -----------------------------------------------------------------------
+      - name: 组装发布说明
+        env:
+          TAG: ${{ github.ref_name }}
+          HAS_CHANGELOG: ${{ steps.changelog.outputs.found }}
+          PREV_TAG: ${{ steps.prs.outputs.prev_tag }}
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          : > release-notes.md
+
+          # —— 摘要 ——
+          if [[ -s summary.md ]]; then
+            {
+              echo "> $(cat summary.md)"
+              echo ""
+            } >> release-notes.md
+          fi
+
+          # —— 变更内容（CHANGELOG 手写部分）——
+          if [[ "$HAS_CHANGELOG" == "true" ]] && [[ -s changelog-section.md ]]; then
+            cat changelog-section.md >> release-notes.md
+          elif [[ -n "$PREV_TAG" ]]; then
+            # CHANGELOG 没写时不要只留一句占位——直接把对比链接给出来，
+            # 读者仍然能一键看到全部改动
+            {
+              echo "本版本未在 \`CHANGELOG.md\` 中单独登记。"
+              echo ""
+              echo "完整的代码改动可以通过下方的变更清单与对比链接查看；"
+              echo "也欢迎提 Issue 提醒维护者补充版本说明。"
+              echo ""
+            } >> release-notes.md
+          fi
+
+          # —— 变更清单（PR / 贡献者 / 对比链接）——
+          if [[ -s pr-list.md ]]; then
+            printf '\n---\n\n' >> release-notes.md
+            cat pr-list.md >> release-notes.md
+          fi
+
+          echo "=== 最终发布说明 ==="
+          cat release-notes.md
+
+      # -----------------------------------------------------------------------
+      # ⑤ 创建 Release
+      # -----------------------------------------------------------------------
       - name: 创建 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -80,31 +256,3 @@ jobs:
 
           echo "✅ Release ${TAG} 已创建"
           echo "### 🚀 Release [${TAG}](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}) 已发布" >> "$GITHUB_STEP_SUMMARY"
-
-  # ---------------------------------------------------------------------------
-  # CHANGELOG 提交流程提示
-  # 发布后提醒维护者把 Unreleased 段落归位，避免日志越积越乱。
-  # ---------------------------------------------------------------------------
-  remind:
-    name: 检查 CHANGELOG 是否已归位
-    runs-on: ubuntu-latest
-    needs: release
-    permissions:
-      issues: write
-    steps:
-      - name: Checkout Repos
-        uses: actions/checkout@v7
-
-      - name: 检查 Unreleased 段落是否仍然存在
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          #!/usr/bin/env bash
-          set -euo pipefail
-
-          if grep -q '^## \[Unreleased\]' CHANGELOG.md; then
-            echo "✓ CHANGELOG 中保留了 Unreleased 段落"
-          else
-            echo "::warning::CHANGELOG.md 中缺少 [Unreleased] 段落，请在下次改动时补回"
-          fi
