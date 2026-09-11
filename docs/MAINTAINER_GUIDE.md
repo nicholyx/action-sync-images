@@ -167,6 +167,14 @@ gh label create stale         --color 795548 --description "长期无响应"
 - **CI 卡住不让合并** → 检查是不是真的有问题；确认无误时可以临时在分支保护里放宽，但请尽快改回来
 - **Dependabot 噪音太大** → 调整 `.github/dependabot.yml` 的 `open-pull-requests-limit` 或 `schedule.interval`
 
+### 维护流程已沉淀为 Skill
+
+`.claude/skills/maintain-loop/SKILL.md` 把本项目完整的维护闭环——盘点、规划、实现、CI 与合并、发布、继续规划，以及踩坑后沉淀的硬规则——写成了一份可执行的操作规范。
+
+在装了 Claude Code 的环境里，克隆本仓库后它会随项目自动生效；让 AI「继续迭代」「按维护流程走」「发布新版本」时，它会按同一套流程执行。人工维护者也可以把它当作**流程速查表**来读——本手册其余部分讲「每件事的细节」，它讲「整件事的顺序」。
+
+修改维护流程时**两边都要改**：先改本手册（细节的事实来源），再同步 skill（流程的执行入口）。
+
 ---
 
 ## 日常维护
