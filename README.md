@@ -57,6 +57,7 @@
 - **结果通知** —— 可推送同步结果到钉钉 / 飞书 / Slack，无人值守时也能第一时间知道成败
 - **可审计** —— 记录源与目标的 digest，并可生成锁文件用于精确复现
 - **结果一目了然** —— 运行结束直接生成结果表格，无需翻日志
+- **可看趋势** —— `scripts/history.sh` 汇总历次报告，回答「哪个镜像总在失败」
 - **可在本地复现** —— 同一套逻辑封装成 `scripts/sync.sh`，本地也能跑，支持 `--dry-run`
 - **目标仓库可配置** —— 换命名空间或区域不需要改代码
 - **静态检查齐全** —— actionlint + yamllint + shellcheck + 提交信息规范，`./scripts/lint.sh` 一键跑完
@@ -271,6 +272,39 @@ ALIYUNCS_REGISTRY = registry.cn-hangzhou.aliyuncs.com/your-namespace
 </details>
 
 <details>
+<summary><b>某个镜像是不是一直在失败？</b></summary>
+
+每次运行的报告都是独立的 Artifact，单看一份看不出趋势。`scripts/history.sh` 把历次报告摊在一起：
+
+```bash
+# 汇总最近 20 次运行
+./scripts/history.sh
+
+# 某个镜像的历史
+./scripts/history.sh --image registry.k8s.io/pause:3.9
+
+# 失败最多的 5 个镜像
+./scripts/history.sh --top-failures 5
+```
+
+输出是 Markdown 表格，可以直接贴进 Issue：
+
+```text
+共 **20** 次运行，覆盖 `2026-08-22T…` ~ `2026-09-11T…`
+累计同步 **96** 个镜像次：成功 88 ｜ 跳过 5 ｜ 失败 3
+
+| 镜像 | 成功 | 跳过 | 失败 | 最近一次 |
+| --- | :---: | :---: | :---: | :---: |
+| `ghcr.io/foo/bar:1.2` | 14 | 3 | 3 | ❌ |
+```
+
+它**复用已有的报告 Artifact，不引入任何新的存储**——因此不会给仓库留下持续增长的提交历史。历史的价值在于趋势，而趋势不需要永久保存。
+
+> 💡 需要 `gh` CLI 与 `jq`。默认从 GitHub 下载报告，也可以用 `--dir` 指向本地目录离线使用。
+
+</details>
+
+<details>
 <summary><b>在本地跑，不用 GitHub Actions</b></summary>
 
 ```bash
@@ -304,6 +338,7 @@ brew install skopeo regclient   # macOS
 │   └── release.yml                自动发布
 ├── scripts/
 │   ├── sync.sh                    ★ 同步引擎（全项目唯一的逻辑实现）
+│   ├── history.sh                 汇总历次同步报告，看趋势
 │   ├── lint.sh                    本地统一校验入口
 │   └── check-commit-msg.sh        提交信息规范校验
 ├── docs/                          完整文档，见下方索引
