@@ -457,18 +457,14 @@ brew install skopeo regclient   # macOS
 - [x] 完整性校验（`--verify`）与连续失败告警阈值
 - [x] 多目标同步只拉取源镜像一次
 - [x] 供应链加固（Actions pin 到 SHA、zizmor、OSSF Scorecard）
+- [x] 清单审计（`--audit`）与上游新版本发现（`--check-updates`）
+- [x] 每个目标各用各的命名规则（`--dest-keep-path`）
 
 ### 计划中
 
-**v1.6.0 · 不搬运也能回答状态**——同步、校验、通知、趋势都已就位，剩下的空白在**动手之前**：我的仓库跟上清单了吗？上游有没有新版本？
-
-- [ ] 清单审计（`--audit`，只读报告目标仓库的缺失 / 落后 / 最新）—— [#53](https://github.com/nicholyx/action-sync-images/issues/53)
-- [ ] 上游新版本发现（`--check-updates`，报告上游有而清单未收录的 tag）—— [#54](https://github.com/nicholyx/action-sync-images/issues/54)
-- [ ] 多目标各自的命名规则（`--dest-keep-path`，阿里云压平 + Harbor 保路径）—— [#55](https://github.com/nicholyx/action-sync-images/issues/55)
-
 完整清单见 [路线图 Issue #4](https://github.com/nicholyx/action-sync-images/issues/4)——那里是面向贡献者的工作清单，每项都对应一个独立 Issue，包含背景、入手位置与验收标准。
 
-> 有想法？欢迎[提 Issue](https://github.com/nicholyx/action-sync-images/issues/new/choose) 讨论——高质量的提议最好带上真实的使用场景。
+> 目前暂无排期中的新功能。有想法？欢迎[提 Issue](https://github.com/nicholyx/action-sync-images/issues/new/choose) 讨论——高质量的提议最好带上真实的使用场景。
 
 ---
 

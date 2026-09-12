@@ -9,6 +9,10 @@
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-09-12
+
+本轮把「该同步什么」从同步动作里拆了出来：`--audit` 只读回答「仓库与清单的差距」，`--check-updates` 只读回答「上游有没有新版本」；`--dest-keep-path` 解开了多目标共用一个命名规则的别扭。此外补齐供应链加固（pin SHA / zizmor / Scorecard）、英文版 README 与 SUPPORT.md，并把维护流程沉淀为两个项目级 skill。
+
 ### 新增
 
 - **按目标选择命名规则**（`--dest-keep-path`）：`--dest` 一直用压平规则（`/` → `_`），
@@ -40,7 +44,6 @@
   与「修改 YAML 工作流的工具选择」；`oss-bootstrap` 新增供应链加固清单
   （pin SHA / persist-credentials / zizmor / Scorecard）、SUPPORT.md 与
   多语言 README 的条目
-
 - **SUPPORT.md**：获取帮助入口（文档 → Discussions Q&A → Bug → 安全报告的
   分流路径），这是 GitHub 社区标准文件之一，此前只有 README 里的零散指引
 
