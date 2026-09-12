@@ -63,6 +63,7 @@ The runner sits overseas with direct access to all upstream registries. You clic
 - **Self-hosted registries** — TLS verification can be turned off for internal HTTP registries
 - **Result notifications** — push results to DingTalk / Lark / Slack so unattended runs aren't a blind spot
 - **Auditable** — source and destination digests are recorded; lockfiles reproduce exactly what was synced
+- **Status check** — `--audit` reports how far your registry has drifted from the manifest (current / stale / missing / unknown), pushing nothing
 - **Trends** — `scripts/history.sh` aggregates past reports to answer "which image keeps failing"
 - **Local reproduction** — the same logic ships as `scripts/sync.sh` with `--dry-run`
 - **Configurable destination** — change namespace or region without touching code
@@ -308,6 +309,31 @@ It **reuses the report artifacts you already have — no new storage** — so it
 </details>
 
 <details>
+<summary><b>Checking how far your registry has drifted (<code>--audit</code>)</b></summary>
+
+The manifest is the desired state, but "is my registry actually caught up?" used to require running a real sync — and a real sync pushes. `--audit` only reads:
+
+```bash
+./scripts/sync.sh --file images.lock.txt -d <your-registry-prefix> --audit
+```
+
+```text
+ ✓ current   registry.k8s.io/pause:3.9
+ ✗ missing   registry.k8s.io/etcd:3.5.15-0
+ ⚠ stale     registry.k8s.io/coredns/coredns:v1.11.1
+ ? unknown   quay.io/coreos/flannel:v0.25.5
+   source unreachable: dial tcp: lookup quay.io: no such host
+```
+
+**`unknown` is a category of its own.** "Couldn't check" and "doesn't match" are different things — showing a network hiccup as `stale` sends you chasing a problem that doesn't exist. When the *source* is unreachable the result is `unknown` too, never `missing`.
+
+Exit code `2` means "not everything is current" (including "couldn't finish checking"), so it drops straight into a CI health check — auditing is read-only and does not violate the "syncs must be explicitly triggered" rule.
+
+Drop `--audit` and re-run the same command to fix what it found; `--skip-existing` skips whatever is already current. Full details in [USAGE.md § scenario 12](docs/USAGE.md#场景十二审计清单与目标仓库的差距) (Chinese).
+
+</details>
+
+<details>
 <summary><b>Running locally without GitHub Actions</b></summary>
 
 ```bash
@@ -381,6 +407,12 @@ Recent highlights:
 - ✅ v1.3: private source credentials, regex filtering, sync history trends
 - ✅ v1.4: per-platform integrity verification (`--verify`), duration rankings, failure-threshold alerting
 - ✅ v1.5: single-pull multi-destination, per-registry credential mapping
+
+Planned for v1.6 — answering "what's the state" without moving anything:
+
+- [ ] Manifest audit (`--audit`) — [#53](https://github.com/nicholyx/action-sync-images/issues/53)
+- [ ] Upstream release detection (`--check-updates`) — [#54](https://github.com/nicholyx/action-sync-images/issues/54)
+- [ ] Per-destination naming rules (`--dest-keep-path`) — [#55](https://github.com/nicholyx/action-sync-images/issues/55)
 
 Ideas welcome — [open an issue](https://github.com/nicholyx/action-sync-images/issues/new/choose).
 

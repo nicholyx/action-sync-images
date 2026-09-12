@@ -823,6 +823,65 @@ jobs:
           fi
           echo "✓ 增量跳过生效"
 
+      - name: 审计应区分「最新」「缺失」「无法判定」
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 1) 目标已同步且与源一致 → 最新，退出码 0
+          set +e
+          out="$(./scripts/sync.sh \
+            --src localhost:5000/source/hello:latest \
+            --dest localhost:5000/dest \
+            --tls-verify false --audit 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [[ "$code" -ne 0 ]]; then
+            echo "::error::目标与源一致，审计却以退出码 ${code} 结束"
+            exit 1
+          fi
+          if ! grep -q '条全部最新' <<<"$out"; then
+            echo "::error::审计未报出「全部最新」"
+            exit 1
+          fi
+          echo "✓ 一致时报最新、退出码 0"
+
+          # 2) 目标仓库里没有这个镜像 → 缺失，退出码 2
+          set +e
+          out="$(./scripts/sync.sh \
+            --src localhost:5000/source/hello:latest \
+            --dest localhost:5000/never-synced \
+            --tls-verify false --audit 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [[ "$code" -ne 2 ]] || ! grep -q '缺失' <<<"$out"; then
+            echo "::error::目标不存在时，审计应报「缺失」并以退出码 2 结束（实际 ${code}）"
+            exit 1
+          fi
+          echo "✓ 目标不存在时报缺失、退出码 2"
+
+          # 3) 源本身就取不到 → 无法判定，**不能**报成「缺失」。
+          # 这是 --audit 最要紧的一条分类原则：把「查不到」说成「缺失」，
+          # 会让人跑去同步一个根本同步不下来的镜像。
+          set +e
+          out="$(./scripts/sync.sh \
+            --src localhost:5000/nope/nothing:latest \
+            --dest localhost:5000/dest \
+            --tls-verify false --audit 2>&1)"
+          set -e
+          echo "$out"
+          if ! grep -q '无法判定' <<<"$out"; then
+            echo "::error::源不可达时，审计未报出「无法判定」"
+            exit 1
+          fi
+          if grep -q '缺失' <<<"$out"; then
+            echo "::error::源不可达被误报成「缺失」——「无法判定」的分类原则被破坏"
+            exit 1
+          fi
+          echo "✓ 源不可达时报无法判定，未误报为缺失"
+
       - name: 源内容变化后应重新同步
         run: |
           #!/usr/bin/env bash
@@ -832,6 +891,23 @@ jobs:
           skopeo copy --dest-tls-verify=false \
             docker://docker.io/library/alpine:latest \
             docker://localhost:5000/source/hello:latest
+
+          # 趁这个真实的不一致现场验证 --audit 能把它认出来：
+          # mock 只能证明判定逻辑正确，这里证明它在真实 registry 上跑得通
+          set +e
+          audit_out="$(./scripts/sync.sh \
+            --src localhost:5000/source/hello:latest \
+            --dest localhost:5000/dest \
+            --tls-verify false --audit 2>&1)"
+          audit_code=$?
+          set -e
+          echo "$audit_out"
+
+          if [[ "$audit_code" -ne 2 ]] || ! grep -q '落后' <<<"$audit_out"; then
+            echo "::error::源内容已变化，审计应报「落后」并以退出码 2 结束（实际 ${audit_code}）"
+            exit 1
+          fi
+          echo "✓ 审计发现目标落后"
 
           output="$(./scripts/sync.sh \
             --src localhost:5000/source/hello:latest \
