@@ -17,6 +17,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 DEST_EXACT=""
 declare -a DEST_REGISTRIES=()
+# 当前镜像的全部目标地址，由 resolve_dest_refs 填写（同步与审计共用）
+declare -a DEST_REFS=()
 PLATFORMS=""
 STRIP_ATTESTATION="false"
 MAX_RETRIES="3"
@@ -37,6 +39,10 @@ TLS_VERIFY="true"
 # 校验要为每个镜像多做两次 inspect，大清单下开销明显；
 # 且「同步成功」对多数使用者已经够用，需要精确性的场景再打开。
 VERIFY="false"
+# 清单审计（--audit）：只读地检查清单里每个镜像在目标仓库中的状态，不推送任何东西。
+# 它回答的问题在过去只有真的跑一次同步才能回答——而同步是会真推送的。
+# 「检查」与「搬运」本就该分开：只想看一眼仓库状态时，不该被迫先搬一趟。
+AUDIT="false"
 NOTIFY_WEBHOOK=""
 NOTIFY_TYPE="auto"
 NOTIFY_ON="always"
@@ -103,6 +109,15 @@ declare -a R_SECONDS=()
 declare -a R_NOTE=()
 declare -a R_SRC_DIGEST=()
 declare -a R_DEST_DIGEST=()
+
+# 审计结果数组，由 load_audit_results 从 WORK_DIR 读入。
+# 刻意与同步结果分开：审计的状态值域（最新 / 落后 / 缺失 / 无法判定）
+# 与同步（成功 / 跳过 / 失败）不是一回事，混在一套数组里会让报告、
+# 通知与锁文件都变得含糊——「缺失」被通知渲染成「失败」就是误导。
+declare -a A_SRC=()
+declare -a A_DEST=()
+declare -a A_STATE=()
+declare -a A_NOTE=()
 
 # ---------------------------------------------------------------------------
 # 输出辅助
@@ -199,6 +214,15 @@ sync.sh —— 容器镜像同步引擎
                            Windows 平台被排除在比对之外（其 manifest 在传输中
                            必然重新生成）；拿不到 digest 时只告警不判失败
 
+      --audit              只读检查清单里每个镜像在目标仓库中的状态，**不推送
+                           任何东西**。回答「我的仓库跟上清单了吗」，适合在
+                           动手同步之前先看一眼，或接进 CI 做定期体检。
+                           四种状态：最新 / 落后 / 缺失 / 无法判定。
+                           与 --strip-attestation 互斥：后者会重建索引，
+                           目标的平台摘要必然与源不同，审计只会给出一排
+                           假的「落后」；与 --dry-run / --write-lock /
+                           --notify-* 同用时这些参数不生效（会告警）
+
 源仓库凭证（同步私有镜像时使用）：
       --src-username <名>  源仓库的用户名，需与 --src-password 同时提供
       --src-password <密>  源仓库的密码或 Token
@@ -261,6 +285,13 @@ sync.sh —— 容器镜像同步引擎
   1  参数或环境错误（缺少依赖、参数非法）
   2  至少一个镜像同步失败（其余镜像仍会继续尝试）
 
+--audit 模式下的退出码：
+  0  全部最新，且全部可判定
+  1  参数或环境错误
+  2  审计未得出「全部最新」——存在落后、缺失，或有无法判定的项。
+     具体是哪一类看报告正文。把「没查完」也归入 2，是为了让 CI 门禁
+     不会在检查本身没做完的情况下报绿
+
 示例：
   # 同步单个镜像
   ./scripts/sync.sh -s registry.k8s.io/pause:3.9 -d registry.cn-shenzhen.aliyuncs.com/nicholyx
@@ -279,6 +310,9 @@ sync.sh —— 容器镜像同步引擎
   # 从完整清单里只同步 kube-* 组件，并临时跳过已知有问题的 apiserver
   ./scripts/sync.sh --file images.lock.txt -d registry.cn-shenzhen.aliyuncs.com/nicholyx \
       --filter 'kube-' --exclude 'kube-apiserver'
+
+  # 只看状态不动手：清单里的镜像，目标仓库现在缺哪些、哪些落后了
+  ./scripts/sync.sh --file images.lock.txt -d registry.cn-shenzhen.aliyuncs.com/nicholyx --audit
 EOF
 }
 
@@ -315,6 +349,8 @@ parse_args() {
         SKIP_EXISTING="true"; shift ;;
       --verify)
         VERIFY="true"; shift ;;
+      --audit)
+        AUDIT="true"; shift ;;
       --tls-verify)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         TLS_VERIFY="$2"; shift 2 ;;
@@ -446,6 +482,27 @@ dest_repo_for() {
   fi
 
   printf '%s%s' "$name" "$tag"
+}
+
+# 解析某个源镜像对应的全部目标地址，写入全局数组 DEST_REFS。
+#
+# 用全局变量传出而不是命令替换：命令替换是子 shell，数组赋值传不回父进程
+# （与 OCI_STAGING_DIR 同一类问题，项目里已经踩过一次）。
+resolve_dest_refs() {
+  local src="$1"
+  local dest_repo d
+
+  DEST_REFS=()
+
+  if [[ -n "$DEST_EXACT" ]]; then
+    DEST_REFS=("$DEST_EXACT")
+    return 0
+  fi
+
+  dest_repo="$(dest_repo_for "$src")"
+  for d in "${DEST_REGISTRIES[@]}"; do
+    DEST_REFS+=("${d}/${dest_repo}")
+  done
 }
 
 # 判断字符串是否符合镜像引用的大致格式。
@@ -1042,13 +1099,18 @@ apply_filters() {
 
   local total=${#SOURCE_IMAGES[@]}
   if [[ "$excluded" -gt 0 ]]; then
-    log_info "筛选：${total} 个镜像中排除 ${excluded} 个，实际同步 $((total - excluded)) 个"
+    # 审计模式下说「实际同步 N 个」会让人以为发生了推送——措辞跟着模式走
+    local action="同步"
+    if [[ "$AUDIT" == "true" ]]; then
+      action="审计"
+    fi
+    log_info "筛选：${total} 个镜像中排除 ${excluded} 个，实际${action} $((total - excluded)) 个"
   fi
 
-  # 全被筛掉时明确失败。静默地「什么都不同步然后报成功」是最糟的结果——
+  # 全被筛掉时明确失败。静默地「什么都不做然后报成功」是最糟的结果——
   # 使用者会以为同步完成了，直到集群拉不到镜像才发现。
   if [[ "$excluded" -eq "$total" ]]; then
-    die "全部 ${total} 个镜像都被筛掉了，没有可同步的镜像。请放宽 --filter / --exclude"
+    die "全部 ${total} 个镜像都被筛掉了，没有剩余可处理的镜像。请放宽 --filter / --exclude"
   fi
 
   FILTERED_OUT_COUNT="$excluded"
@@ -1350,16 +1412,8 @@ process_one() {
   fi
 
   # 构造目标列表。支持多目标：每个镜像会对列表中的每个目标各同步一次。
-  dest_repo="$(dest_repo_for "$src")"
-  local -a dests=()
-  if [[ -n "$DEST_EXACT" ]]; then
-    dests=("$DEST_EXACT")
-  else
-    local d
-    for d in "${DEST_REGISTRIES[@]}"; do
-      dests+=("${d}/${dest_repo}")
-    done
-  fi
+  resolve_dest_refs "$src"
+  local -a dests=("${DEST_REFS[@]}")
 
   group_start "[${idx}/${total}] ${src}"
 
@@ -1527,6 +1581,263 @@ dispatch_all() {
     # 这里不让它影响脚本自身
     wait || true
   fi
+}
+
+# ---------------------------------------------------------------------------
+# 清单审计（--audit）
+#
+# 解决的问题很具体：定期同步的用法是「清单记录期望状态，隔一段时间跑一次」，
+# 但「我的仓库现在跟上清单了吗」在过去只有真的跑一次同步才能回答——而同步
+# 是会真推送的。「检查」与「搬运」本就该分开：只想看一眼仓库状态时，
+# 不该被迫先搬一趟。
+#
+# 四种状态必须分开，尤其是最后一种：
+#   最新 / 落后 / 缺失 / 无法判定
+# 把「查不到」显示成「落后」，会让人去排查一个并不存在的问题（其实只是网络
+# 抖了一下）。这与「参数被接受却不生效必须告警」是同一条原则——错误的信息
+# 比没有信息更糟，因为它会被当成结论。
+# ---------------------------------------------------------------------------
+
+# 探测一个镜像引用的可达性。
+#
+# 输出 ok / missing，或 unreachable + 字段分隔符 + 原因。
+#
+# 判据刻意保守：**只有明确表示「不存在」的错误才算 missing，其余一律算
+# unreachable**。反过来（拿不准的都当成缺失）会诱导使用者去同步一个可能
+# 早已存在的镜像；「误报缺失」比「承认不知道」有害得多，因为前者会被当成结论。
+probe_ref() {
+  local ref="$1" err="" rc=0
+
+  # stderr 交给命令替换、stdout 丢弃：出错原因全在 stderr 里。
+  # 重定向顺序不能反——2>&1 必须在 >/dev/null 之前，否则 stderr 会被一起丢掉。
+  set +e
+  err="$(skopeo_inspect_raw "$ref" 2>&1 >/dev/null)"
+  rc=$?
+  set -e
+
+  if [[ "$rc" -eq 0 ]]; then
+    printf 'ok'
+    return 0
+  fi
+
+  # registry 表达「这个 manifest / 仓库不存在」的几种措辞。
+  # 不在这份名单里的（unauthorized、超时、DNS 解析失败……）一律算无法判定。
+  if printf '%s\n' "$err" | grep -qiE 'manifest unknown|name unknown|repository name not known|not found|no such manifest'; then
+    printf 'missing'
+    return 0
+  fi
+
+  # 只取第一行：报错里常跟着很长的 URL，而且多行内容塞进结果文件会破坏排版。
+  # 这里刻意不按字节截断——那可能把一个多字节字符切一半，输出成乱码。
+  printf 'unreachable%s%s' "$FIELD_SEP" \
+    "$(printf '%s' "$err" | tr -d '\r' | grep -v '^[[:space:]]*$' | head -n 1 || true)"
+}
+
+audit_result_file_for() {
+  printf '%s/audit-%04d-%02d' "$WORK_DIR" "$1" "$2"
+}
+
+write_audit_result() {
+  local file="$1" src="$2" dest="$3" state="$4" note="$5"
+  # note 里若混入分隔符会破坏字段结构，统一换成空格
+  printf '%s%s%s%s%s%s%s\n' \
+    "$src" "$FIELD_SEP" "$dest" "$FIELD_SEP" "$state" "$FIELD_SEP" "${note//$FIELD_SEP/ }" > "$file"
+}
+
+# 审计一个源镜像在全部目标上的状态。
+#
+# 多目标时**逐目标各出一行**，不合并成一个状态：一个目标已是最新、另一个缺失
+# 是完全正常的（两个仓库各自的历史不同），合并只会把这层信息抹掉，
+# 让人误以为「都好了」或者「都没好」。
+audit_one() {
+  local idx="$1" src="$2"
+  local src_probe dest di=0 dest_total probed state note file
+
+  group_start "[${idx}] ${src}"
+
+  # 源不可达就没有「应该是什么」这一说，任何对比都失去意义：
+  # 逐目标记一笔即可，不必再向目标发请求
+  src_probe="$(probe_ref "$src")"
+  resolve_dest_refs "$src"
+  dest_total=${#DEST_REFS[@]}
+
+  for dest in "${DEST_REFS[@]}"; do
+    di=$((di + 1))
+    file="$(audit_result_file_for "$idx" "$di")"
+
+    if [[ "$src_probe" != "ok" ]]; then
+      state="unknown"
+      if [[ "$src_probe" == unreachable* ]]; then
+        note="源镜像无法访问：${src_probe#*"$FIELD_SEP"}"
+      else
+        note="源仓库中不存在这个镜像"
+      fi
+      write_audit_result "$file" "$src" "$dest" "$state" "$note"
+      continue
+    fi
+
+    probed="$(probe_ref "$dest")"
+    case "$probed" in
+      ok)
+        if is_up_to_date "$src" "$dest"; then
+          state="current"
+          note=""
+        else
+          # 与 --verify 同一套比对口径：按各平台子 manifest 的 digest 比。
+          # 顶层 digest 会因 registry 重新包装而变化，拿它比会误报一大堆
+          state="stale"
+          note="目标与源的平台摘要不一致"
+        fi
+        ;;
+      missing)
+        state="missing"
+        note="目标仓库中不存在"
+        ;;
+      *)
+        state="unknown"
+        note="目标仓库无法访问：${probed#*"$FIELD_SEP"}"
+        ;;
+    esac
+
+    write_audit_result "$file" "$src" "$dest" "$state" "$note"
+  done
+
+  group_end
+  return 0
+}
+
+# 调度全部审计任务。
+# 并发控制与 dispatch_all 同一套（jobs -pr 数槽位，兼容 bash 3.2 不用 wait -n）。
+dispatch_audit() {
+  local idx=0
+  local total=${#SOURCE_IMAGES[@]}
+  local raw_src reason
+
+  for raw_src in "${SOURCE_IMAGES[@]}"; do
+    idx=$((idx + 1))
+
+    reason="${EXCLUDE_REASONS[$((idx - 1))]:-}"
+    if [[ -n "$reason" ]]; then
+      # 被筛掉的同样出现在报告里。审计场景下这一点更要紧：
+      # 报告里少一项，看的人会默认它是好的
+      write_audit_result "$(audit_result_file_for "$idx" 1)" "$raw_src" "—" "excluded" "$reason"
+      continue
+    fi
+
+    if [[ "$CONCURRENCY" -gt 1 ]]; then
+      while [[ "$(jobs -pr | wc -l | tr -d ' ')" -ge "$CONCURRENCY" ]]; do
+        sleep 0.3
+      done
+      audit_one "$idx" "$raw_src" &
+    else
+      audit_one "$idx" "$raw_src"
+    fi
+  done
+
+  if [[ "$CONCURRENCY" -gt 1 ]]; then
+    wait || true
+  fi
+}
+
+load_audit_results() {
+  local f src dest state note
+  local -a files=()
+
+  for f in "${WORK_DIR}"/audit-*; do
+    [[ -e "$f" ]] || continue
+    files+=("$f")
+  done
+
+  [[ ${#files[@]} -gt 0 ]] || return 0
+
+  for f in "${files[@]}"; do
+    src=""; dest=""; state=""; note=""
+    IFS="$FIELD_SEP" read -r src dest state note < "$f" || true
+    A_SRC+=("${src:-}")
+    A_DEST+=("${dest:-}")
+    A_STATE+=("${state:-unknown}")
+    A_NOTE+=("${note:-}")
+  done
+}
+
+emit_audit_summary() {
+  local current=0 stale=0 missing=0 unknown=0 excluded=0 i
+
+  for i in "${!A_STATE[@]}"; do
+    case "${A_STATE[$i]}" in
+      current)  current=$((current + 1)) ;;
+      stale)    stale=$((stale + 1)) ;;
+      missing)  missing=$((missing + 1)) ;;
+      excluded) excluded=$((excluded + 1)) ;;
+      *)        unknown=$((unknown + 1)) ;;
+    esac
+  done
+
+  local checked=$((current + stale + missing + unknown))
+
+  printf '\n' >&2
+  printf '%s\n' "────────────────────────────────────────────────────────" >&2
+  for i in "${!A_SRC[@]}"; do
+    local mark label
+    case "${A_STATE[$i]}" in
+      current)  mark="${C_GREEN}✓${C_RESET}";  label="最新" ;;
+      stale)    mark="${C_YELLOW}⚠${C_RESET}"; label="落后" ;;
+      missing)  mark="${C_RED}✗${C_RESET}";    label="缺失" ;;
+      excluded) mark="${C_DIM}⊘${C_RESET}";    label="已排除" ;;
+      *)        mark="${C_YELLOW}?${C_RESET}"; label="无法判定" ;;
+    esac
+    printf ' %s %s  %s\n' "$mark" "$label" "${A_SRC[$i]}" >&2
+    printf '   %s→ %s%s\n' "$C_DIM" "${A_DEST[$i]}" "$C_RESET" >&2
+    if [[ -n "${A_NOTE[$i]}" ]]; then
+      printf '   %s%s%s\n' "$C_YELLOW" "${A_NOTE[$i]}" "$C_RESET" >&2
+    fi
+  done
+  printf '%s\n' "────────────────────────────────────────────────────────" >&2
+
+  if [[ "$stale" -eq 0 && "$missing" -eq 0 && "$unknown" -eq 0 ]]; then
+    log_ok "审计完成：${checked} 条全部最新"
+  else
+    log_info "审计完成：最新 ${current} ｜ 落后 ${stale} ｜ 缺失 ${missing} ｜ 无法判定 ${unknown}"
+  fi
+  if [[ "$excluded" -gt 0 ]]; then
+    log_dim "另有 ${excluded} 条被 --filter / --exclude 排除，未参与审计"
+  fi
+  # 审计的终点是动作。把「下一步怎么做」直接写出来，省得看完报告还要想
+  if [[ "$stale" -gt 0 || "$missing" -gt 0 ]]; then
+    log_dim "去掉 --audit 重跑同一条命令即可补齐：已经最新的会被 --skip-existing 自动跳过"
+  fi
+
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    {
+      echo "## 镜像清单审计"
+      echo ""
+      echo "| 源镜像 | 目标镜像 | 状态 | 说明 |"
+      echo "| --- | --- | :---: | --- |"
+      for i in "${!A_SRC[@]}"; do
+        local icon="❓ 无法判定"
+        case "${A_STATE[$i]}" in
+          current)  icon="✅ 最新" ;;
+          stale)    icon="⚠️ 落后" ;;
+          missing)  icon="❌ 缺失" ;;
+          excluded) icon="⊘ 已排除" ;;
+        esac
+        echo "| \`${A_SRC[$i]}\` | \`${A_DEST[$i]}\` | ${icon} | ${A_NOTE[$i]:-—} |"
+      done
+      echo ""
+      echo "**合计**：最新 ${current} · 落后 ${stale} · 缺失 ${missing} · 无法判定 ${unknown}"
+      if [[ "$excluded" -gt 0 ]]; then
+        echo ""
+        echo "> 另有 ${excluded} 条被 \`--filter\` / \`--exclude\` 排除，未参与审计。"
+      fi
+    } >> "$GITHUB_STEP_SUMMARY"
+  fi
+
+  # 「没查完」与「查出差异」都返回 2：让 CI 门禁不至于在检查本身都没做完时
+  # 就报绿。究竟属于哪一种，报告正文里分得很清楚。
+  if [[ "$stale" -gt 0 || "$missing" -gt 0 || "$unknown" -gt 0 ]]; then
+    return 2
+  fi
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -2114,6 +2425,29 @@ main() {
   fi
   DEST_EXACT="${DEST_EXACT#docker://}"
 
+  # ---- 审计模式的参数约束 ----
+  if [[ "$AUDIT" == "true" ]]; then
+    # 剔除 attestation 会重建索引，目标的平台摘要必然与源不同。继续跑只会得到
+    # 一排假的「落后」——比报错更糟：它会让人去排查一个并不存在的问题。
+    if [[ "$STRIP_ATTESTATION" == "true" ]]; then
+      die "--audit 与 --strip-attestation 不能同时使用：剔除 attestation 会重建索引，目标的平台摘要必然与源不同，审计只会给出一排假的「落后」"
+    fi
+
+    # 审计不推送、不写文件、不通知，这些参数到了这里没有作用。
+    # 「参数被接受却不生效」比直接报错更危险——它让人对系统行为产生错误认知，
+    # 所以显式传入了就必须说出来。
+    local -a ignored=()
+    if [[ "$DRY_RUN" == "true" ]]; then ignored+=("--dry-run"); fi
+    if [[ -n "$WRITE_LOCK" ]]; then ignored+=("--write-lock"); fi
+    if [[ -n "$REPORT_DIR" ]]; then ignored+=("--report-dir"); fi
+    if [[ -n "$NOTIFY_WEBHOOK" ]]; then ignored+=("--notify-webhook"); fi
+    if [[ "$VERIFY" == "true" ]]; then ignored+=("--verify"); fi
+    if [[ "$SKIP_EXISTING" == "true" ]]; then ignored+=("--skip-existing"); fi
+    if [[ ${#ignored[@]} -gt 0 ]]; then
+      log_warn "--audit 是只读检查，以下参数本次不生效：${ignored[*]}"
+    fi
+  fi
+
   ensure_skopeo
   ensure_jq
   setup_timeout
@@ -2163,12 +2497,19 @@ main() {
 
   # 报「实际要同步」的数量，而不是清单里的总数——筛选之后这两个值常常不同
   local total="$active_count"
+  local action="同步"
+  local verb="推送到"
+  if [[ "$AUDIT" == "true" ]]; then
+    action="审计"
+    verb="检查"
+  fi
+
   if [[ -n "$DEST_EXACT" ]]; then
-    log_info "待同步镜像 ${total} 个 → ${DEST_EXACT}"
+    log_info "待${action}镜像 ${total} 个 → ${DEST_EXACT}"
   else
-    log_info "待同步镜像 ${total} 个 → ${DEST_REGISTRIES[*]}"
+    log_info "待${action}镜像 ${total} 个 → ${DEST_REGISTRIES[*]}"
     if [[ ${#DEST_REGISTRIES[@]} -gt 1 ]]; then
-      log_info "共 ${#DEST_REGISTRIES[@]} 个目标，每个镜像都会推送到全部目标"
+      log_info "共 ${#DEST_REGISTRIES[@]} 个目标，每个镜像都会${verb}全部目标"
     fi
   fi
   if [[ "$CONCURRENCY" -gt 1 ]]; then
@@ -2182,9 +2523,20 @@ main() {
 
   local start end
   start="$(date +%s)"
-  dispatch_all
+  if [[ "$AUDIT" == "true" ]]; then
+    dispatch_audit
+  else
+    dispatch_all
+  fi
   end="$(date +%s)"
   log_info "总耗时：$((end - start)) 秒"
+
+  # 审计与同步的报告是两套：状态值域不同，汇总方式与退出码也不同
+  if [[ "$AUDIT" == "true" ]]; then
+    load_audit_results
+    emit_audit_summary
+    return $?
+  fi
 
   load_results
   emit_summary

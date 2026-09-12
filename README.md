@@ -60,6 +60,7 @@
 - **支持自建 registry** —— 可关闭 TLS 校验，同步自建的 HTTP 仓库
 - **结果通知** —— 可推送同步结果到钉钉 / 飞书 / Slack，无人值守时也能第一时间知道成败
 - **可审计** —— 记录源与目标的 digest，并可生成锁文件用于精确复现
+- **状态可查** —— `--audit` 只读检查清单与目标仓库的差距（最新 / 落后 / 缺失 / 无法判定），不推送任何东西
 - **结果一目了然** —— 运行结束直接生成结果表格，无需翻日志
 - **可看趋势** —— `scripts/history.sh` 汇总历次报告，回答「哪个镜像总在失败」
 - **可在本地复现** —— 同一套逻辑封装成 `scripts/sync.sh`，本地也能跑，支持 `--dry-run`
@@ -309,6 +310,33 @@ ALIYUNCS_REGISTRY = registry.cn-hangzhou.aliyuncs.com/your-namespace
 </details>
 
 <details>
+<summary><b>先看看仓库跟上清单没有（<code>--audit</code>）</b></summary>
+
+清单是期望状态，但「仓库现在到底跟上没有」此前只有真的跑一次同步才知道——而同步是会真推送的。`--audit` 只读地检查，**不推送任何东西**：
+
+```bash
+./scripts/sync.sh --file images.lock.txt -d <目标仓库> --audit
+```
+
+```text
+ ✓ 最新  registry.k8s.io/pause:3.9
+ ✗ 缺失  registry.k8s.io/etcd:3.5.15-0
+ ⚠ 落后  registry.k8s.io/coredns/coredns:v1.11.1
+ ? 无法判定  quay.io/coreos/flannel:v0.25.5
+   源镜像无法访问：dial tcp: lookup quay.io: no such host
+
+审计完成：最新 1 ｜ 落后 1 ｜ 缺失 1 ｜ 无法判定 1
+```
+
+**「无法判定」单独占一类**：查不到和内容不一致是两回事，把网络抖动显示成「落后」会让人去排查一个并不存在的问题。源自身取不到时报的也是「无法判定」，不是目标「缺失」。
+
+退出码 `2` 表示「未得出全部最新」（含「没查完」），可以直接接进 CI 做定期体检——审计是只读的，不违反「同步必须显式触发」这条红线。
+
+看完全去掉 `--audit` 重跑同一条命令即可补齐，已是最新的会被 `--skip-existing` 自动跳过。详见[场景十二](docs/USAGE.md#场景十二审计清单与目标仓库的差距)。
+
+</details>
+
+<details>
 <summary><b>在本地跑，不用 GitHub Actions</b></summary>
 
 ```bash
@@ -394,9 +422,15 @@ brew install skopeo regclient   # macOS
 
 ### 计划中
 
+**v1.6.0 · 不搬运也能回答状态**——同步、校验、通知、趋势都已就位，剩下的空白在**动手之前**：我的仓库跟上清单了吗？上游有没有新版本？
+
+- [ ] 清单审计（`--audit`，只读报告目标仓库的缺失 / 落后 / 最新）—— [#53](https://github.com/nicholyx/action-sync-images/issues/53)
+- [ ] 上游新版本发现（`--check-updates`，报告上游有而清单未收录的 tag）—— [#54](https://github.com/nicholyx/action-sync-images/issues/54)
+- [ ] 多目标各自的命名规则（`--dest-keep-path`，阿里云压平 + Harbor 保路径）—— [#55](https://github.com/nicholyx/action-sync-images/issues/55)
+
 完整清单见 [路线图 Issue #4](https://github.com/nicholyx/action-sync-images/issues/4)——那里是面向贡献者的工作清单，每项都对应一个独立 Issue，包含背景、入手位置与验收标准。
 
-> 目前暂无排期中的新功能。有想法？欢迎[提 Issue](https://github.com/nicholyx/action-sync-images/issues/new/choose) 讨论——高质量的提议最好带上真实的使用场景。
+> 有想法？欢迎[提 Issue](https://github.com/nicholyx/action-sync-images/issues/new/choose) 讨论——高质量的提议最好带上真实的使用场景。
 
 ---
 

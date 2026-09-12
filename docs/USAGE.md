@@ -541,6 +541,74 @@ skopeo 在不指定 `--retry-delay` 时，等待时间随失败次数**指数增
 
 ---
 
+### 场景十二：审计清单与目标仓库的差距
+
+定期同步有个绕不开的麻烦：清单记录着期望状态，但**「仓库现在到底跟上没有」只有真的跑一次同步才知道**——而同步是会真推送的。只想看一眼状态时，不该被迫先搬一趟。
+
+`--audit` 只读地检查清单里每个镜像在目标仓库中的状态，**不推送任何东西**：
+
+```bash
+./scripts/sync.sh --file images.lock.txt \
+  --dest registry.cn-shenzhen.aliyuncs.com/nicholyx \
+  --audit
+```
+
+输出形如：
+
+```text
+ ✓ 最新  registry.k8s.io/pause:3.9
+   → registry.cn-shenzhen.aliyuncs.com/nicholyx/registry.k8s.io_pause:3.9
+ ✗ 缺失  registry.k8s.io/etcd:3.5.15-0
+   → registry.cn-shenzhen.aliyuncs.com/nicholyx/registry.k8s.io_etcd:3.5.15-0
+   目标仓库中不存在
+ ⚠ 落后  registry.k8s.io/coredns/coredns:v1.11.1
+   → registry.cn-shenzhen.aliyuncs.com/nicholyx/registry.k8s.io_coredns_coredns:v1.11.1
+   目标与源的平台摘要不一致
+ ? 无法判定  quay.io/coreos/flannel:v0.25.5
+   → registry.cn-shenzhen.aliyuncs.com/nicholyx/quay.io_coreos_flannel:v0.25.5
+   源镜像无法访问：dial tcp: lookup quay.io: no such host
+
+审计完成：最新 1 ｜ 落后 1 ｜ 缺失 1 ｜ 无法判定 1
+```
+
+四种状态必须分清楚：
+
+| 状态 | 含义 | 该怎么办 |
+| --- | --- | --- |
+| ✅ 最新 | 目标存在，且与源的平台摘要一致 | 不用管 |
+| ⚠️ 落后 | 目标存在，但内容与源不同 | 重新同步 |
+| ❌ 缺失 | 目标仓库里没有这个镜像 | 同步过去 |
+| ❓ 无法判定 | 源或目标查不到（网络、凭证、私有仓库） | 先解决访问问题再看 |
+
+**「无法判定」单独占一类，不并进「落后」。** 查询失败和内容不一致是两回事：把网络抖动显示成「落后」，会让人去排查一个并不存在的问题——错误的信息比没有信息更糟，因为它会被当成结论。同理，源自身取不到时报的是「无法判定」，而不是目标「缺失」。
+
+审计的退出码：
+
+| 码 | 含义 |
+| --- | --- |
+| `0` | 全部最新，且全部可判定 |
+| `1` | 参数或环境错误 |
+| `2` | 审计未得出「全部最新」——存在落后、缺失，或有无法判定的项 |
+
+**「没查完」也返回 `2`**，是为了让 CI 门禁不至于在检查本身都没做完时就报绿。究竟属于哪一种，报告正文里分得很清楚。
+
+审计是只读的，接进定时任务也不违反「同步必须显式触发」这条红线：
+
+```yaml
+- name: 镜像仓库体检
+  run: |
+    ./scripts/sync.sh --file images.lock.txt --dest "$DEST" --audit
+```
+
+几条需要注意的限制：
+
+- **不能与 `--strip-attestation` 同时使用**。剔除 attestation 会重建索引，目标的平台摘要必然与源不同，审计只会给出一排**假的「落后」**。这个组合会直接报错，而不是默默给出错误结论。
+- `--dry-run` / `--write-lock` / `--report-dir` / `--notify-*` / `--verify` / `--skip-existing` 在审计模式下没有作用，显式传入时会告警。
+- 可与 `--filter` / `--exclude` 组合；被排除的镜像**仍会出现在报告里**并标注原因——报告里少一项，看的人会默认它是好的。
+- 看完报告要动手时，去掉 `--audit` 重跑同一条命令即可：已经最新的会被 `--skip-existing` 自动跳过。
+
+---
+
 ## 验证同步结果
 
 ### 在 Actions 里看
