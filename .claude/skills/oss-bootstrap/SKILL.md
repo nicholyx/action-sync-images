@@ -59,9 +59,11 @@ description: 把一个新项目（或只有代码的裸仓库）快速落实为�
 | `CONTRIBUTING.md` | 根目录 | 流程、提交规范、本地检查入口 |
 | `CODE_OF_CONDUCT.md` | 根目录 | Contributor Covenant 即可 |
 | `SECURITY.md` | 根目录 | 漏洞报告渠道 + 威胁模型（本项目把「什么是威胁」写清楚了，值得照做） |
+| `SUPPORT.md` | 根目录 | 获取帮助的分流路径：文档 → Discussions Q&A → Bug → 安全报告 |
 | `CODEOWNERS` | `.github/` | 关键路径指定 reviewer |
-| Issue/PR 模板 | `.github/ISSUE_TEMPLATE/` | YAML forms 而非 markdown；Issue 至少分 bug / feature / docs 三类 |
+| Issue/PR 模板 | `.github/ISSUE_TEMPLATE/` | YAML forms 而非 markdown；Issue 至少分 bug / feature / docs 三类；config.yml 指向 Discussions 并关闭空白 Issue |
 | `.gitignore` | 根目录 | 语言惯例 + 编辑器目录 |
+| 多语言 README | `README.md` / `README.en.md` | 顶部互相链接做语言切换；次要语言注明「完整文档以主语言为准」 |
 
 ## 阶段三：仓库自动化
 
@@ -76,7 +78,21 @@ description: 把一个新项目（或只有代码的裸仓库）快速落实为�
   可选 AI 摘要（配了 key 才启用，**任何失败都退出 0**，摘要不该成为发布的单点故障）。
   预发布版本（tag 含 `-`）不标 latest；**tag 过滤器末尾要加 `*`**，否则预发布 tag
   根本不触发工作流，预发布逻辑成死代码
-- **dependabot.yml**：Actions 生态，每周一次
+- **dependabot.yml**：Actions 生态，每周一次，配 7 天 cooldown（新版本有 bug 或
+  tag 被改投恶意代码时，冷却期让它先暴露）
+
+### 供应链加固（对标 OSSF Scorecard——热门项目近两年的标配，缺了 zizmor 会给出一排 high）
+
+| 加固项 | 做法 |
+| --- | --- |
+| Actions pin 到 commit SHA | `uses: actions/checkout@<40 位 SHA> # v7`——tag 可移动而 SHA 不可；注释保留版本，Dependabot 的 PR 照常更新 SHA。SHA 用 `gh api repos/<owner>/<repo>/commits/<tag> --jq .sha` 查 |
+| checkout 不留凭证 | 每个 checkout 加 `persist-credentials: false`——GITHUB_TOKEN 不残留在 runner 上 |
+| 工作流安全扫描 | CI 加 **zizmor** job（容器按版本 pin，挂载 `:ro`），基线保持 0 findings；豁免集中在 `.github/zizmor.yml`，**每条豁免必须写明可验证的安全依据**（如 pull_request_target 但不 checkout PR 代码） |
+| OSSF Scorecard | 新增 scorecard 工作流（`ossf/scorecard-action`，`publish_results: true` 需要 `id-token: write`），结果发布到公开评分页并上传 code scanning；README 加徽章——供应链安全从「自觉做得好」变成「有公开体检报告」 |
+| 最小权限 | 每个工作流显式声明 `permissions`，绝不放任仓库默认（宽）权限 |
+
+注意：给 step **插入** `with:` 块这类结构调整，逐个手工做（批量脚本会算错缩进层级，
+详见 maintain-loop 的「修改 YAML 工作流的工具选择」）。
 
 仓库标签体系补齐：在默认标签外建项目标签（如 ci / automation / governance / sync-*），
 `gh label create`。
@@ -155,6 +171,8 @@ JSON
 - [ ] 分支保护启用，且只依赖汇总 check
 - [ ] 治理文件齐全，LICENSE 能被 GitHub 识别
 - [ ] labeler / welcome / stale / release / dependabot 全部就位且跑过至少一次
+- [ ] 供应链基线达标：所有 `uses:` pin 到 SHA、checkout 全部 `persist-credentials: false`、
+      zizmor 0 findings（豁免有据）、Scorecard 工作流就位
 - [ ] docs 四件套 + CHANGELOG 就位，README 的参数与链接经过校验
 - [ ] 看板、Roadmap Issue、第一个里程碑就位
 - [ ] 一个真实 PR 从头到尾走通过，首个 Release 已发布
