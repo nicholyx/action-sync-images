@@ -841,7 +841,10 @@ jobs:
             echo "::error::目标与源一致，审计却以退出码 ${code} 结束"
             exit 1
           fi
-          if ! grep -q '条全部最新' <<<"$out"; then
+          # 断言一律匹配报告正文行（带状态图标），不要只 grep 状态词本身——
+          # 汇总行「最新 0 ｜ 落后 0 ｜ 缺失 0」里这几个词永远都在，
+          # 拿关键词直接匹配等于断言恒真，第一版就是这么写错的
+          if ! grep -q '条全部最新' <<<"$out" || ! grep -q '✓ 最新' <<<"$out"; then
             echo "::error::审计未报出「全部最新」"
             exit 1
           fi
@@ -856,7 +859,7 @@ jobs:
           code=$?
           set -e
           echo "$out"
-          if [[ "$code" -ne 2 ]] || ! grep -q '缺失' <<<"$out"; then
+          if [[ "$code" -ne 2 ]] || ! grep -q '✗ 缺失' <<<"$out"; then
             echo "::error::目标不存在时，审计应报「缺失」并以退出码 2 结束（实际 ${code}）"
             exit 1
           fi
@@ -872,11 +875,11 @@ jobs:
             --tls-verify false --audit 2>&1)"
           set -e
           echo "$out"
-          if ! grep -q '无法判定' <<<"$out"; then
+          if ! grep -q '? 无法判定' <<<"$out"; then
             echo "::error::源不可达时，审计未报出「无法判定」"
             exit 1
           fi
-          if grep -q '缺失' <<<"$out"; then
+          if grep -q '✗ 缺失' <<<"$out"; then
             echo "::error::源不可达被误报成「缺失」——「无法判定」的分类原则被破坏"
             exit 1
           fi
@@ -903,7 +906,7 @@ jobs:
           set -e
           echo "$audit_out"
 
-          if [[ "$audit_code" -ne 2 ]] || ! grep -q '落后' <<<"$audit_out"; then
+          if [[ "$audit_code" -ne 2 ]] || ! grep -q '⚠ 落后' <<<"$audit_out"; then
             echo "::error::源内容已变化，审计应报「落后」并以退出码 2 结束（实际 ${audit_code}）"
             exit 1
           fi
