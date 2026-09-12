@@ -11,6 +11,16 @@
 
 ### 新增
 
+- **英文版 README**（`README.en.md`）：面向国际使用者的完整入口，覆盖全部特性、
+  快速开始、参数速查与常见场景；两个 README 顶部互相链接切换。完整文档仍以
+  中文为主，英文版已注明。顺带修正中文 README 滞后的路线图——私有源凭证、
+  历史趋势、完整性校验、多目标单拉取、供应链加固等已完成项此前仍不在列
+- **skill 沉淀**：`maintain-loop` 新增「退出码与进程模型」硬规则（包装函数
+  吞退出码、命令替换的子 shell 传值、find 退出码语义等，全部来自真实踩坑）
+  与「修改 YAML 工作流的工具选择」；`oss-bootstrap` 新增供应链加固清单
+  （pin SHA / persist-credentials / zizmor / Scorecard）、SUPPORT.md 与
+  多语言 README 的条目
+
 - **SUPPORT.md**：获取帮助入口（文档 → Discussions Q&A → Bug → 安全报告的
   分流路径），这是 GitHub 社区标准文件之一，此前只有 README 里的零散指引
 

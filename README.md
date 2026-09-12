@@ -15,6 +15,8 @@
 
 [快速开始](#快速开始) · [使用文档](docs/USAGE.md) · [工作原理](docs/ARCHITECTURE.md) · [排错手册](docs/TROUBLESHOOTING.md) · [贡献指南](CONTRIBUTING.md)
 
+**中文** | [English](README.en.md)
+
 </div>
 
 ---
@@ -384,16 +386,17 @@ brew install skopeo regclient   # macOS
 - [x] 一次推送到多个目标仓库
 - [x] 按正则筛选镜像（`--filter` / `--exclude`）
 - [x] 自建 registry 的 TLS 开关（`--tls-verify`）
+- [x] 私有源凭证与按仓库映射（`--src-username` / `--src-credentials`）
+- [x] 同步历史趋势（`scripts/history.sh`）
+- [x] 完整性校验（`--verify`）与连续失败告警阈值
+- [x] 多目标同步只拉取源镜像一次
+- [x] 供应链加固（Actions pin 到 SHA、zizmor、OSSF Scorecard）
 
 ### 计划中
 
 完整清单见 [路线图 Issue #4](https://github.com/nicholyx/action-sync-images/issues/4)——那里是面向贡献者的工作清单，每项都对应一个独立 Issue，包含背景、入手位置与验收标准。
 
-- [ ] 支持为源镜像配置独立凭证，同步私有仓库镜像 —— [#20](https://github.com/nicholyx/action-sync-images/issues/20)
-- [ ] 同步结果的历史记录与趋势统计 —— [#21](https://github.com/nicholyx/action-sync-images/issues/21)
-- [ ] 补充更多源仓库的排错条目（**适合首次贡献**）—— [#24](https://github.com/nicholyx/action-sync-images/issues/24)
-
-有想法？欢迎[提 Issue](https://github.com/nicholyx/action-sync-images/issues/new/choose) 讨论。
+> 目前暂无排期中的新功能。有想法？欢迎[提 Issue](https://github.com/nicholyx/action-sync-images/issues/new/choose) 讨论——高质量的提议最好带上真实的使用场景。
 
 ---
 
