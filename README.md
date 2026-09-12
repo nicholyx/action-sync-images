@@ -62,6 +62,7 @@
 - **可审计** —— 记录源与目标的 digest，并可生成锁文件用于精确复现
 - **状态可查** —— `--audit` 只读检查清单与目标仓库的差距（最新 / 落后 / 缺失 / 无法判定），不推送任何东西
 - **上游新版可查** —— `--check-updates` 对比上游 tag 与清单，报告有哪些版本还没收录
+- **网页上就能体检** —— `Check-Registry` 工作流一键跑上面两项检查，不用装任何工具，结果进运行页面的 Summary 并可推送通知
 - **结果一目了然** —— 运行结束直接生成结果表格，无需翻日志
 - **可看趋势** —— `scripts/history.sh` 汇总历次报告，回答「哪个镜像总在失败」
 - **可在本地复现** —— 同一套逻辑封装成 `scripts/sync.sh`，本地也能跑，支持 `--dry-run`
@@ -401,7 +402,9 @@ brew install skopeo regclient   # macOS
 │   ├── sync-images-aliyuncs.yml   同步到阿里云（主力）
 │   ├── sync-images-harbor.yml     同步到自建 Harbor
 │   ├── sync-images-batch.yml      按清单文件批量同步
+│   ├── check-registry.yml         镜像仓库体检（只读检查，不推送）
 │   ├── ci.yml                     CI：静态检查 + 冒烟测试
+│   ├── scorecard.yml              OSSF Scorecard 供应链评分
 │   ├── labeler.yml                PR 自动打标签
 │   ├── stale.yml                  Issue/PR 过期管理
 │   ├── welcome.yml                欢迎首次贡献者

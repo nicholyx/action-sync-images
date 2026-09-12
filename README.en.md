@@ -65,6 +65,7 @@ The runner sits overseas with direct access to all upstream registries. You clic
 - **Auditable** — source and destination digests are recorded; lockfiles reproduce exactly what was synced
 - **Status check** — `--audit` reports how far your registry has drifted from the manifest (current / stale / missing / unknown), pushing nothing
 - **Release check** — `--check-updates` compares upstream tags against the manifest and reports versions you haven't pinned yet
+- **Check from the web UI** — the `Check-Registry` workflow runs either check with one click, no tooling required; results land in the run's Summary and can be pushed as notifications
 - **Trends** — `scripts/history.sh` aggregates past reports to answer "which image keeps failing"
 - **Local reproduction** — the same logic ships as `scripts/sync.sh` with `--dry-run`
 - **Configurable destination** — change namespace or region without touching code
@@ -398,6 +399,7 @@ brew install skopeo regclient   # macOS
 │   ├── sync-images-aliyuncs.yml   sync to Aliyun (primary)
 │   ├── sync-images-harbor.yml     sync to self-hosted Harbor
 │   ├── sync-images-batch.yml      batch sync from a manifest
+│   ├── check-registry.yml         read-only registry check (audit / upstream)
 │   ├── ci.yml                     CI: static checks + smoke tests
 │   ├── scorecard.yml              OSSF Scorecard supply-chain scoring
 │   ├── labeler.yml                auto-label PRs by changed paths

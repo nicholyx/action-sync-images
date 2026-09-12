@@ -1,0 +1,147 @@
+# 工作流名称
+name: Check-Registry
+# 工作流运行时显示名称
+run-name: ${{ github.actor }} - 镜像仓库体检（${{ inputs.mode }}）
+
+# 怎样触发工作流
+#
+# 只有手动触发。需要定时的使用者可以 fork 后自行加一行 schedule——
+# 「什么时候去访问一批上游仓库」应该是使用者的决定，不该由项目替他做。
+# 这一点与同步工作流的克制是同一条原则：只读不等于可以自作主张。
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '检查类型：audit（清单 vs 目标仓库）或 updates（清单 vs 上游）'
+        required: true
+        type: choice
+        options:
+          - audit
+          - updates
+        default: audit
+      lockfile:
+        description: '镜像清单文件路径'
+        required: true
+        default: 'images.lock.txt'
+      dest_registry:
+        description: '目标仓库前缀（仅 audit 需要；留空则用 ALIYUNCS_REGISTRY 或内置默认值）'
+        required: false
+        default: ''
+      updates_limit:
+        description: 'updates 模式下每个仓库最多列出几条未收录的 tag（总数始终会报）'
+        required: false
+        default: '5'
+      filter:
+        description: '只检查匹配该正则的镜像（ERE，例如 kube-；留空则全部检查）'
+        required: false
+        default: ''
+      exclude:
+        description: '跳过匹配该正则的镜像（ERE，例如 apiserver；留空则不排除）'
+        required: false
+        default: ''
+      notify_on:
+        description: '通知时机：failure（仅在有落后/缺失/无法判定时推送）或 always'
+        required: false
+        type: choice
+        options:
+          - failure
+          - always
+        default: failure
+
+# 只读检查：不推送任何东西，因此只需要读代码的权限
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: 只读体检
+    runs-on: ubuntu-latest
+    env:
+      MODE: ${{ inputs.mode }}
+      LOCKFILE: ${{ inputs.lockfile }}
+      DEST_REGISTRY: ${{ inputs.dest_registry || vars.ALIYUNCS_REGISTRY || 'registry.cn-shenzhen.aliyuncs.com/nicholyx' }}
+      UPDATES_LIMIT: ${{ inputs.updates_limit }}
+      FILTER_REGEX: ${{ inputs.filter }}
+      EXCLUDE_REGEX: ${{ inputs.exclude }}
+      NOTIFY_ON: ${{ inputs.notify_on }}
+      NOTIFY_WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK }}
+      # 与同步工作流同一套源凭证：清单里混有私有仓库时按需配置
+      SYNC_SRC_USERNAME: ${{ secrets.SRC_REGISTRY_USERNAME }}
+      SYNC_SRC_PASSWORD: ${{ secrets.SRC_REGISTRY_PASSWORD }}
+      SYNC_SRC_CREDENTIALS: ${{ secrets.SRC_CREDENTIALS }}
+    steps:
+      - name: Checkout Repos
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # 只读检查用不到 git 凭证，不持久化，
+          # 让 checkout 之后的任何脚本都拿不到 GITHUB_TOKEN
+          persist-credentials: false
+
+      # audit 要读目标的私有仓库，需要推送凭证同款的读权限；
+      # updates 只查上游，完全不碰目标，因此不必登录。
+      - name: Login to Registry（仅 audit 需要）
+        if: inputs.mode == 'audit'
+        env:
+          REGISTRY_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 凭证是可选的：公开仓库匿名就能读，没配凭证不该让整个体检失败，
+          # 只是私有仓库会被报成「无法判定」——这比报错更贴近实际状态
+          if [[ -z "$REGISTRY_USERNAME" || -z "$REGISTRY_PASSWORD" ]]; then
+            echo "未配置仓库凭证，按匿名访问处理（公开仓库不受影响）"
+            exit 0
+          fi
+
+          registry_host="${DEST_REGISTRY%%/*}"
+          echo "登录仓库：${registry_host}"
+          printf '%s' "${REGISTRY_PASSWORD}" | docker login "${registry_host}" \
+            --username "${REGISTRY_USERNAME}" --password-stdin
+
+      - name: 执行体检
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          if [[ ! -f "$LOCKFILE" ]]; then
+            echo "::error::清单文件不存在：${LOCKFILE}"
+            exit 1
+          fi
+
+          # 参数按模式组装。updates 不需要目标地址——传了会被脚本告警为「不生效」，
+          # 因此这里干脆不传，保持「给什么参数就做什么事」的干净。
+          case "$MODE" in
+            audit)
+              args=(--file "$LOCKFILE" --dest "$DEST_REGISTRY" --audit)
+              ;;
+            updates)
+              args=(--file "$LOCKFILE" --check-updates)
+              if [[ -n "$UPDATES_LIMIT" && "$UPDATES_LIMIT" != "5" ]]; then
+                args+=(--updates-limit "$UPDATES_LIMIT")
+              fi
+              ;;
+            *)
+              echo "::error::未知的检查类型：${MODE}（可选：audit / updates）"
+              exit 1
+              ;;
+          esac
+
+          if [[ -n "$FILTER_REGEX" ]]; then
+            args+=(--filter "$FILTER_REGEX")
+          fi
+          if [[ -n "$EXCLUDE_REGEX" ]]; then
+            args+=(--exclude "$EXCLUDE_REGEX")
+          fi
+
+          if [[ -n "$NOTIFY_WEBHOOK" ]]; then
+            args+=(--notify-webhook "$NOTIFY_WEBHOOK")
+            # 体检的价值在于「出问题时才打扰」，全绿的推送很快没人看
+            args+=(--notify-on "$NOTIFY_ON")
+          fi
+
+          # 退出码 2 = 未得出「全部最新」（有差异，或有仓库没查成）。
+          # 这里**就是要让步骤失败**：页面上一眼能看出哪些仓库需要关注。
+          # 绿 = 一切正常，红 = 需要看看——具体是哪一种看 Step Summary。
+          ./scripts/sync.sh "${args[@]}"
