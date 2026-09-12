@@ -19,6 +19,12 @@ DEST_EXACT=""
 declare -a DEST_REGISTRIES=()
 # 当前镜像的全部目标地址，由 resolve_dest_refs 填写（同步与审计共用）
 declare -a DEST_REFS=()
+
+# split_image_ref 的传出变量。三个值用命令替换传不回来（那是子 shell），
+# 而调用方通常只关心其中一两个
+REF_REPO=""
+REF_TAG=""
+REF_DIGEST=""
 PLATFORMS=""
 STRIP_ATTESTATION="false"
 MAX_RETRIES="3"
@@ -43,6 +49,12 @@ VERIFY="false"
 # 它回答的问题在过去只有真的跑一次同步才能回答——而同步是会真推送的。
 # 「检查」与「搬运」本就该分开：只想看一眼仓库状态时，不该被迫先搬一趟。
 AUDIT="false"
+# 上游版本检查（--check-updates）：报告上游有、清单却未收录的 tag。
+# 同样是只读的——「检查」与「搬运」分开，这里连目标仓库都不需要。
+CHECK_UPDATES="false"
+# 每个源仓库最多展示几条未收录的 tag（取版本序最大的若干条）。
+# 上游仓库动辄几百个 tag，全列出来等于没有输出。
+UPDATES_LIMIT="5"
 NOTIFY_WEBHOOK=""
 NOTIFY_TYPE="auto"
 NOTIFY_ON="always"
@@ -180,7 +192,7 @@ sync.sh —— 容器镜像同步引擎
   ./scripts/sync.sh --src <镜像> --dest <目标仓库前缀> [选项]
   ./scripts/sync.sh --file <镜像清单文件> --dest <目标仓库前缀> [选项]
 
-目标地址（必填其一）：
+目标地址（必填其一；--check-updates 只查上游，不需要填）：
   -d, --dest <前缀>        目标仓库前缀。最终目标为「前缀 + 源镜像路径（压平）」，
                            例如 registry.cn-shenzhen.aliyuncs.com/nicholyx
                            **可重复指定以同时推送到多个目标**
@@ -222,6 +234,18 @@ sync.sh —— 容器镜像同步引擎
                            目标的平台摘要必然与源不同，审计只会给出一排
                            假的「落后」；与 --dry-run / --write-lock /
                            --notify-* 同用时这些参数不生效（会告警）
+                           与 --check-updates 互斥（检查对象不同，请分开跑）
+
+      --check-updates      只读检查上游有哪些 tag 不在清单里，回答「上游是不是
+                           该升级了」。只报告，**不修改清单**——升到哪个版本
+                           涉及兼容性判断，是人的决定。
+                           不对 tag 做语义化比较，也不过滤预发布：上游命名未必
+                           规整（1.27-alpine / v1.32.0-rc.1），语义化比较会给出
+                           **错误**结论；这里只用版本序粗排并原样展示
+                           不需要目标地址；退出码 2 表示「有仓库存在未收录的
+                           tag，或有仓库没查成」
+      --updates-limit <N>  每个仓库最多列出几条未收录的 tag，默认 5。
+                           无论列出几条，总数都会给出
 
 源仓库凭证（同步私有镜像时使用）：
       --src-username <名>  源仓库的用户名，需与 --src-password 同时提供
@@ -351,6 +375,11 @@ parse_args() {
         VERIFY="true"; shift ;;
       --audit)
         AUDIT="true"; shift ;;
+      --check-updates)
+        CHECK_UPDATES="true"; shift ;;
+      --updates-limit)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        UPDATES_LIMIT="$2"; shift 2 ;;
       --tls-verify)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         TLS_VERIFY="$2"; shift 2 ;;
@@ -452,22 +481,38 @@ normalize_ref() {
 #    `localhost:5000_source_hello` 这种非法仓库名。
 #    因此必须先分离出 tag——只有落在**最后一个 / 之后**的冒号才是 tag
 #    分隔符——对名称部分同时替换 / 和 :，最后再拼回 tag。
-dest_repo_for() {
-  local ref="$1" digest="" name="" tag="" short=""
+# 拆解镜像引用为「仓库」「tag」「digest」，写入上面的三个全局变量。
+#
+# 规则：**只有最后一个 / 之后的冒号才是 tag 分隔符**——registry 地址里的冒号
+# （localhost:5000/foo）不是。digest 一律先剥离。
+split_image_ref() {
+  local ref="$1"
 
-  # 剥掉 digest
+  REF_REPO=""
+  REF_TAG=""
+  REF_DIGEST=""
+
   if [[ "$ref" == *"@"* ]]; then
-    digest="${ref#*@}"
+    REF_DIGEST="${ref#*@}"
     ref="${ref%%@*}"
   fi
 
-  # 分离 tag：只有最后一个 / 之后的冒号才是 tag 分隔符
   local last_segment="${ref##*/}"
   if [[ "$last_segment" == *:* ]]; then
-    tag=":${last_segment#*:}"
-    name="${ref%:*}"
+    REF_TAG="${last_segment#*:}"
+    REF_REPO="${ref%:*}"
   else
-    name="$ref"
+    REF_REPO="$ref"
+  fi
+}
+
+dest_repo_for() {
+  local name="" tag="" short=""
+
+  split_image_ref "$1"
+  name="$REF_REPO"
+  if [[ -n "$REF_TAG" ]]; then
+    tag=":${REF_TAG}"
   fi
 
   # 压平：/ 和 : 都换成 _（仓库名不允许冒号，也不支持多级路径）
@@ -476,8 +521,8 @@ dest_repo_for() {
 
   # 源只给了 digest 没给 tag（形如 nginx@sha256:…）时，
   # 用 digest 前缀生成一个可读的 tag，避免目标没有 tag
-  if [[ -z "$tag" && -n "$digest" ]]; then
-    short="${digest#sha256:}"
+  if [[ -z "$tag" && -n "$REF_DIGEST" ]]; then
+    short="${REF_DIGEST#sha256:}"
     tag=":${short:0:12}"
   fi
 
@@ -1841,6 +1886,203 @@ emit_audit_summary() {
 }
 
 # ---------------------------------------------------------------------------
+# 上游版本检查（--check-updates）
+#
+# images.lock.txt 锁的是某个 k8s 版本的整套组件。上游发新版本时，没有任何机制
+# 会通知你——得自己盯上游发布、自己查有哪些新 tag、再手工更新清单。这是定期
+# 同步流程里唯一还需要人肉盯着的环节：搬运本身自动化了，校验、通知、趋势都有了，
+# 唯独「该不该同步新版本」还靠人记得去查。
+#
+# 三条刻意的约束：
+#
+# 1. **只报告，绝不修改清单。** 升到哪个版本涉及兼容性判断，是人的决定。工具
+#    只负责让信息可见，不替使用者做选择——与「同步必须显式触发」同源。
+# 2. **输出必须收敛。** kube-apiserver 这类仓库有几百个 tag，全列出来等于没有
+#    输出。取版本序最大的若干条，同时给出总数——只删不报总数会让人低估差距。
+# 3. **不做语义化版本判断，也不过滤预发布。** 上游 tag 命名未必规整
+#    （1.27-alpine、latest、v1.32.0-rc.1），语义化比较会给出**错误**结论
+#    （把 rc 当成比正式版更新）。只用 sort -V 做「谁在后」的粗排序并原样展示：
+#    哪个能上生产是使用者的判断，不是工具的。
+# ---------------------------------------------------------------------------
+
+skopeo_list_tags() {
+  local repo="$1"
+  local -a cmd=(skopeo list-tags)
+  if [[ "$TLS_VERIFY" == "false" ]]; then
+    cmd+=(--tls-verify=false)
+  fi
+  # 私有上游同样需要凭证，与 inspect 走同一条装载路径
+  if [[ -n "$SRC_AUTHFILE" ]]; then
+    cmd+=(--authfile "$SRC_AUTHFILE")
+  fi
+  cmd+=("docker://${repo}")
+  "${cmd[@]}"
+}
+
+# 把清单按「源仓库」分组：同一个仓库的多个 tag 只查一次上游，
+# 否则 k8s 那十几个组件会把同一个仓库查上十几遍。
+#
+# 结果写进两个按下标对齐的全局数组（bash 3.2 没有关联数组，
+# 项目里统一用下标对齐的并行数组）。
+declare -a UPD_REPOS=()
+declare -a UPD_KNOWN_TAGS=()
+group_repos_from_manifest() {
+  local i repo tag idx found
+  UPD_REPOS=()
+  UPD_KNOWN_TAGS=()
+
+  for i in "${!SOURCE_IMAGES[@]}"; do
+    # 被筛掉的不查：与同步、审计一致，使用者有意排除的东西不该产生网络请求。
+    # 汇总里会报出排除了多少个，不会悄悄少查。
+    if [[ -n "${EXCLUDE_REASONS[$i]:-}" ]]; then
+      continue
+    fi
+
+    split_image_ref "${SOURCE_IMAGES[$i]}"
+    repo="$REF_REPO"
+    tag="$REF_TAG"
+
+    found=0
+    for idx in "${!UPD_REPOS[@]}"; do
+      if [[ "${UPD_REPOS[$idx]}" == "$repo" ]]; then
+        found=1
+        if [[ -n "$tag" ]]; then
+          # 下标不带 $：数组下标是算术上下文，项目里的数组赋值统一这么写
+          UPD_KNOWN_TAGS[idx]="${UPD_KNOWN_TAGS[idx]:-} ${tag}"
+        fi
+        break
+      fi
+    done
+
+    if [[ "$found" -eq 0 ]]; then
+      UPD_REPOS+=("$repo")
+      UPD_KNOWN_TAGS+=("$tag")
+    fi
+  done
+}
+
+check_updates_all() {
+  local limit="$UPDATES_LIMIT"
+  local idx repo known_tags raw rc upstream_sorted known_sorted missing missing_count shown
+  local checked=0 with_updates=0 failed=0 total_missing=0
+  local summary_rows=""
+
+  group_repos_from_manifest
+
+  if [[ ${#UPD_REPOS[@]} -eq 0 ]]; then
+    log_warn "没有可检查的镜像（全部被筛选排除）"
+    return 0
+  fi
+
+  log_info "检查 ${#UPD_REPOS[@]} 个源仓库的上游 tag 列表"
+
+  for idx in "${!UPD_REPOS[@]}"; do
+    repo="${UPD_REPOS[$idx]}"
+    known_tags="${UPD_KNOWN_TAGS[$idx]:-}"
+    checked=$((checked + 1))
+
+    printf '\n' >&2
+    printf '%s%s%s\n' "$C_BLUE" "$repo" "$C_RESET" >&2
+
+    known_tags="$(printf '%s' "$known_tags" | tr -s ' ' | sed 's/^ //; s/ $//')"
+    if [[ -n "$known_tags" ]]; then
+      printf '  清单中：%s\n' "$known_tags" >&2
+    else
+      printf '  清单中：（只给了 digest，没有 tag）\n' >&2
+    fi
+
+    set +e
+    raw="$(skopeo_list_tags "$repo" 2>&1)"
+    rc=$?
+    set -e
+
+    if [[ "$rc" -ne 0 ]]; then
+      # 单个仓库查不成不该影响其他仓库：私有仓库、不支持列 tag 的 registry、
+      # 网络抖动都会走到这里，逐个记下来继续
+      failed=$((failed + 1))
+      local reason
+      reason="$(printf '%s' "$raw" | tr -d '\r' | grep -v '^[[:space:]]*$' | head -n 1 || true)"
+      printf '  %s无法查询上游 tag 列表%s：%s\n' "$C_YELLOW" "$C_RESET" "$reason" >&2
+      summary_rows+="| \`${repo}\` | ${known_tags:-—} | — | 查询失败：${reason} |"$'\n'
+      continue
+    fi
+
+    upstream_sorted="$(printf '%s' "$raw" | jq -r '.Tags[]?' 2>/dev/null | grep -v '^$' | sort -u || true)"
+    if [[ -z "$upstream_sorted" ]]; then
+      printf '  %s上游没有返回任何 tag%s\n' "$C_YELLOW" "$C_RESET" >&2
+      summary_rows+="| \`${repo}\` | ${known_tags:-—} | — | 上游返回空列表 |"$'\n'
+      continue
+    fi
+
+    known_sorted="$(printf '%s' "$known_tags" | tr ' ' '\n' | grep -v '^$' | sort -u || true)"
+    missing="$(comm -13 <(printf '%s\n' "$known_sorted") <(printf '%s\n' "$upstream_sorted") || true)"
+    missing="$(printf '%s' "$missing" | grep -v '^$' || true)"
+
+    if [[ -z "$missing" ]]; then
+      printf '  %s清单已覆盖上游现有 tag（上游共 %s 个）%s\n' \
+        "$C_GREEN" "$(printf '%s\n' "$upstream_sorted" | grep -c .)" "$C_RESET" >&2
+      summary_rows+="| \`${repo}\` | ${known_tags:-—} | 0 | ✅ 已覆盖 |"$'\n'
+      continue
+    fi
+
+    with_updates=$((with_updates + 1))
+    missing_count="$(printf '%s\n' "$missing" | grep -c .)"
+    total_missing=$((total_missing + missing_count))
+
+    # 缺失数少于上限时就说「全部列出」——写「版本序最大的 5 个」却只列出 3 条，
+    # 看的人会以为还有没显示出来的
+    local tail_label="版本序最大的 ${limit} 个"
+    if [[ "$missing_count" -le "$limit" ]]; then
+      tail_label="全部列出如下"
+    fi
+
+    printf '  %s上游共 %s 个 tag，其中 %s 个不在清单中，%s：%s\n' \
+      "$C_YELLOW" \
+      "$(printf '%s\n' "$upstream_sorted" | grep -c .)" \
+      "$missing_count" "$tail_label" "$C_RESET" >&2
+
+    shown="$(printf '%s\n' "$missing" | sort -Vr | head -n "$limit" | tr '\n' ' ')"
+    shown="${shown% }"
+    printf '    %s\n' "$shown" >&2
+
+    summary_rows+="| \`${repo}\` | ${known_tags:-—} | ${missing_count} | ${shown} |"$'\n'
+  done
+
+  printf '\n' >&2
+  if [[ "$with_updates" -eq 0 && "$failed" -eq 0 ]]; then
+    log_ok "检查完成：${checked} 个源仓库，清单均已覆盖上游现有 tag"
+  else
+    log_info "检查完成：${checked} 个源仓库，${with_updates} 个有未收录的 tag（共 ${total_missing} 个），${failed} 个查询失败"
+  fi
+  if [[ "$FILTERED_OUT_COUNT" -gt 0 ]]; then
+    log_dim "另有 ${FILTERED_OUT_COUNT} 个镜像被 --filter / --exclude 排除，未参与检查"
+  fi
+  if [[ "$with_updates" -gt 0 ]]; then
+    # 说清楚边界：这是报告，不是升级建议，更不会替你改文件
+    log_dim "以上只是「上游有这些 tag」，不是「应该升级到哪个版本」；清单需要时请手工编辑"
+  fi
+
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    {
+      echo "## 上游版本检查"
+      echo ""
+      echo "检查了 ${checked} 个源仓库：${with_updates} 个有未收录的 tag（共 ${total_missing} 个），${failed} 个查询失败。"
+      echo ""
+      echo "| 源仓库 | 清单中 | 未收录 | 版本序最大的 ${limit} 个 |"
+      echo "| --- | --- | :---: | --- |"
+      printf '%s' "$summary_rows"
+    } >> "$GITHUB_STEP_SUMMARY"
+  fi
+
+  # 与 --audit 同一套退出码约定：没查成与查出差异都返回 2，
+  # 让 CI 门禁不至于在检查本身没做完时报绿
+  if [[ "$with_updates" -gt 0 || "$failed" -gt 0 ]]; then
+    return 2
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # 结果汇总与报告
 # ---------------------------------------------------------------------------
 load_results() {
@@ -2374,7 +2616,8 @@ main() {
     SRC_CREDENTIALS_TMPFILE="$SRC_CREDENTIALS_FILE"
   fi
 
-  if [[ ${#DEST_REGISTRIES[@]} -eq 0 && -z "$DEST_EXACT" ]]; then
+  # --check-updates 只查上游 tag，不碰任何目标仓库，因此不需要目标地址
+  if [[ ${#DEST_REGISTRIES[@]} -eq 0 && -z "$DEST_EXACT" && "$CHECK_UPDATES" != "true" ]]; then
     log_error "缺少必填参数：--dest 或 --dest-exact"
     echo "" >&2
     usage >&2
@@ -2390,6 +2633,9 @@ main() {
   validate_numeric "--concurrency" "$CONCURRENCY"
   validate_numeric "--timeout" "$TIMEOUT"
   validate_numeric "--retries" "$MAX_RETRIES"
+  validate_numeric "--updates-limit" "$UPDATES_LIMIT"
+
+  [[ "$UPDATES_LIMIT" -ge 1 ]] || die "--updates-limit 至少为 1"
 
   # 正则先校验再跑。写错的正则应该立刻被拒绝，而不是等收集完镜像才发现
   validate_regex "--filter" "$FILTER_REGEX"
@@ -2424,6 +2670,32 @@ main() {
     DEST_REGISTRIES=("${normalized[@]}")
   fi
   DEST_EXACT="${DEST_EXACT#docker://}"
+
+  # ---- 只读检查的参数约束 ----
+  # 两个检查的对象不同（目标仓库 vs 上游），报告也是两套，混着跑会互相淹没。
+  # 都要的话跑两次就好——这类检查本来就该是随手能跑的一条命令。
+  if [[ "$AUDIT" == "true" && "$CHECK_UPDATES" == "true" ]]; then
+    die "--audit 与 --check-updates 不能同时使用：前者看目标仓库与清单的差距，后者看上游与清单的差距，请分两次运行"
+  fi
+
+  if [[ "$CHECK_UPDATES" == "true" ]]; then
+    local -a upd_ignored=()
+    if [[ "$DRY_RUN" == "true" ]]; then upd_ignored+=("--dry-run"); fi
+    if [[ -n "$WRITE_LOCK" ]]; then upd_ignored+=("--write-lock"); fi
+    if [[ -n "$REPORT_DIR" ]]; then upd_ignored+=("--report-dir"); fi
+    if [[ -n "$NOTIFY_WEBHOOK" ]]; then upd_ignored+=("--notify-webhook"); fi
+    if [[ "$VERIFY" == "true" ]]; then upd_ignored+=("--verify"); fi
+    if [[ "$SKIP_EXISTING" == "true" ]]; then upd_ignored+=("--skip-existing"); fi
+    if [[ "$STRIP_ATTESTATION" == "true" ]]; then upd_ignored+=("--strip-attestation"); fi
+    if [[ ${#DEST_REGISTRIES[@]} -gt 0 ]]; then upd_ignored+=("--dest"); fi
+    if [[ -n "$DEST_EXACT" ]]; then upd_ignored+=("--dest-exact"); fi
+    # 并发与超时是给搬运用的；列 tag 是一次轻量查询，串行足够
+    if [[ "$CONCURRENCY" != "1" ]]; then upd_ignored+=("--concurrency"); fi
+    if [[ "$TIMEOUT" != "600" ]]; then upd_ignored+=("--timeout"); fi
+    if [[ ${#upd_ignored[@]} -gt 0 ]]; then
+      log_warn "--check-updates 只查上游，以下参数本次不生效：${upd_ignored[*]}"
+    fi
+  fi
 
   # ---- 审计模式的参数约束 ----
   if [[ "$AUDIT" == "true" ]]; then
@@ -2471,7 +2743,7 @@ main() {
   local active_count
   active_count=$((${#SOURCE_IMAGES[@]} - FILTERED_OUT_COUNT))
 
-  if [[ -n "$DEST_EXACT" && "$active_count" -gt 1 ]]; then
+  if [[ -n "$DEST_EXACT" && "$active_count" -gt 1 && "$CHECK_UPDATES" != "true" ]]; then
     die "--dest-exact 只能搭配单个源镜像使用（当前提供了 ${active_count} 个）；批量同步请改用 --dest 前缀模式"
   fi
 
@@ -2504,7 +2776,9 @@ main() {
     verb="检查"
   fi
 
-  if [[ -n "$DEST_EXACT" ]]; then
+  if [[ "$CHECK_UPDATES" == "true" ]]; then
+    log_info "待检查镜像 ${total} 个（只查上游 tag，不需要目标地址）"
+  elif [[ -n "$DEST_EXACT" ]]; then
     log_info "待${action}镜像 ${total} 个 → ${DEST_EXACT}"
   else
     log_info "待${action}镜像 ${total} 个 → ${DEST_REGISTRIES[*]}"
@@ -2521,21 +2795,31 @@ main() {
   # 写成函数后新增清理项只改 cleanup 一处，不必再核对这行的展开时机
   trap cleanup EXIT
 
-  local start end
+  local start end check_rc=0
   start="$(date +%s)"
   if [[ "$AUDIT" == "true" ]]; then
     dispatch_audit
+  elif [[ "$CHECK_UPDATES" == "true" ]]; then
+    # 接住退出码再放行：set -e 下它会直接结束脚本，连总耗时都打不出来
+    set +e
+    check_updates_all
+    check_rc=$?
+    set -e
   else
     dispatch_all
   fi
   end="$(date +%s)"
   log_info "总耗时：$((end - start)) 秒"
 
-  # 审计与同步的报告是两套：状态值域不同，汇总方式与退出码也不同
+  # 三种模式的报告是分开的：状态值域不同，汇总方式与退出码也不同
   if [[ "$AUDIT" == "true" ]]; then
     load_audit_results
     emit_audit_summary
     return $?
+  fi
+  if [[ "$CHECK_UPDATES" == "true" ]]; then
+    # 结果已经直接输出，这里只需把退出码带出去
+    return "$check_rc"
   fi
 
   load_results

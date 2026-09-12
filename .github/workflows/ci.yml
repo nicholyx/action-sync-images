@@ -885,6 +885,50 @@ jobs:
           fi
           echo "✓ 源不可达时报无法判定，未误报为缺失"
 
+      - name: 上游版本检查（--check-updates）
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 往源仓库多推一个 tag，制造「上游有、清单没有」的真实现场
+          skopeo copy --dest-tls-verify=false \
+            docker://docker.io/library/hello-world:latest \
+            docker://localhost:5000/source/hello:v2
+
+          set +e
+          out="$(./scripts/sync.sh \
+            --src localhost:5000/source/hello:latest \
+            --check-updates --tls-verify false 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+
+          if [[ "$code" -ne 2 ]]; then
+            echo "::error::上游存在未收录的 tag，退出码应为 2，实际为 ${code}"
+            exit 1
+          fi
+          if ! grep -q 'v2' <<<"$out"; then
+            echo "::error::未报出清单之外的上游 tag v2"
+            exit 1
+          fi
+          echo "✓ 报出了上游未收录的 tag"
+
+          # 清单补上 v2 后应报「已覆盖」并以 0 结束——这条才是关键：
+          # 它证明「未收录」来自与清单的真实差异，而不是无脑列出上游所有 tag
+          set +e
+          out="$(./scripts/sync.sh \
+            --src localhost:5000/source/hello:latest,localhost:5000/source/hello:v2 \
+            --check-updates --tls-verify false 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+
+          if [[ "$code" -ne 0 ]] || ! grep -q '已覆盖' <<<"$out"; then
+            echo "::error::清单已包含全部上游 tag，应报「已覆盖」并以 0 结束（实际 ${code}）"
+            exit 1
+          fi
+          echo "✓ 清单覆盖后报「已覆盖」、退出码 0"
+
       - name: 源内容变化后应重新同步
         run: |
           #!/usr/bin/env bash
