@@ -9,6 +9,24 @@
 
 ## [Unreleased]
 
+### 新增
+
+- **SUPPORT.md**：获取帮助入口（文档 → Discussions Q&A → Bug → 安全报告的
+  分流路径），这是 GitHub 社区标准文件之一，此前只有 README 里的零散指引
+
+### 安全
+
+- **供应链加固**（对标 OSSF Scorecard 检查项）：所有工作流引用的 Actions 从
+  版本号 pin 到 commit SHA（注释保留版本，Dependabot 仍会提更新 PR）；
+  所有 checkout 加 `persist-credentials: false`，GITHUB_TOKEN 不再残留在
+  runner 上；Dependabot 引入 7 天冷却期
+- **工作流安全扫描**：CI 新增 zizmor job（容器按版本 pin），专查 Actions
+  的已知反模式；豁免项集中在 `.github/zizmor.yml`，每条写明安全依据
+- **OSSF Scorecard**：新增评分工作流（结果发布到公开评分页并上传 code
+  scanning），README 加 Scorecard 徽章——供应链安全从「自己觉得做得好」
+  变成「有公开体检报告」
+- 教学文件 learn-github-actions.yaml 补上最小权限声明
+
 ---
 
 ## [1.5.0] - 2026-09-11

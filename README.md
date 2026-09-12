@@ -7,6 +7,8 @@
 不需要 VPS，不需要服务器，不依赖别人同步好的镜像。
 
 [![CI](https://github.com/nicholyx/action-sync-images/actions/workflows/ci.yml/badge.svg)](https://github.com/nicholyx/action-sync-images/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/nicholyx/action-sync-images)](https://github.com/nicholyx/action-sync-images/releases)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/badge?org=nicholyx&repo=action-sync-images)](https://github.com/ossf/scorecard)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 [![GitHub stars](https://img.shields.io/github/stars/nicholyx/action-sync-images?style=social)](https://github.com/nicholyx/action-sync-images/stargazers)

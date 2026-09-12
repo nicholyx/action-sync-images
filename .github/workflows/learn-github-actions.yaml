@@ -19,16 +19,22 @@ jobs:
     # 将作业配置为在最新版本的 Ubuntu Linux 运行程序上运行。
     # 注意此处不是 Docker Hub 中的 ubuntu:latest，而是 GitHub 中自己的虚拟主机。
     runs-on: ubuntu-latest
+    # 只读即可。不声明时 job 会继承仓库的默认权限（较宽），安全扫描会告警
+    permissions:
+      contents: read
     # 操作步骤
     steps:
       # 使用 actions 脚本，例如，用于在工作流程中检出代码仓库的操作，
       # 即它允许你从存储库中检出（拉取）代码
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # CI 用不到 git 凭证，不持久化
+          persist-credentials: false
 
       # 使用 actions 脚本，创建一个 node 运行环境并使用 with 参数指定版本。
       # 原先这里锁的是 node 14，该版本早已停止维护，GitHub Actions 的运行器
       # 也不再支持对应的 action 版本（v3），工作流会在启动阶段直接失败。
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: '22'
 

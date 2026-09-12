@@ -37,7 +37,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repos
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # CI 用不到 git 凭证（推送走 docker 凭证），不持久化，
+          # 让 checkout 之后的任何脚本都拿不到 GITHUB_TOKEN
+          persist-credentials: false
 
       - name: 安装 actionlint
         run: |
@@ -58,7 +62,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repos
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # CI 用不到 git 凭证（推送走 docker 凭证），不持久化，
+          # 让 checkout 之后的任何脚本都拿不到 GITHUB_TOKEN
+          persist-credentials: false
 
       - name: 安装 yamllint
         run: |
@@ -78,7 +86,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repos
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # CI 用不到 git 凭证（推送走 docker 凭证），不持久化，
+          # 让 checkout 之后的任何脚本都拿不到 GITHUB_TOKEN
+          persist-credentials: false
 
       - name: 运行 shellcheck
         run: shellcheck -x scripts/*.sh
@@ -102,7 +114,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repos
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # CI 用不到 git 凭证（推送走 docker 凭证），不持久化，
+          # 让 checkout 之后的任何脚本都拿不到 GITHUB_TOKEN
+          persist-credentials: false
 
       - name: 安装 skopeo
         run: |
@@ -669,6 +685,31 @@ jobs:
           echo "✓ 环境变量注入（Secret 场景）可用"
 
   # ---------------------------------------------------------------------------
+  # 工作流安全扫描
+  # zizmor 专查 GitHub Actions 的已知反模式：凭证持久化、危险触发器、
+  # 依赖未锁定等。豁免项集中放在 .github/zizmor.yml，每条写明理由。
+  # 容器按版本 pin（与 action 同一个思路：工具本身也是供应链的一环）。
+  # ---------------------------------------------------------------------------
+  zizmor:
+    name: 工作流安全扫描
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Repos
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: 运行 zizmor
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          # 挂载只读（:ro）：扫描器没有理由改动被扫描的文件
+          docker run --rm -v "$PWD":/repo:ro \
+            ghcr.io/zizmorcore/zizmor:1.30.1 /repo --no-online-audits
+
+  # ---------------------------------------------------------------------------
   # 真实同步集成测试
   #
   # 与冒烟测试的关键区别：这里**真的会推送镜像**。
@@ -683,7 +724,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repos
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # CI 用不到 git 凭证（推送走 docker 凭证），不持久化，
+          # 让 checkout 之后的任何脚本都拿不到 GITHUB_TOKEN
+          persist-credentials: false
 
       - name: 启动本地 registry
         run: |
@@ -969,8 +1014,11 @@ jobs:
     if: github.event_name == 'pull_request'
     steps:
       - name: Checkout Repos
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          # CI 用不到 git 凭证（推送走 docker 凭证），不持久化，
+          # 让 checkout 之后的任何脚本都拿不到 GITHUB_TOKEN
+          persist-credentials: false
           # 需要完整的提交历史才能校验区间内的所有提交
           fetch-depth: 0
 
@@ -992,7 +1040,7 @@ jobs:
   ci-summary:
     name: CI 总览
     runs-on: ubuntu-latest
-    needs: [actionlint, yamllint, shellcheck, smoke-test, integration-test, commit-messages]
+    needs: [actionlint, yamllint, shellcheck, zizmor, smoke-test, integration-test, commit-messages]
     if: always()
     steps:
       - name: 汇总各检查结果
@@ -1000,6 +1048,7 @@ jobs:
           R_ACTIONLINT: ${{ needs.actionlint.result }}
           R_YAMLLINT: ${{ needs.yamllint.result }}
           R_SHELLCHECK: ${{ needs.shellcheck.result }}
+          R_ZIZMOR: ${{ needs.zizmor.result }}
           R_SMOKE: ${{ needs.smoke-test.result }}
           R_INTEGRATION: ${{ needs.integration-test.result }}
           R_COMMITS: ${{ needs.commit-messages.result }}
@@ -1007,8 +1056,8 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
 
-          declare -a names=(工作流静态检查 YAML风格检查 Shell脚本检查 冒烟测试 集成测试 提交信息规范)
-          declare -a results=("$R_ACTIONLINT" "$R_YAMLLINT" "$R_SHELLCHECK" "$R_SMOKE" "$R_INTEGRATION" "$R_COMMITS")
+          declare -a names=(工作流静态检查 YAML风格检查 Shell脚本检查 工作流安全扫描 冒烟测试 集成测试 提交信息规范)
+          declare -a results=("$R_ACTIONLINT" "$R_YAMLLINT" "$R_SHELLCHECK" "$R_ZIZMOR" "$R_SMOKE" "$R_INTEGRATION" "$R_COMMITS")
 
           failed=0
 
