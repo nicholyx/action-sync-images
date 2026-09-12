@@ -16,6 +16,10 @@ updates:
       time: "06:00"
       timezone: "Asia/Shanghai"
     open-pull-requests-limit: 5
+    # 冷却期：新版本发布后等 7 天才提 PR。_actions 的 tag 被改投恶意代码、
+    # 或新版本本身有问题时，冷却期让问题有机会先暴露出来
+    cooldown:
+      default-days: 7
     labels:
       - dependencies
       - ci

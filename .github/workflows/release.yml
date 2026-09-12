@@ -22,8 +22,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repos
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          # CI 用不到 git 凭证（推送走 docker 凭证），不持久化，
+          # 让 checkout 之后的任何脚本都拿不到 GITHUB_TOKEN
+          persist-credentials: false
           # 需要完整历史：既要定位上一个 tag，也要让 GitHub 生成对比链接
           fetch-depth: 0
 

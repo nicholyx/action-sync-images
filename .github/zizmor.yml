@@ -1,0 +1,32 @@
+# zizmor 配置 —— GitHub Actions 的静态安全扫描
+#
+# CI 中的 zizmor job 以此文件为准。豁免必须有可验证的理由，
+# 写清楚「为什么不构成威胁」，否则不应该出现在这里。
+#
+# 文档：https://docs.zizmor.sh/configuration/
+
+rules:
+  # labeler.yml 与 welcome.yml 使用 pull_request_target。
+  #
+  # 这两个工作流都**不 checkout、不执行任何来自 PR 的代码**——它们只调用
+  # GitHub 官方 Action（SHA 锁定），对 PR 发标签 / 发欢迎评论。
+  # pull_request_target 的危险点在于「以可写 token 运行 PR 代码」，
+  # 而这里根本没有运行 PR 代码，风险不存在。
+  #
+  # 若未来任何一个工作流要 checkout PR 的 head 分支，必须改用 pull_request
+  # + 显式授权，而不是在这里加豁免。
+  dangerous-triggers:
+    ignore:
+      - labeler.yml
+      - welcome.yml
+
+  # actionlint 的安装采用「固定版本 + 官方 release 直下」，未做 checksum
+  # 校验。版本已固定（可复现），下载源是 rhysd/actionlint 的官方 release，
+  # 风险可控。若要加固，可改为下载 checksums 文件并 sha256sum -c。
+  adhoc-packages:
+    ignore:
+      - ci.yml
+      # learn-github-actions.yaml 是保留的教学文件，npm install -g bats
+      # 正是它要演示的写法（无锁文件的入门示例），豁免。
+      # 该工作流无任何敏感凭证（permissions 已收窄到 contents: read）。
+      - learn-github-actions.yaml
