@@ -9,6 +9,23 @@
 
 ## [Unreleased]
 
+### 新增
+
+- **检查结果也能推送通知**：`--audit` 与 `--check-updates` 支持 `--notify-webhook`，
+  补上「无人值守体检」的最后一块——此前只有同步结果能通知，定期跑体检仍然得有人
+  天天去运行页面看。`--notify-on failure` 在检查模式下的含义是「有需要关注的项」
+  （落后 / 缺失 / 无法判定，或有仓库没查成），全绿时不打扰；通知只列需要处理的
+  条目（最多 20 条），不会把整张表推过去把重点淹没。`--notify-after-failures`
+  仅同步模式适用，检查模式下显式传入会告警
+
+### 修复
+
+- **配了 webhook 时，macOS 上的同步会以非零退出**：`for line in "${alert_lines[@]}"`
+  在数组为空时，bash 3.2（macOS 自带）配合 `set -u` 会抛 unbound variable——
+  同步明明成功了，脚本却报错退出，使用者会以为同步失败。触发条件是「全部成功 +
+  配置了 webhook + 在 bash 3.2 上运行」，CI 用的 bash 5 不报此错，因此一直没暴露。
+  改为先判长度再遍历（与 `collect_images` 里的既有做法一致）
+
 ## [1.6.0] - 2026-09-12
 
 本轮把「该同步什么」从同步动作里拆了出来：`--audit` 只读回答「仓库与清单的差距」，`--check-updates` 只读回答「上游有没有新版本」；`--dest-keep-path` 解开了多目标共用一个命名规则的别扭。此外补齐供应链加固（pin SHA / zizmor / Scorecard）、英文版 README 与 SUPPORT.md，并把维护流程沉淀为两个项目级 skill。

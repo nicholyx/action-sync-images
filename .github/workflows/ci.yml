@@ -1063,6 +1063,75 @@ jobs:
           fi
           echo "✓ 两套命名规则各自生效"
 
+      - name: 体检结果的通知真的发得出去
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 起一个只收 POST 的假 webhook。通知这条路径此前只有「提取函数 + mock」
+          # 的单元测试，端到端从没跑过——类型识别、jq 组装、curl 调用、结果判断
+          # 这几段串起来是什么样，只有真发一次才知道。
+          cat > /tmp/hook.py <<'PY'
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+          class H(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  n = int(self.headers.get('Content-Length', 0))
+                  with open('/tmp/hook-payload.json', 'wb') as f:
+                      f.write(self.rfile.read(n))
+                  self.send_response(200)
+                  self.end_headers()
+                  self.wfile.write(b'ok')
+
+              def log_message(self, *a):
+                  pass
+
+
+          HTTPServer(('127.0.0.1', 8899), H).serve_forever()
+          PY
+          rm -f /tmp/hook-payload.json
+          python3 /tmp/hook.py &
+          hook_pid=$!
+          trap 'kill "$hook_pid" 2>/dev/null || true' EXIT
+          sleep 2
+
+          # 目标仓库里没有这个镜像 → 审计报「缺失」→ 有需要关注的项 → 应当通知
+          set +e
+          ./scripts/sync.sh \
+            --src localhost:5000/source/hello:latest \
+            --dest localhost:5000/definitely-absent \
+            --tls-verify false --audit \
+            --notify-webhook http://127.0.0.1:8899/hook --notify-type generic 2>&1
+          set -e
+
+          if [[ ! -s /tmp/hook-payload.json ]]; then
+            echo "::error::审计发现差异时未发送通知"
+            exit 1
+          fi
+          if ! grep -q '缺失' /tmp/hook-payload.json; then
+            echo "::error::通知发出去了但内容里没有结论（「缺失」）"
+            cat /tmp/hook-payload.json
+            exit 1
+          fi
+          echo "✓ 有差异时通知发出，且内容包含结论"
+
+          # --notify-on failure + 全绿 → 不该打扰
+          rm -f /tmp/hook-payload.json
+          set +e
+          ./scripts/sync.sh \
+            --src localhost:5000/source/hello:latest \
+            --dest localhost:5000/dest \
+            --tls-verify false --audit --notify-on failure \
+            --notify-webhook http://127.0.0.1:8899/hook --notify-type generic 2>&1
+          set -e
+
+          if [[ -e /tmp/hook-payload.json ]]; then
+            echo "::error::全绿时不该打扰，却收到了通知"
+            exit 1
+          fi
+          echo "✓ 全绿时按 --notify-on failure 保持安静"
+
       # -----------------------------------------------------------------------
       # 私有源：走到认证这条真实路径上
       #

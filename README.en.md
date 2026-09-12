@@ -61,7 +61,7 @@ The runner sits overseas with direct access to all upstream registries. You clic
 - **Fail-safe batching** — one failed image doesn't abort the rest; everything is summarized at the end
 - **Timeout & retries** — per-image timeouts keep one huge image from stalling the whole batch
 - **Self-hosted registries** — TLS verification can be turned off for internal HTTP registries
-- **Result notifications** — push results to DingTalk / Lark / Slack so unattended runs aren't a blind spot
+- **Result notifications** — push sync *and* audit results to DingTalk / Lark / Slack so unattended runs aren't a blind spot
 - **Auditable** — source and destination digests are recorded; lockfiles reproduce exactly what was synced
 - **Status check** — `--audit` reports how far your registry has drifted from the manifest (current / stale / missing / unknown), pushing nothing
 - **Release check** — `--check-updates` compares upstream tags against the manifest and reports versions you haven't pinned yet
