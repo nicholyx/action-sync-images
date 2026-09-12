@@ -445,12 +445,7 @@ Recent highlights:
 - ✅ v1.3: private source credentials, regex filtering, sync history trends
 - ✅ v1.4: per-platform integrity verification (`--verify`), duration rankings, failure-threshold alerting
 - ✅ v1.5: single-pull multi-destination, per-registry credential mapping
-
-Planned for v1.6 — answering "what's the state" without moving anything:
-
-- [ ] Manifest audit (`--audit`) — [#53](https://github.com/nicholyx/action-sync-images/issues/53)
-- [ ] Upstream release detection (`--check-updates`) — [#54](https://github.com/nicholyx/action-sync-images/issues/54)
-- [ ] Per-destination naming rules (`--dest-keep-path`) — [#55](https://github.com/nicholyx/action-sync-images/issues/55)
+- ✅ v1.6: manifest audit, upstream release detection, per-destination naming rules
 
 Ideas welcome — [open an issue](https://github.com/nicholyx/action-sync-images/issues/new/choose).
 
