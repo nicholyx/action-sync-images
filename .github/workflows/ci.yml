@@ -1021,6 +1021,48 @@ jobs:
           fi
           echo "✓ 中转推送内容与源一致"
 
+      - name: 每个目标各用各的命名规则
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 一次运行推往两个目标：一个压平、一个保留路径。这正是
+          # 「阿里云给国内集群（个人版不支持多级路径）+ Harbor 做归档」的组合。
+          set +e
+          out="$(./scripts/sync.sh \
+            --src localhost:5000/source/hello:latest \
+            --dest localhost:5000/flat-dest \
+            --dest-keep-path localhost:5000/keep-dest \
+            --tls-verify false --concurrency 1 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+
+          if [[ "$code" -ne 0 ]]; then
+            echo "::error::混合命名规则的多目标同步失败（退出码 ${code}），输出见上"
+            exit 1
+          fi
+
+          flat="localhost:5000/flat-dest/localhost_5000_source_hello:latest"
+          # 保留路径目标：层级结构还在，只有端口那一段压成了下划线
+          keep="localhost:5000/keep-dest/localhost_5000/source/hello:latest"
+
+          for dest in "$flat" "$keep"; do
+            if ! skopeo inspect --tls-verify=false "docker://${dest}" >/dev/null 2>&1; then
+              echo "::error::目标镜像不存在：${dest}"
+              exit 1
+            fi
+            echo "✓ 已推送：${dest}"
+          done
+
+          # 两个目标的地址必须真的不同——规则接错时它们会撞到同一个地址，
+          # 表面上「同步成功」，实际只推了一份
+          if [[ "$flat" == "$keep" ]]; then
+            echo "::error::压平与保留路径生成了相同的目标地址"
+            exit 1
+          fi
+          echo "✓ 两套命名规则各自生效"
+
       # -----------------------------------------------------------------------
       # 私有源：走到认证这条真实路径上
       #

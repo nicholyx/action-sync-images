@@ -17,6 +17,13 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 DEST_EXACT=""
 declare -a DEST_REGISTRIES=()
+# 与 DEST_REGISTRIES 按下标对齐：每个目标用哪套命名规则（flat / keep）。
+#
+# 压平规则的存在理由很具体——阿里云 ACR 个人版不支持多级仓库路径；而自建
+# Harbor 支持多级路径，且保留原路径更符合直觉（一眼能看出上游是谁）。
+# 「阿里云给国内集群 + Harbor 做内部归档」这个最典型的多目标场景同时需要两者，
+# 因此规则必须挂在**每个目标**上，而不是全局一份。
+declare -a DEST_MODES=()
 # 当前镜像的全部目标地址，由 resolve_dest_refs 填写（同步与审计共用）
 declare -a DEST_REFS=()
 
@@ -196,8 +203,19 @@ sync.sh —— 容器镜像同步引擎
   -d, --dest <前缀>        目标仓库前缀。最终目标为「前缀 + 源镜像路径（压平）」，
                            例如 registry.cn-shenzhen.aliyuncs.com/nicholyx
                            **可重复指定以同时推送到多个目标**
+      --dest-keep-path <前缀>
+                           同上，但**保留源镜像的路径结构**，不做压平。
+                           用于支持多级路径的 registry（如自建 Harbor）：
+                           registry.k8s.io/pause:3.9 会落到
+                           <前缀>/registry.k8s.io/pause:3.9
+                           源 registry 带端口时（localhost:5000/foo），端口
+                           那一段仍会压成下划线——仓库路径不允许冒号
+                           可与 --dest 混用，让每个目标各用合适的规则——
+                           阿里云个人版不支持多级路径（用 --dest），
+                           Harbor 支持（用 --dest-keep-path）
       --dest-exact <地址>  精确指定完整目标地址，不再自动拼接源镜像名。
-                           只能搭配单个源镜像、且不能与 --dest 混用，
+                           只能搭配单个源镜像、且不能与 --dest /
+                           --dest-keep-path 混用，
                            例如 harbor.example.com/library/nginx:1.27
 
 镜像来源（至少提供一项，可同时使用）：
@@ -337,6 +355,11 @@ sync.sh —— 容器镜像同步引擎
 
   # 只看状态不动手：清单里的镜像，目标仓库现在缺哪些、哪些落后了
   ./scripts/sync.sh --file images.lock.txt -d registry.cn-shenzhen.aliyuncs.com/nicholyx --audit
+
+  # 一次推两个目标，各用各的命名规则：阿里云压平，自建 Harbor 保留路径
+  ./scripts/sync.sh --file images.lock.txt \
+      -d registry.cn-shenzhen.aliyuncs.com/nicholyx \
+      --dest-keep-path harbor.example.com/mirror
 EOF
 }
 
@@ -360,7 +383,10 @@ parse_args() {
         EXCLUDE_REGEX="$2"; shift 2 ;;
       -d|--dest|--dest-registry)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
-        DEST_REGISTRIES+=("$2"); shift 2 ;;
+        DEST_REGISTRIES+=("$2"); DEST_MODES+=("flat"); shift 2 ;;
+      --dest-keep-path)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        DEST_REGISTRIES+=("$2"); DEST_MODES+=("keep"); shift 2 ;;
       --dest-exact)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         DEST_EXACT="$2"; shift 2 ;;
@@ -506,8 +532,12 @@ split_image_ref() {
   fi
 }
 
+# 第二参数是命名规则：
+#   flat（默认）压平——/ 和 : 都换成 _，适配不支持多级仓库路径的 registry
+#   keep        保留——原样保留源镜像的路径结构，供支持多级路径的 registry 使用
 dest_repo_for() {
   local name="" tag="" short=""
+  local mode="${2:-flat}"
 
   split_image_ref "$1"
   name="$REF_REPO"
@@ -515,9 +545,16 @@ dest_repo_for() {
     tag=":${REF_TAG}"
   fi
 
-  # 压平：/ 和 : 都换成 _（仓库名不允许冒号，也不支持多级路径）
-  name="${name//\//_}"
+  # 冒号一律替换掉：仓库路径里不允许出现冒号（registry 的语法约束），
+  # 而它只可能来自带端口的源 registry（localhost:5000/foo）。
+  # 这是两种模式的共同前提，不是压平规则的一部分。
   name="${name//:/_}"
+
+  # 压平：把 / 也换成 _（适配不支持多级仓库路径的 registry）。
+  # keep 模式保留 /，因此层级结构还在，只是端口那一段变成了下划线。
+  if [[ "$mode" != "keep" ]]; then
+    name="${name//\//_}"
+  fi
 
   # 源只给了 digest 没给 tag（形如 nginx@sha256:…）时，
   # 用 digest 前缀生成一个可读的 tag，避免目标没有 tag
@@ -535,7 +572,7 @@ dest_repo_for() {
 # （与 OCI_STAGING_DIR 同一类问题，项目里已经踩过一次）。
 resolve_dest_refs() {
   local src="$1"
-  local dest_repo d
+  local i d mode
 
   DEST_REFS=()
 
@@ -544,9 +581,11 @@ resolve_dest_refs() {
     return 0
   fi
 
-  dest_repo="$(dest_repo_for "$src")"
-  for d in "${DEST_REGISTRIES[@]}"; do
-    DEST_REFS+=("${d}/${dest_repo}")
+  # 逐目标取各自的命名规则。两个数组按下标对齐，由 parse_args 同步追加保证。
+  for i in "${!DEST_REGISTRIES[@]}"; do
+    d="${DEST_REGISTRIES[$i]}"
+    mode="${DEST_MODES[$i]:-flat}"
+    DEST_REFS+=("${d}/$(dest_repo_for "$src" "$mode")")
   done
 }
 
@@ -1440,7 +1479,7 @@ result_file_for() {
 process_one() {
   local idx="$1" raw_src="$2"
   local total="$3"
-  local src dest dest_repo platforms
+  local src dest platforms
   local src_digest="" dest_digest=""
 
   src="$(normalize_ref "$raw_src")"
@@ -2624,10 +2663,10 @@ main() {
     exit 1
   fi
 
-  # 两者语义不同：--dest 是前缀（会被拼接），--dest-exact 是完整地址（不拼接）。
-  # 混用时目标地址会变得含糊，宁可明确报错。
+  # 两者语义不同：--dest / --dest-keep-path 是前缀（会被拼接），
+  # --dest-exact 是完整地址（不拼接）。混用时目标地址会变得含糊，宁可明确报错。
   if [[ -n "$DEST_EXACT" && ${#DEST_REGISTRIES[@]} -gt 0 ]]; then
-    die "--dest-exact 与 --dest 不能同时使用：前者指定完整目标地址，后者是待拼接的前缀"
+    die "--dest-exact 不能与 --dest / --dest-keep-path 同时使用：前者指定完整目标地址，后两者是待拼接的前缀"
   fi
 
   validate_numeric "--concurrency" "$CONCURRENCY"
@@ -2687,7 +2726,7 @@ main() {
     if [[ "$VERIFY" == "true" ]]; then upd_ignored+=("--verify"); fi
     if [[ "$SKIP_EXISTING" == "true" ]]; then upd_ignored+=("--skip-existing"); fi
     if [[ "$STRIP_ATTESTATION" == "true" ]]; then upd_ignored+=("--strip-attestation"); fi
-    if [[ ${#DEST_REGISTRIES[@]} -gt 0 ]]; then upd_ignored+=("--dest"); fi
+    if [[ ${#DEST_REGISTRIES[@]} -gt 0 ]]; then upd_ignored+=("目标地址（--dest / --dest-keep-path）"); fi
     if [[ -n "$DEST_EXACT" ]]; then upd_ignored+=("--dest-exact"); fi
     # 并发与超时是给搬运用的；列 tag 是一次轻量查询，串行足够
     if [[ "$CONCURRENCY" != "1" ]]; then upd_ignored+=("--concurrency"); fi
