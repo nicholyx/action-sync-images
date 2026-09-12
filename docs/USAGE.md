@@ -93,6 +93,17 @@
 - 历史报告拿不到时（Artifact 过期、首次运行）一律按「连续失败 1 次」处理——**宁可不通知，也不基于猜测误报**
 - 历史窗口受 Artifact 保留期限制（默认 30 天），足够判断「是不是一直在失败」
 
+**体检结果同样能推送。** `--audit` 与 `--check-updates` 是只读的，但它们的结论同样无人值守——定期跑一次，只有出问题时才需要有人知道。
+
+```bash
+./scripts/sync.sh --file images.lock.txt -d <目标仓库> --audit \
+  --notify-webhook "$NOTIFY_WEBHOOK" --notify-on failure
+```
+
+在检查模式下，`--notify-on failure` 的含义是「有需要关注的项」——存在落后 / 缺失 / 无法判定，或有仓库没查成；**全绿时不会打扰**。通知里只列需要处理的条目（最多 20 条，完整结果看运行页面），不会把整张表推过去把重点淹没。
+
+> `--notify-after-failures` 只在同步模式下有意义——检查没有「连续失败」这个概念，在检查模式下显式传入会告警。
+
 ### 可选：更换目标仓库
 
 默认目标仓库是 `registry.cn-shenzhen.aliyuncs.com/nicholyx`。想换成别的，不必改代码：

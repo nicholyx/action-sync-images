@@ -69,6 +69,8 @@ NOTIFY_ON="always"
 # 调大是为了对抗通知疲劳——上游抖动占了失败原因的一大部分，每次都响的话
 # 群里的通知很快就没有人看了，真正需要关注的问题反而被淹没。
 NOTIFY_AFTER_FAILURES="1"
+# 与 --retries 同理：默认值在检查模式下不适用不值得打扰，显式传入必须说出来
+NOTIFY_AFTER_FAILURES_EXPLICIT="false"
 # 计算连续失败次数时要下载的历史报告 Artifact 名称（阈值 > 1 时才用到）
 HISTORY_ARTIFACT="sync-report-aliyuncs"
 WRITE_LOCK=""
@@ -251,7 +253,9 @@ sync.sh —— 容器镜像同步引擎
                            与 --strip-attestation 互斥：后者会重建索引，
                            目标的平台摘要必然与源不同，审计只会给出一排
                            假的「落后」；与 --dry-run / --write-lock /
-                           --notify-* 同用时这些参数不生效（会告警）
+                           --report-dir 同用时这些参数不生效（会告警）
+                           --notify-webhook 在检查模式下同样有效，只是
+                           --notify-on failure 的含义变成「有需要关注的项」
                            与 --check-updates 互斥（检查对象不同，请分开跑）
 
       --check-updates      只读检查上游有哪些 tag 不在清单里，回答「上游是不是
@@ -311,12 +315,16 @@ sync.sh —— 容器镜像同步引擎
                               不指定则完全不发送任何通知。
       --notify-type <类型>    钉钉 dingtalk / 飞书 feishu / Slack slack /
                               通用 generic，默认 auto（按 URL 自动识别）
-      --notify-on <时机>      always（默认，总是通知）或 failure（仅失败时通知）
+      --notify-on <时机>      always（默认，总是通知）或 failure（仅在有事时通知）。
+                           在 --audit / --check-updates 下，failure 表示
+                           「有落后 / 缺失 / 无法判定，或有仓库没查成」
       --notify-after-failures <N>
                               同一个镜像连续失败多少次才通知，默认 1（每次失败都通知）。
                               调大可对抗通知疲劳：上游抖动的失败重跑就好，每次都响
                               的通知很快没人看了。需要能下载历史报告（gh CLI），
-                              拿不到历史时按「连续失败 1 次」处理
+                              拿不到历史时按「连续失败 1 次」处理。
+                              **仅同步模式适用**：检查没有「连续失败」的概念，
+                              在 --audit / --check-updates 下显式传入会告警
       --history-artifact <名> 历史报告的 Artifact 名称，默认 sync-report-aliyuncs。
                               仅在 --notify-after-failures 大于 1 时使用
 
@@ -448,7 +456,7 @@ parse_args() {
         NOTIFY_ON="$2"; shift 2 ;;
       --notify-after-failures)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
-        NOTIFY_AFTER_FAILURES="$2"; shift 2 ;;
+        NOTIFY_AFTER_FAILURES="$2"; NOTIFY_AFTER_FAILURES_EXPLICIT="true"; shift 2 ;;
       --history-artifact)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         HISTORY_ARTIFACT="$2"; shift 2 ;;
@@ -1717,6 +1725,39 @@ probe_ref() {
     "$(printf '%s' "$err" | tr -d '\r' | grep -v '^[[:space:]]*$' | head -n 1 || true)"
 }
 
+# 审计状态的图标与名称。三个地方要用（控制台、Step Summary、通知），
+# 各写一份 case 早晚会漂移成一地不一致。
+audit_state_mark() {
+  case "$1" in
+    current)  printf '%s✓%s' "$C_GREEN" "$C_RESET" ;;
+    stale)    printf '%s⚠%s' "$C_YELLOW" "$C_RESET" ;;
+    missing)  printf '%s✗%s' "$C_RED" "$C_RESET" ;;
+    excluded) printf '%s⊘%s' "$C_DIM" "$C_RESET" ;;
+    *)        printf '%s?%s' "$C_YELLOW" "$C_RESET" ;;
+  esac
+}
+
+audit_state_label() {
+  case "$1" in
+    current)  printf '最新' ;;
+    stale)    printf '落后' ;;
+    missing)  printf '缺失' ;;
+    excluded) printf '已排除' ;;
+    *)        printf '无法判定' ;;
+  esac
+}
+
+# Step Summary 里用 emoji 更醒目（终端那边是单色字符 + 颜色）
+audit_state_emoji() {
+  case "$1" in
+    current)  printf '✅' ;;
+    stale)    printf '⚠️' ;;
+    missing)  printf '❌' ;;
+    excluded) printf '⊘' ;;
+    *)        printf '❓' ;;
+  esac
+}
+
 audit_result_file_for() {
   printf '%s/audit-%04d-%02d' "$WORK_DIR" "$1" "$2"
 }
@@ -1862,15 +1903,8 @@ emit_audit_summary() {
   printf '\n' >&2
   printf '%s\n' "────────────────────────────────────────────────────────" >&2
   for i in "${!A_SRC[@]}"; do
-    local mark label
-    case "${A_STATE[$i]}" in
-      current)  mark="${C_GREEN}✓${C_RESET}";  label="最新" ;;
-      stale)    mark="${C_YELLOW}⚠${C_RESET}"; label="落后" ;;
-      missing)  mark="${C_RED}✗${C_RESET}";    label="缺失" ;;
-      excluded) mark="${C_DIM}⊘${C_RESET}";    label="已排除" ;;
-      *)        mark="${C_YELLOW}?${C_RESET}"; label="无法判定" ;;
-    esac
-    printf ' %s %s  %s\n' "$mark" "$label" "${A_SRC[$i]}" >&2
+    printf ' %s %s  %s\n' "$(audit_state_mark "${A_STATE[$i]}")" \
+      "$(audit_state_label "${A_STATE[$i]}")" "${A_SRC[$i]}" >&2
     printf '   %s→ %s%s\n' "$C_DIM" "${A_DEST[$i]}" "$C_RESET" >&2
     if [[ -n "${A_NOTE[$i]}" ]]; then
       printf '   %s%s%s\n' "$C_YELLOW" "${A_NOTE[$i]}" "$C_RESET" >&2
@@ -1898,14 +1932,7 @@ emit_audit_summary() {
       echo "| 源镜像 | 目标镜像 | 状态 | 说明 |"
       echo "| --- | --- | :---: | --- |"
       for i in "${!A_SRC[@]}"; do
-        local icon="❓ 无法判定"
-        case "${A_STATE[$i]}" in
-          current)  icon="✅ 最新" ;;
-          stale)    icon="⚠️ 落后" ;;
-          missing)  icon="❌ 缺失" ;;
-          excluded) icon="⊘ 已排除" ;;
-        esac
-        echo "| \`${A_SRC[$i]}\` | \`${A_DEST[$i]}\` | ${icon} | ${A_NOTE[$i]:-—} |"
+        echo "| \`${A_SRC[$i]}\` | \`${A_DEST[$i]}\` | $(audit_state_emoji "${A_STATE[$i]}") $(audit_state_label "${A_STATE[$i]}") | ${A_NOTE[$i]:-—} |"
       done
       echo ""
       echo "**合计**：最新 ${current} · 落后 ${stale} · 缺失 ${missing} · 无法判定 ${unknown}"
@@ -1915,6 +1942,34 @@ emit_audit_summary() {
       fi
     } >> "$GITHUB_STEP_SUMMARY"
   fi
+
+  # ---- 结果通知 ----
+  # 只为「需要关注的项」列详情：全绿时一句话就够，把整张表推过去只会淹没重点。
+  # 条数封顶——清单很长时通知不该变成一篇长文，完整表格在运行页面上。
+  local detail="" listed=0 hidden=0
+  for i in "${!A_SRC[@]}"; do
+    case "${A_STATE[$i]}" in
+      current|excluded) continue ;;
+    esac
+    if [[ "$listed" -ge 20 ]]; then
+      hidden=$((hidden + 1))
+      continue
+    fi
+    if [[ -n "${A_NOTE[$i]}" ]]; then
+      detail+="- \`${A_SRC[$i]}\` **$(audit_state_label "${A_STATE[$i]}")**：${A_NOTE[$i]}"$'\n'
+    else
+      detail+="- \`${A_SRC[$i]}\` **$(audit_state_label "${A_STATE[$i]}")**"$'\n'
+    fi
+    listed=$((listed + 1))
+  done
+  if [[ "$hidden" -gt 0 ]]; then
+    detail+="- …另有 ${hidden} 条未列出（完整结果见运行页面）"$'\n'
+  fi
+
+  send_check_notification "镜像清单体检" \
+    "共检查 **${checked}** 条（镜像 × 目标）：最新 ${current} ｜ 落后 ${stale} ｜ 缺失 ${missing} ｜ 无法判定 ${unknown}" \
+    "$detail" \
+    "$((stale + missing + unknown))"
 
   # 「没查完」与「查出差异」都返回 2：让 CI 门禁不至于在检查本身都没做完时
   # 就报绿。究竟属于哪一种，报告正文里分得很清楚。
@@ -2005,6 +2060,7 @@ check_updates_all() {
   local idx repo known_tags raw rc upstream_sorted known_sorted missing missing_count shown
   local checked=0 with_updates=0 failed=0 total_missing=0
   local summary_rows=""
+  local notify_detail=""
 
   group_repos_from_manifest
 
@@ -2043,6 +2099,7 @@ check_updates_all() {
       reason="$(printf '%s' "$raw" | tr -d '\r' | grep -v '^[[:space:]]*$' | head -n 1 || true)"
       printf '  %s无法查询上游 tag 列表%s：%s\n' "$C_YELLOW" "$C_RESET" "$reason" >&2
       summary_rows+="| \`${repo}\` | ${known_tags:-—} | — | 查询失败：${reason} |"$'\n'
+      notify_detail+="- \`${repo}\` **查询失败**：${reason}"$'\n'
       continue
     fi
 
@@ -2085,6 +2142,7 @@ check_updates_all() {
     printf '    %s\n' "$shown" >&2
 
     summary_rows+="| \`${repo}\` | ${known_tags:-—} | ${missing_count} | ${shown} |"$'\n'
+    notify_detail+="- \`${repo}\` 有 **${missing_count}** 个未收录：${shown}"$'\n'
   done
 
   printf '\n' >&2
@@ -2112,6 +2170,11 @@ check_updates_all() {
       printf '%s' "$summary_rows"
     } >> "$GITHUB_STEP_SUMMARY"
   fi
+
+  send_check_notification "上游版本检查" \
+    "检查了 **${checked}** 个源仓库：${with_updates} 个有未收录的 tag（共 ${total_missing} 个），${failed} 个查询失败" \
+    "$notify_detail" \
+    "$((with_updates + failed))"
 
   # 与 --audit 同一套退出码约定：没查成与查出差异都返回 2，
   # 让 CI 门禁不至于在检查本身没做完时报绿
@@ -2344,12 +2407,94 @@ build_notify_text() {
   fi
 
   # 在 Actions 中运行时附上运行链接，便于收到通知后一键跳转排查
+  append_run_link "$text"
+}
+
+# 把一段 Markdown 文本推送到 webhook。
+#
+# 同步、审计、上游检查三条路径共用它：类型识别、JSON 组装、HTTP 调用与降级
+# 处理都只该有一份实现——分三份写，改一处忘两处是迟早的事。
+#
+# **永远返回 0**：通知是附加能力，发不出去只告警，绝不能让一次成功的运行变红。
+notify_send_text() {
+  local text="$1" title="$2"
+  local type="$NOTIFY_TYPE"
+
+  [[ -n "$NOTIFY_WEBHOOK" ]] || return 0
+
+  if [[ "$type" == "auto" ]]; then
+    type="$(detect_notify_type "$NOTIFY_WEBHOOK")"
+  fi
+
+  # 交给 jq 构造 JSON，转义由它负责，避免镜像名中的特殊字符破坏结构
+  local payload
+  case "$type" in
+    dingtalk)
+      payload="$(jq -n --arg t "$text" --arg s "$title" '{msgtype:"markdown",markdown:{title:$s,text:$t}}')" ;;
+    feishu)
+      payload="$(jq -n --arg t "$text" '{msg_type:"text",content:{text:$t}}')" ;;
+    slack|generic)
+      payload="$(jq -n --arg t "$text" '{text:$t}')" ;;
+    *)
+      log_warn "未知的通知类型：${type}（可选：dingtalk / feishu / slack / generic）"
+      return 0 ;;
+  esac
+
+  # webhook 地址本身就是凭证——知道地址就能往群里发消息，
+  # 因此日志里只记录类型与结果，绝不输出 URL。
+  # 注意不要写成 `... || printf '000'`：curl 的 -w '%{http_code}' 在连接失败时
+  # 本身就会输出 000，再补一个会拼成 000000 这种看不懂的东西。
+  local http_code
+  http_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+    -H 'Content-Type: application/json' \
+    --max-time 15 \
+    -d "$payload" "$NOTIFY_WEBHOOK" 2>/dev/null)" || true
+  http_code="${http_code:-000}"
+
+  if [[ "$http_code" =~ ^2 ]]; then
+    log_info "结果已推送到 ${type}"
+  else
+    log_warn "通知发送失败（HTTP ${http_code}），结果不受影响"
+    gh_warning "结果通知发送失败：HTTP ${http_code}"
+  fi
+
+  return 0
+}
+
+# 把 Actions 运行链接追加到通知正文末尾，便于收到通知后一键跳转排查
+append_run_link() {
+  local text="$1"
   if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
     local base="${GITHUB_SERVER_URL:-https://github.com}"
     text+=$'\n'"[查看运行详情](${base}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID})"$'\n'
   fi
-
   printf '%s' "$text"
+}
+
+# 审计 / 上游检查完成后的通知。
+#
+# 与同步路径共用发送实现，但**「要不要发」的规则不同**：
+# `--notify-on failure` 在检查模式下表示「有需要关注的项」——存在落后 / 缺失 /
+# 无法判定，或有仓库没查成。检查没有「连续失败」的概念，因此
+# `--notify-after-failures` 在这里不适用（显式传入时在参数校验阶段告警）。
+send_check_notification() {
+  local title="$1" summary="$2" detail="$3" attention="$4"
+
+  [[ -n "$NOTIFY_WEBHOOK" ]] || return 0
+
+  if [[ "$NOTIFY_ON" == "failure" && "$attention" -eq 0 ]]; then
+    log_info "本次没有需要关注的项，按 --notify-on failure 的配置跳过通知"
+    return 0
+  fi
+
+  local text="## ${title}"$'\n\n'"${summary}"$'\n'
+  if [[ -n "$detail" ]]; then
+    text+=$'\n'"${detail}"$'\n'
+  fi
+  text="$(append_run_link "$text")"
+
+  notify_send_text "$text" "$title"
+  return 0
 }
 
 send_notification() {
@@ -2392,48 +2537,20 @@ send_notification() {
     return 0
   fi
 
-  local type="$NOTIFY_TYPE"
-  if [[ "$type" == "auto" ]]; then
-    type="$(detect_notify_type "$NOTIFY_WEBHOOK")"
+  # 必须先判长度再遍历：set -u 下空数组的 "${arr[@]}" 在 bash 3.2（macOS 自带）
+  # 会报 unbound variable。CI 的 bash 5 不报，所以这个缺陷只在本地暴露——
+  # 触发条件是「同步全部成功 + 配置了 webhook + 在 macOS 上跑」，
+  # 表现为同步明明成功了脚本却以非零退出。与 collect_images 里那条注释同源。
+  if [[ ${#alert_lines[@]} -gt 0 ]]; then
+    for line in "${alert_lines[@]}"; do
+      alert_detail+="${line}"$'\n'
+    done
   fi
 
-  for line in "${alert_lines[@]}"; do
-    alert_detail+="${line}"$'\n'
-  done
-
-  local text payload
+  local text
   text="$(build_notify_text "$total" "$ok" "$skipped" "$fail" "$excluded" "$alert_detail")"
 
-  # 交给 jq 构造 JSON，转义由它负责，避免镜像名中的特殊字符破坏结构
-  case "$type" in
-    dingtalk)
-      payload="$(jq -n --arg t "$text" '{msgtype:"markdown",markdown:{title:"镜像同步完成",text:$t}}')" ;;
-    feishu)
-      payload="$(jq -n --arg t "$text" '{msg_type:"text",content:{text:$t}}')" ;;
-    slack|generic)
-      payload="$(jq -n --arg t "$text" '{text:$t}')" ;;
-    *)
-      log_warn "未知的通知类型：${type}（可选：dingtalk / feishu / slack / generic）"
-      return 0 ;;
-  esac
-
-  # webhook 地址本身就是凭证——知道地址就能往群里发消息，
-  # 因此日志里只记录类型与结果，绝不输出 URL。
-  # 注意不要写成 `... || printf '000'`：curl 的 -w '%{http_code}' 在连接失败时
-  # 本身就会输出 000，再补一个会拼成 000000 这种看不懂的东西。
-  local http_code
-  http_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
-    -H 'Content-Type: application/json' \
-    --max-time 15 \
-    -d "$payload" "$NOTIFY_WEBHOOK" 2>/dev/null)" || true
-  http_code="${http_code:-000}"
-
-  if [[ "$http_code" =~ ^2 ]]; then
-    log_info "同步结果已推送到 ${type}"
-  else
-    log_warn "通知发送失败（HTTP ${http_code}），同步结果不受影响"
-    gh_warning "同步结果通知发送失败：HTTP ${http_code}"
-  fi
+  notify_send_text "$text" "镜像同步完成"
 
   return 0
 }
@@ -2722,7 +2839,11 @@ main() {
     if [[ "$DRY_RUN" == "true" ]]; then upd_ignored+=("--dry-run"); fi
     if [[ -n "$WRITE_LOCK" ]]; then upd_ignored+=("--write-lock"); fi
     if [[ -n "$REPORT_DIR" ]]; then upd_ignored+=("--report-dir"); fi
-    if [[ -n "$NOTIFY_WEBHOOK" ]]; then upd_ignored+=("--notify-webhook"); fi
+    # --notify-webhook 在检查模式下是生效的（见 send_check_notification），
+    # 但「连续失败次数」这个概念在检查里不存在，只有同步才有
+    if [[ "$NOTIFY_AFTER_FAILURES_EXPLICIT" == "true" ]]; then
+      upd_ignored+=("--notify-after-failures")
+    fi
     if [[ "$VERIFY" == "true" ]]; then upd_ignored+=("--verify"); fi
     if [[ "$SKIP_EXISTING" == "true" ]]; then upd_ignored+=("--skip-existing"); fi
     if [[ "$STRIP_ATTESTATION" == "true" ]]; then upd_ignored+=("--strip-attestation"); fi
@@ -2751,7 +2872,10 @@ main() {
     if [[ "$DRY_RUN" == "true" ]]; then ignored+=("--dry-run"); fi
     if [[ -n "$WRITE_LOCK" ]]; then ignored+=("--write-lock"); fi
     if [[ -n "$REPORT_DIR" ]]; then ignored+=("--report-dir"); fi
-    if [[ -n "$NOTIFY_WEBHOOK" ]]; then ignored+=("--notify-webhook"); fi
+    # --notify-webhook 在审计模式下是生效的（见 send_check_notification）
+    if [[ "$NOTIFY_AFTER_FAILURES_EXPLICIT" == "true" ]]; then
+      ignored+=("--notify-after-failures")
+    fi
     if [[ "$VERIFY" == "true" ]]; then ignored+=("--verify"); fi
     if [[ "$SKIP_EXISTING" == "true" ]]; then ignored+=("--skip-existing"); fi
     if [[ ${#ignored[@]} -gt 0 ]]; then
