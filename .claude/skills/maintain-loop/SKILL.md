@@ -89,6 +89,11 @@ git status --short && git log --oneline -3
 - bash 内嵌 Markdown 反引号写在 `printf` 的**双引号**格式串里，避免 shellcheck SC2016。
 - `--dry-run` 的输出必须复述**真正会执行的参数数组**，不是拿输入重新拼一遍——两者看似一样，
   脱节时 dry-run 就失去了全部意义（丢平台缺陷长期未被发现正是因为它）。
+- **空数组的 `"${arr[@]}"` 遍历前必须判长度**。`set -u` 下 bash 3.2（macOS 自带）
+  会抛 unbound variable，bash 4.4+ 才改掉这个展开行为——而 CI 用的是 bash 5，
+  所以这类缺陷**只在本地暴露**：配了 webhook 的同步在 macOS 上表现为「同步明明
+  成功、脚本却以非零退出」。写成 `if [[ ${#arr[@]} -gt 0 ]]; then for x in "${arr[@]}"`。
+  `collect_images` 里早有同源注释，仍然漏掉了一处——改完记得全文件搜一遍遍历。
 
 ### 退出码与进程模型的硬规则（同一类问题的四个面孔）
 
