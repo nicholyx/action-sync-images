@@ -56,7 +56,7 @@ The runner sits overseas with direct access to all upstream registries. You clic
 - **Attestation handling** — a dedicated path for registries that reject OCI 1.1 empty blobs (`unknown manifest class`)
 - **Batch sync** — multiple images per run, or a manifest file for a fixed image set
 - **On-demand filtering** — pick images from the manifest with regexes instead of editing the manifest itself
-- **Multi-destination** — one run pushes to several registries (e.g. Aliyun for clusters in China, Harbor for internal archive)
+- **Multi-destination** — one run pushes to several registries (e.g. Aliyun for clusters in China, Harbor for internal archive), each choosing its own naming rule (flattened or path-preserving)
 - **Concurrency + incremental** — batch sync runs concurrently and skips images the destination already has. On scheduled re-runs, everything is usually skipped in seconds
 - **Fail-safe batching** — one failed image doesn't abort the rest; everything is summarized at the end
 - **Timeout & retries** — per-image timeouts keep one huge image from stalling the whole batch
@@ -195,6 +195,21 @@ Self-hosted Harbor supports nested paths and uses exact mode (no flattening):
 ```text
 Source: nginx:1.27  →  Dest: harbor.example.com/library/nginx:1.27
 ```
+
+**Want different rules per destination?** `--dest-keep-path` takes the same prefix-plus-path form as `--dest` but keeps the source path intact. Mix and match:
+
+```bash
+./scripts/sync.sh --file images.lock.txt \
+  -d <aliyun-prefix> \
+  --dest-keep-path harbor.example.com/mirror
+```
+
+```text
+<aliyun-prefix>/registry.k8s.io_pause:3.9              ← flattened (Aliyun personal edition has no nested paths)
+harbor.example.com/mirror/registry.k8s.io/pause:3.9    ← path preserved (Harbor supports it)
+```
+
+See [USAGE.md § scenario 14](docs/USAGE.md#场景十四一次推往两类仓库各用各的命名规则) (Chinese).
 
 ---
 

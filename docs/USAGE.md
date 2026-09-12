@@ -651,6 +651,38 @@ quay.io/coreos/flannel
 
 ---
 
+### 场景十四：一次推往两类仓库，各用各的命名规则
+
+`--dest` 使用「压平」规则（`/` → `_`），因为**阿里云 ACR 个人版不支持多级仓库路径**。但自建 Harbor 支持多级路径，而且保留原路径更符合直觉——一眼能看出上游是谁。
+
+于是「阿里云给国内集群 + Harbor 做内部归档」这个最典型的多目标场景，两边要的名字其实不一样：
+
+| 目标 | 期望的镜像名 |
+| --- | --- |
+| 阿里云 ACR | `<前缀>/registry.k8s.io_pause:3.9` |
+| 自建 Harbor | `<前缀>/registry.k8s.io/pause:3.9` |
+
+`--dest-keep-path` 就是为后者准备的——语义与 `--dest` 完全相同（前缀 + 源镜像路径），只是**保留路径结构**：
+
+```bash
+./scripts/sync.sh --file images.lock.txt \
+  -d registry.cn-shenzhen.aliyuncs.com/nicholyx \
+  --dest-keep-path harbor.example.com/mirror
+```
+
+```text
+registry.cn-shenzhen.aliyuncs.com/nicholyx/registry.k8s.io_pause:3.9   ← 压平（--dest）
+harbor.example.com/mirror/registry.k8s.io/pause:3.9                    ← 保留路径（--dest-keep-path）
+```
+
+两者可以任意混用、顺序无关，每个目标的命名**互相独立**（某个目标推送失败不影响另一个）。不确定会变成什么样，照例先跑一次 `--dry-run`。
+
+**一个边界**：仓库路径里不允许出现冒号，所以源 registry 带端口时（`localhost:5000/foo`），端口那一段会被压成下划线，结果是 `<前缀>/localhost_5000/foo`。层级结构仍然保留，只是这一段没法原样带入。
+
+另外，`--dest-keep-path` 与 `--dest-exact` 不能同时使用：前者是待拼接的前缀，后者是完整地址，混用时目标会变得含糊，因此直接报错而不是默默忽略其中一个。
+
+---
+
 ## 验证同步结果
 
 ### 在 Actions 里看

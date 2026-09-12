@@ -52,7 +52,7 @@
 - **处理 attestation** —— 专门的路径解决阿里云 ACR 拒绝 OCI 1.1 空 blob 的问题（`unknown manifest class`）
 - **批量同步** —— 一次填多个镜像，或用清单文件维护一整套镜像集合
 - **按需筛选** —— 用正则从清单里挑出这次要同步的镜像，不必为了临时筛选去改清单文件
-- **多目标同步** —— 一次运行推送到多个仓库（比如阿里云给国内集群、Harbor 做内部归档）
+- **多目标同步** —— 一次运行推送到多个仓库（比如阿里云给国内集群、Harbor 做内部归档），且每个目标可各自选择压平或保留路径
 - **并发 + 增量** —— 批量同步支持并发执行，并自动跳过目标已有的相同镜像。
   定期同步的场景下，重复运行通常几秒就跑完
 - **失败不中断** —— 批量同步时单个镜像失败不影响其余镜像，最后统一汇总
@@ -193,6 +193,21 @@ registry.k8s.io/kube-scheduler:v1.31.0
 ```text
 源：nginx:1.27  →  目标：harbor.example.com/library/nginx:1.27
 ```
+
+**多个目标想各用各的规则？** 用 `--dest-keep-path`——语义与 `--dest` 相同（前缀 + 源镜像路径），只是不压平。两者可以混用：
+
+```bash
+./scripts/sync.sh --file images.lock.txt \
+  -d <阿里云前缀> \
+  --dest-keep-path harbor.example.com/mirror
+```
+
+```text
+<阿里云前缀>/registry.k8s.io_pause:3.9                  ← 压平（阿里云个人版不支持多级路径）
+harbor.example.com/mirror/registry.k8s.io/pause:3.9     ← 保留路径（Harbor 支持）
+```
+
+详见[场景十四](docs/USAGE.md#场景十四一次推往两类仓库各用各的命名规则)。
 
 ---
 
