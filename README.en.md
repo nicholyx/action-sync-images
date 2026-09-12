@@ -64,6 +64,7 @@ The runner sits overseas with direct access to all upstream registries. You clic
 - **Result notifications** — push results to DingTalk / Lark / Slack so unattended runs aren't a blind spot
 - **Auditable** — source and destination digests are recorded; lockfiles reproduce exactly what was synced
 - **Status check** — `--audit` reports how far your registry has drifted from the manifest (current / stale / missing / unknown), pushing nothing
+- **Release check** — `--check-updates` compares upstream tags against the manifest and reports versions you haven't pinned yet
 - **Trends** — `scripts/history.sh` aggregates past reports to answer "which image keeps failing"
 - **Local reproduction** — the same logic ships as `scripts/sync.sh` with `--dry-run`
 - **Configurable destination** — change namespace or region without touching code
@@ -330,6 +331,28 @@ The manifest is the desired state, but "is my registry actually caught up?" used
 Exit code `2` means "not everything is current" (including "couldn't finish checking"), so it drops straight into a CI health check — auditing is read-only and does not violate the "syncs must be explicitly triggered" rule.
 
 Drop `--audit` and re-run the same command to fix what it found; `--skip-existing` skips whatever is already current. Full details in [USAGE.md § scenario 12](docs/USAGE.md#场景十二审计清单与目标仓库的差距) (Chinese).
+
+</details>
+
+<details>
+<summary><b>Is there a newer upstream release? (<code>--check-updates</code>)</b></summary>
+
+The manifest pins a set of images (say, one Kubernetes version). When upstream ships a new release, nothing tells you. `--check-updates` pulls the upstream tag list and diffs it against the manifest:
+
+```bash
+./scripts/sync.sh --file images.lock.txt --check-updates
+```
+
+```text
+registry.k8s.io/kube-apiserver
+  in manifest: v1.31.0
+  340 tags upstream, 12 not in the manifest; highest by version order (5):
+    v1.32.3 v1.32.2 v1.32.1 v1.31.4 v1.31.3
+```
+
+**It reports, it never edits the manifest** — which version to move to is a compatibility judgement, and that call is yours. It also does **no semver reasoning and no prerelease filtering**: upstream tag naming is often irregular (`latest`, `1.27-alpine`, `v1.32.0-rc.1`), and semver comparison would return *wrong* answers. So seeing `latest` or a tag older than your manifest is normal — this is **not an upgrade recommendation**.
+
+Only the 5 highest-by-version tags are listed by default (`--updates-limit`), but the total count is always reported. No destination needed; multiple tags from one repository are fetched once. See [USAGE.md § scenario 13](docs/USAGE.md#场景十三发现上游的新版本) (Chinese).
 
 </details>
 
