@@ -463,6 +463,7 @@ brew install skopeo regclient   # macOS
 - [x] 清单审计（`--audit`）与上游新版本发现（`--check-updates`）
 - [x] 每个目标各用各的命名规则（`--dest-keep-path`）
 
+- [x] 检查结果的通知与「仓库体检」工作流（`Check-Registry`）
 ### 计划中
 
 完整清单见 [路线图 Issue #4](https://github.com/nicholyx/action-sync-images/issues/4)——那里是面向贡献者的工作清单，每项都对应一个独立 Issue，包含背景、入手位置与验收标准。
