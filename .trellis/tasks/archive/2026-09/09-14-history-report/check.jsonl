@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/engine/index.md", "reason": "Quality Check 清单：lint、mock 验证、CI 断言本地复现、U+FFFD 扫描"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "聚合口径单一来源（共享函数）是本任务的核心复用要求，检查是否有 jq 字符串复制"}
+{"file": ".trellis/spec/workflows/index.md", "reason": "核对供应链基线未回退（SHA pin / persist-credentials / zizmor）"}

@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "history.sh 是 bash 3.2 兼容脚本，数组遍历判长度、printf 换行等硬规则适用"}
+{"file": ".trellis/spec/engine/modes.md", "reason": "检查模式语义矩阵，--check 的工作流定位文案必须与模式语义一致"}
