@@ -15,6 +15,13 @@
 
 ### 新增
 
+- **检查报告落盘**：`--audit` / `--check-updates` / `--audit-lock` 支持
+  `--report-dir`，产出与同步报告同款的 `.md` + `.json`。此前两个只读检查
+  跑完什么都不留——结果只存在于日志与 Step Summary 里，想让结果留档或给
+  别的系统消费只能截图。JSON 顶层带 `generated_at` 与汇总计数，逐条记录
+  带状态与备注；md 与 Step Summary 三方同源，不会各自漂移。
+  `Check-Registry` 体检工作流同步上传报告 Artifact（30 天保留，与同步
+  报告同一机制——这不是引入新的存储，Artifact 本来就是项目的既有约定）
 - **锁文件时效性校验**（`--audit-lock <文件>`）：只读校验 `--write-lock` 生成的
   锁文件——锁文件里每个「镜像@digest」的上游，现在还是不是锁定的那份。
   `--write-lock` 只完成了「能复现」这半件事：上游重新构建并覆盖同名 tag 时

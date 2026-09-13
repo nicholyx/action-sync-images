@@ -614,7 +614,8 @@ skopeo 在不指定 `--retry-delay` 时，等待时间随失败次数**指数增
 几条需要注意的限制：
 
 - **不能与 `--strip-attestation` 同时使用**。剔除 attestation 会重建索引，目标的平台摘要必然与源不同，审计只会给出一排**假的「落后」**。这个组合会直接报错，而不是默默给出错误结论。
-- `--dry-run` / `--write-lock` / `--report-dir` / `--notify-*` / `--verify` / `--skip-existing` 在审计模式下没有作用，显式传入时会告警。
+- `--dry-run` / `--write-lock` / `--verify` / `--skip-existing` 在审计模式下没有作用，显式传入时会告警。
+- 加 `--report-dir` 可把报告落盘（`.md` + `.json`，JSON 顶层带 `generated_at` 与汇总计数），体检工作流已自动上传为 Artifact。
 - 可与 `--filter` / `--exclude` 组合；被排除的镜像**仍会出现在报告里**并标注原因——报告里少一项，看的人会默认它是好的。
 - 看完报告要动手时，去掉 `--audit` 重跑同一条命令即可：已经最新的会被 `--skip-existing` 自动跳过。
 
@@ -659,6 +660,7 @@ quay.io/coreos/flannel
 - 单个仓库查不成不影响其他仓库，会单独报出来
 - 退出码：`0` 清单已覆盖；`2` 有未收录的 tag**或**有仓库没查成；`1` 参数错误
 - 与 `--audit` 互斥——检查对象不同（上游 vs 目标仓库），报告也是两套，请分两次运行
+- 加 `--report-dir` 可把报告落盘（`.md` + `.json`），JSON 里每个仓库一条记录，含未收录的 tag 列表
 
 ---
 
@@ -753,6 +755,7 @@ harbor.example.com/mirror/registry.k8s.io/pause:3.9                    ← 保�
 - `# [失败]` / `# [已排除]` / `# [无 digest]` 标注行（上次同步未锁上的条目）同样出现在报告里并标明类别，不会被悄悄吞掉
 - `--src` / `--file` 不能与 `--audit-lock` 同用：校验清单以锁文件为准，混进来只会让语义变含糊
 - 接进定时体检（配合 `Check-Registry` 的思路）时，锁文件校验建议每次同步前跑一次
+- 加 `--report-dir` 可把报告落盘（`.md` + `.json`），与其他检查报告同名约定
 
 ---
 

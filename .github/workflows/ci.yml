@@ -214,6 +214,33 @@ jobs:
           fi
           echo "✓ perl alarm 兜底可用（${elapsed}s 终止超时命令，参数透传正常）"
 
+      - name: 验证检查模式的报告落盘
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          rm -rf /tmp/report-smoke && mkdir -p /tmp/report-smoke
+          ./scripts/sync.sh \
+            --src "nginx:1.27" \
+            --dest registry.example.com/smoke \
+            --dry-run --report-dir /tmp/report-smoke >/dev/null 2>&1 || true
+          ./scripts/sync.sh \
+            --src "nginx:1.27" \
+            --dest registry.example.com/smoke \
+            --audit --dry-run --report-dir /tmp/report-smoke >/dev/null 2>&1 || true
+
+          # --audit 的报告必须真的落盘（dry-run 不影响审计本身，但也不该影响报告）
+          for f in audit-report.md audit-report.json; do
+            if [[ ! -s "/tmp/report-smoke/$f" ]]; then
+              echo "::error::审计报告未落盘或为空：$f"
+              exit 1
+            fi
+          done
+          # JSON 必须可解析，且顶层字段齐全
+          jq -e '.generated_at and .check == "audit" and (.records | type == "array")' \
+            /tmp/report-smoke/audit-report.json >/dev/null
+          echo "✓ 检查报告 .md 与 .json 落盘且 JSON 结构正确"
+
       - name: 验证非法参数被立即拒绝
         run: |
           #!/usr/bin/env bash
