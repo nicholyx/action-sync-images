@@ -29,6 +29,8 @@ TOP_FAILURES=10
 SLOWEST=""
 REPORT_NAME="sync-report-aliyuncs"
 REPORT_NAME_EXPLICIT="false"
+WORKFLOW_FILTER=""
+WORKFLOW_EXPLICIT="false"
 CHECK_MODE=""
 WORK_DIR=""
 
@@ -61,6 +63,10 @@ history.sh —— 从历次同步/检查报告中汇总趋势
       --limit <N>         下载最近 N 次运行的报告，默认 20（仅在下载模式下有意义）
       --report-name <名>  Artifact 名称，默认 sync-report-aliyuncs
                            （--check 模式下默认 check-report）
+      --workflow <名>     只在该工作流的运行里找报告，默认不限
+                           （--check 模式下默认 Check-Registry——体检是低频的
+                           手动触发工作流，不限工作流的话窗口会被 CI 等高频
+                           运行挤占，一份报告都捞不到）
 
 查询：
       --check <类型>      检查报告趋势，类型：audit / lock-audit。
@@ -120,6 +126,9 @@ parse_args() {
       --report-name)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         REPORT_NAME="$2"; REPORT_NAME_EXPLICIT="true"; shift 2 ;;
+      --workflow)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        WORKFLOW_FILTER="$2"; WORKFLOW_EXPLICIT="true"; shift 2 ;;
       --check)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         case "$2" in
@@ -175,6 +184,15 @@ parse_args() {
   if [[ -n "$CHECK_MODE" && "$REPORT_NAME_EXPLICIT" == "false" ]]; then
     REPORT_NAME="check-report"
   fi
+
+  # --check 只关心体检工作流的运行：不限工作流的话，最近 N 次运行几乎全是
+  # CI / Scorecard 这类高频运行，体检又只有手动触发——窗口里一份检查报告
+  # 都捞不到（这不是数据不存在，是取数范围选错了）。
+  # 同步工作流有多个名字（Sync-Images-to-Aliyuncs / Harbor / Batch），
+  # 没有唯一合理默认，保持不限、支持显式过滤
+  if [[ -n "$CHECK_MODE" && "$WORKFLOW_EXPLICIT" == "false" ]]; then
+    WORKFLOW_FILTER="Check-Registry"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -194,25 +212,42 @@ download_reports() {
 
   log_info "正在获取最近 ${LIMIT} 次运行..."
 
+  # gh run list 的参数组装：--workflow 过滤可选（--check 模式默认带上，
+  # 理由见 parse_args 末尾的注释）
+  local -a list_args=(--limit "$LIMIT" --json databaseId --jq '.[].databaseId')
+  if [[ -n "$WORKFLOW_FILTER" ]]; then
+    log_info "只看工作流「${WORKFLOW_FILTER}」的运行"
+    list_args=(--workflow "$WORKFLOW_FILTER" "${list_args[@]}")
+  fi
+
   local -a run_ids=()
   local id
   while IFS= read -r id; do
     [[ -n "$id" ]] && run_ids+=("$id")
-  done < <(gh run list --limit "$LIMIT" --json databaseId --jq '.[].databaseId' 2>/dev/null || true)
+  done < <(gh run list "${list_args[@]}" 2>/dev/null || true)
 
-  [[ ${#run_ids[@]} -gt 0 ]] || die "没有取到任何运行记录。请确认当前目录在一个 GitHub 仓库中，且 gh 已登录"
+  [[ ${#run_ids[@]} -gt 0 ]] || die "没有取到任何运行记录。请确认当前目录在一个 GitHub 仓库中，gh 已登录，且工作流「${WORKFLOW_FILTER:-}」至少跑过一次（--check 模式下这是体检工作流；也可用 --dir 指定本地报告目录）"
 
   local got=0
   for id in "${run_ids[@]}"; do
-    # 下载失败是正常的：不是每次运行都在做同步（还有 CI、Release 等工作流），
+    # 下载失败是正常的：不是每次运行都在做同步或体检，
     # 那些运行自然没有这个附件。因此这里只计数，不报错。
     if gh run download "$id" -n "$REPORT_NAME" -D "${WORK_DIR}/${id}" >/dev/null 2>&1; then
       got=$((got + 1))
     fi
   done
 
-  log_info "本次运行列表中有 ${got} 次带同步报告"
-  [[ "$got" -gt 0 ]] || die "这 ${#run_ids[@]} 次运行里没有任何「${REPORT_NAME}」附件。换一个 --report-name 或用 --dir 指定本地报告目录"
+  if [[ -n "$CHECK_MODE" ]]; then
+    log_info "本次运行列表中有 ${got} 次带检查报告"
+  else
+    log_info "本次运行列表中有 ${got} 次带同步报告"
+  fi
+  if [[ "$got" -eq 0 ]]; then
+    if [[ -n "$CHECK_MODE" ]]; then
+      die "这 ${#run_ids[@]} 次运行里没有任何「${REPORT_NAME}」附件。--check 模式取的是体检工作流（Check-Registry）的运行——请确认它至少跑过一次（Actions 页面手动触发），或用 --dir 指定本地报告目录"
+    fi
+    die "这 ${#run_ids[@]} 次运行里没有任何「${REPORT_NAME}」附件。换一个 --report-name 或 --workflow，或用 --dir 指定本地报告目录"
+  fi
 }
 
 # 收集报告文件，按报告内的生成时间排序（而不是文件系统顺序——
