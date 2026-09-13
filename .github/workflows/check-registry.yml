@@ -135,6 +135,10 @@ jobs:
             args+=(--exclude "$EXCLUDE_REGEX")
           fi
 
+          # 报告落盘并上传 Artifact，与同步工作流的报告机制对齐：
+          # 体检跑完什么都不留的话，结果只能截图或翻日志
+          args+=(--report-dir ./reports)
+
           if [[ -n "$NOTIFY_WEBHOOK" ]]; then
             args+=(--notify-webhook "$NOTIFY_WEBHOOK")
             # 体检的价值在于「出问题时才打扰」，全绿的推送很快没人看
@@ -145,3 +149,12 @@ jobs:
           # 这里**就是要让步骤失败**：页面上一眼能看出哪些仓库需要关注。
           # 绿 = 一切正常，红 = 需要看看——具体是哪一种看 Step Summary。
           ./scripts/sync.sh "${args[@]}"
+
+      - name: 上传体检报告
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: check-report
+          path: reports/
+          retention-days: 30
+          if-no-files-found: ignore

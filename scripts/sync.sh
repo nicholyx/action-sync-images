@@ -266,8 +266,8 @@ sync.sh —— 容器镜像同步引擎
                            四种状态：最新 / 落后 / 缺失 / 无法判定。
                            与 --strip-attestation 互斥：后者会重建索引，
                            目标的平台摘要必然与源不同，审计只会给出一排
-                           假的「落后」；与 --dry-run / --write-lock /
-                           --report-dir 同用时这些参数不生效（会告警）
+                           假的「落后」；与 --dry-run / --write-lock
+                           同用时这些参数不生效（会告警）
                            --notify-webhook 在检查模式下同样有效，只是
                            --notify-on failure 的含义变成「有需要关注的项」
                            与 --check-updates 互斥（检查对象不同，请分开跑）
@@ -332,7 +332,9 @@ sync.sh —— 容器镜像同步引擎
 
 输出与通知：
       --dry-run            只打印将要执行的命令，不实际推送
-      --report-dir <目录>  把同步报告写入该目录（同时生成 .md 与 .json）
+      --report-dir <目录>  把报告写入该目录（同时生成 .md 与 .json）。
+                           同步与三种检查（--audit / --check-updates /
+                           --audit-lock）均支持，文件名可区分
       --write-lock <路径>  把镜像与 digest 写成锁文件，可用于精确复现
       --regctl-version <v> 指定 regctl 版本，默认 v0.11.6
 
@@ -1967,22 +1969,33 @@ emit_audit_summary() {
     log_dim "去掉 --audit 重跑同一条命令即可补齐：已经最新的会被 --skip-existing 自动跳过"
   fi
 
+  # md 与 Step Summary、报告文件三方同源：只在这里渲染一次
+  local audit_md="## 镜像清单审计"$'\n\n'
+  audit_md+="| 源镜像 | 目标镜像 | 状态 | 说明 |"$'\n'
+  audit_md+="| --- | --- | :---: | --- |"$'\n'
+  for i in "${!A_SRC[@]}"; do
+    audit_md+="| \`${A_SRC[$i]}\` | \`${A_DEST[$i]}\` | $(audit_state_emoji "${A_STATE[$i]}") $(audit_state_label "${A_STATE[$i]}") | ${A_NOTE[$i]:-—} |"$'\n'
+  done
+  audit_md+=$'\n'"**合计**：最新 ${current} · 落后 ${stale} · 缺失 ${missing} · 无法判定 ${unknown}"$'\n'
+  if [[ "$excluded" -gt 0 ]]; then
+    audit_md+=$'\n'"> 另有 ${excluded} 条被 \`--filter\` / \`--exclude\` 排除，未参与审计。"$'\n'
+  fi
+
   if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-    {
-      echo "## 镜像清单审计"
-      echo ""
-      echo "| 源镜像 | 目标镜像 | 状态 | 说明 |"
-      echo "| --- | --- | :---: | --- |"
-      for i in "${!A_SRC[@]}"; do
-        echo "| \`${A_SRC[$i]}\` | \`${A_DEST[$i]}\` | $(audit_state_emoji "${A_STATE[$i]}") $(audit_state_label "${A_STATE[$i]}") | ${A_NOTE[$i]:-—} |"
-      done
-      echo ""
-      echo "**合计**：最新 ${current} · 落后 ${stale} · 缺失 ${missing} · 无法判定 ${unknown}"
-      if [[ "$excluded" -gt 0 ]]; then
-        echo ""
-        echo "> 另有 ${excluded} 条被 \`--filter\` / \`--exclude\` 排除，未参与审计。"
-      fi
-    } >> "$GITHUB_STEP_SUMMARY"
+    printf '%s\n' "$audit_md" >> "$GITHUB_STEP_SUMMARY"
+  fi
+
+  if [[ -n "$REPORT_DIR" ]]; then
+    local audit_records="${WORK_DIR}/records-audit.jsonl"
+    : > "$audit_records"
+    for i in "${!A_SRC[@]}"; do
+      jq -n --arg src "${A_SRC[$i]}" --arg dest "${A_DEST[$i]}" \
+        --arg state "${A_STATE[$i]}" --arg note "${A_NOTE[$i]}" \
+        '{source:$src,dest:$dest,state:$state,note:$note}' >> "$audit_records"
+    done
+    write_check_report_files "audit" "镜像清单审计" "$audit_md" \
+      "{\"current\":${current},\"stale\":${stale},\"missing\":${missing},\"unknown\":${unknown},\"excluded\":${excluded}}" \
+      "$audit_records"
   fi
 
   # ---- 结果通知 ----
@@ -2111,6 +2124,9 @@ check_updates_all() {
     return 0
   fi
 
+  local upd_records="${WORK_DIR}/records-check-updates.jsonl"
+  : > "$upd_records"
+
   log_info "检查 ${#UPD_REPOS[@]} 个源仓库的上游 tag 列表"
 
   for idx in "${!UPD_REPOS[@]}"; do
@@ -2142,6 +2158,9 @@ check_updates_all() {
       printf '  %s无法查询上游 tag 列表%s：%s\n' "$C_YELLOW" "$C_RESET" "$reason" >&2
       summary_rows+="| \`${repo}\` | ${known_tags:-—} | — | 查询失败：${reason} |"$'\n'
       notify_detail+="- \`${repo}\` **查询失败**：${reason}"$'\n'
+      jq -n --arg repo "$repo" --arg known "${known_tags}" \
+        --arg state "error" --arg tags "" --arg note "查询失败：${reason}" \
+        '{repo:$repo,in_manifest:$known,state:$state,latest_tags:$tags,note:$note}' >> "$upd_records"
       continue
     fi
 
@@ -2149,6 +2168,9 @@ check_updates_all() {
     if [[ -z "$upstream_sorted" ]]; then
       printf '  %s上游没有返回任何 tag%s\n' "$C_YELLOW" "$C_RESET" >&2
       summary_rows+="| \`${repo}\` | ${known_tags:-—} | — | 上游返回空列表 |"$'\n'
+      jq -n --arg repo "$repo" --arg known "${known_tags}" \
+        --arg state "empty" --arg tags "" --arg note "上游没有返回任何 tag" \
+        '{repo:$repo,in_manifest:$known,state:$state,latest_tags:$tags,note:$note}' >> "$upd_records"
       continue
     fi
 
@@ -2160,6 +2182,9 @@ check_updates_all() {
       printf '  %s清单已覆盖上游现有 tag（上游共 %s 个）%s\n' \
         "$C_GREEN" "$(printf '%s\n' "$upstream_sorted" | grep -c .)" "$C_RESET" >&2
       summary_rows+="| \`${repo}\` | ${known_tags:-—} | 0 | ✅ 已覆盖 |"$'\n'
+      jq -n --arg repo "$repo" --arg known "${known_tags}" \
+        --arg state "covered" --arg tags "" --arg note "" \
+        '{repo:$repo,in_manifest:$known,state:$state,latest_tags:$tags,note:$note}' >> "$upd_records"
       continue
     fi
 
@@ -2185,6 +2210,9 @@ check_updates_all() {
 
     summary_rows+="| \`${repo}\` | ${known_tags:-—} | ${missing_count} | ${shown} |"$'\n'
     notify_detail+="- \`${repo}\` 有 **${missing_count}** 个未收录：${shown}"$'\n'
+    jq -n --arg repo "$repo" --arg known "${known_tags}" \
+      --arg state "updates" --arg tags "${shown}" --arg note "" \
+      '{repo:$repo,in_manifest:$known,state:$state,latest_tags:$tags,note:$note}' >> "$upd_records"
   done
 
   printf '\n' >&2
@@ -2211,6 +2239,17 @@ check_updates_all() {
       echo "| --- | --- | :---: | --- |"
       printf '%s' "$summary_rows"
     } >> "$GITHUB_STEP_SUMMARY"
+  fi
+
+  if [[ -n "$REPORT_DIR" ]]; then
+    local upd_md="## 上游版本检查"$'\n\n'
+    upd_md+="检查了 ${checked} 个源仓库：${with_updates} 个有未收录的 tag（共 ${total_missing} 个），${failed} 个查询失败。"$'\n\n'
+    upd_md+="| 源仓库 | 清单中 | 未收录 | 版本序最大的 ${limit} 个 |"$'\n'
+    upd_md+="| --- | --- | :---: | --- |"$'\n'
+    upd_md+="${summary_rows}"
+    write_check_report_files "check-updates" "上游版本检查" "$upd_md" \
+      "{\"checked\":${checked},\"with_updates\":${with_updates},\"failed\":${failed},\"total_missing\":${total_missing}}" \
+      "$upd_records"
   fi
 
   send_check_notification "上游版本检查" \
@@ -2468,18 +2507,28 @@ emit_lock_summary() {
     log_dim "漂移的镜像可从锁文件回拉精确的旧版本：把引用中的 tag 换成 @digest 即可"
   fi
 
+  local lock_md="## 锁文件时效性校验"$'\n\n'
+  lock_md+="| 锁定条目 | 状态 | 说明 |"$'\n'
+  lock_md+="| --- | :---: | --- |"$'\n'
+  for i in "${!L_REF[@]}"; do
+    lock_md+="| \`${L_REF[$i]}\` | $(lock_state_emoji "${L_STATE[$i]}") $(lock_state_label "${L_STATE[$i]}") | ${L_NOTE[$i]:-—} |"$'\n'
+  done
+  lock_md+=$'\n'"**合计**：一致 ${match} · 漂移 ${drift} · 无法判定 ${unknown} · 未锁定 ${nodigest} · 标注 ${marker}"$'\n'
+
   if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-    {
-      echo "## 锁文件时效性校验"
-      echo ""
-      echo "| 锁定条目 | 状态 | 说明 |"
-      echo "| --- | :---: | --- |"
-      for i in "${!L_REF[@]}"; do
-        echo "| \`${L_REF[$i]}\` | $(lock_state_emoji "${L_STATE[$i]}") $(lock_state_label "${L_STATE[$i]}") | ${L_NOTE[$i]:-—} |"
-      done
-      echo ""
-      echo "**合计**：一致 ${match} · 漂移 ${drift} · 无法判定 ${unknown} · 未锁定 ${nodigest} · 标注 ${marker}"
-    } >> "$GITHUB_STEP_SUMMARY"
+    printf '%s\n' "$lock_md" >> "$GITHUB_STEP_SUMMARY"
+  fi
+
+  if [[ -n "$REPORT_DIR" ]]; then
+    local lock_records="${WORK_DIR}/records-lock-audit.jsonl"
+    : > "$lock_records"
+    for i in "${!L_REF[@]}"; do
+      jq -n --arg ref "${L_REF[$i]}" --arg state "${L_STATE[$i]}" --arg note "${L_NOTE[$i]}" \
+        '{entry:$ref,state:$state,note:$note}' >> "$lock_records"
+    done
+    write_check_report_files "lock-audit" "锁文件时效性校验" "$lock_md" \
+      "{\"match\":${match},\"drift\":${drift},\"unknown\":${unknown},\"nodigest\":${nodigest},\"marker\":${marker}}" \
+      "$lock_records"
   fi
 
   # 通知只带需要关注的条目，与 --audit 同一套克制规则
@@ -2798,6 +2847,37 @@ append_run_link() {
   fi
   printf '%s' "$text"
 }
+
+# 把检查模式的报告落盘（.md 与 .json 各一份）。
+#
+# md 与 Step Summary 同源——调用方把渲染好的同一段 markdown 传进来，
+# 两处不会各自漂移；json 顶层带 generated_at 与汇总计数，供其他系统消费
+# （history.sh 就是靠 generated_at 对齐时间的，检查报告沿用同一约定）。
+# 记录文件是 JSON Lines（每行一个对象），由调用方用 jq -n --arg 逐条写出，
+# 转义交给 jq，避免备注里的特殊字符破坏结构。
+write_check_report_files() {
+  local check_name="$1" title="$2" md_body="$3" summary_json="$4" records_file="$5"
+  local generated
+  generated="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+  mkdir -p "$REPORT_DIR"
+
+  {
+    echo "# ${title}"
+    echo ""
+    echo "- 生成时间：${generated}"
+    echo ""
+    printf '%s\n' "$md_body"
+  } > "${REPORT_DIR}/${check_name}-report.md"
+
+  jq -n --arg at "$generated" --arg name "$check_name" \
+    --slurpfile r "$records_file" \
+    '{generated_at:$at, check:$name, summary:('"${summary_json}"'), records:$r}' \
+    > "${REPORT_DIR}/${check_name}-report.json"
+
+  log_info "检查报告已写入：${REPORT_DIR}/${check_name}-report.md 与 .json"
+}
+
 
 # 审计 / 上游检查完成后的通知。
 #
@@ -3178,7 +3258,6 @@ main() {
     local -a upd_ignored=()
     if [[ "$DRY_RUN" == "true" ]]; then upd_ignored+=("--dry-run"); fi
     if [[ -n "$WRITE_LOCK" ]]; then upd_ignored+=("--write-lock"); fi
-    if [[ -n "$REPORT_DIR" ]]; then upd_ignored+=("--report-dir"); fi
     # --notify-webhook 在检查模式下是生效的（见 send_check_notification），
     # 但「连续失败次数」这个概念在检查里不存在，只有同步才有
     if [[ "$NOTIFY_AFTER_FAILURES_EXPLICIT" == "true" ]]; then
@@ -3211,7 +3290,6 @@ main() {
     local -a ignored=()
     if [[ "$DRY_RUN" == "true" ]]; then ignored+=("--dry-run"); fi
     if [[ -n "$WRITE_LOCK" ]]; then ignored+=("--write-lock"); fi
-    if [[ -n "$REPORT_DIR" ]]; then ignored+=("--report-dir"); fi
     # --notify-webhook 在审计模式下是生效的（见 send_check_notification）
     if [[ "$NOTIFY_AFTER_FAILURES_EXPLICIT" == "true" ]]; then
       ignored+=("--notify-after-failures")
@@ -3232,7 +3310,6 @@ main() {
     local -a lock_ignored=()
     if [[ "$DRY_RUN" == "true" ]]; then lock_ignored+=("--dry-run"); fi
     if [[ -n "$WRITE_LOCK" ]]; then lock_ignored+=("--write-lock"); fi
-    if [[ -n "$REPORT_DIR" ]]; then lock_ignored+=("--report-dir"); fi
     if [[ "$NOTIFY_AFTER_FAILURES_EXPLICIT" == "true" ]]; then lock_ignored+=("--notify-after-failures"); fi
     if [[ "$VERIFY" == "true" ]]; then lock_ignored+=("--verify"); fi
     if [[ "$SKIP_EXISTING" == "true" ]]; then lock_ignored+=("--skip-existing"); fi
