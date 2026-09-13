@@ -21,9 +21,11 @@ the rest conversationally.
 
 ## Status (update the checkboxes as you complete each item)
 
-- [ ] Fill backend guidelines
-- [ ] Fill frontend guidelines
-- [ ] Add code examples
+- [x] Fill guidelines —— 本项目无 frontend/backend，init 预置的模板层已删除；
+      规范按仓库实际结构回填为 engine / workflows / maintenance / guides 四个目录
+      （全部条目来自真实代码与真实事故，含出处与反模式）
+- [x] Add code examples —— 以「引用真实文件路径与符号」代替粘贴代码块
+      （spec-writing 规范优先项）
 
 ---
 
