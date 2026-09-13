@@ -825,6 +825,56 @@ jobs:
           fi
           echo "✓ 目标存在，且内容与源完全一致"
 
+      - name: 锁文件校验应识别「一致」与「上游已删除」
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 用与 --write-lock 完全相同的口径（compute_digest = 顶层 manifest
+          # digest）为当前源镜像生成一条锁定记录
+          src_digest="sha256:$(skopeo inspect --raw --tls-verify=false docker://localhost:5000/source/hello:latest | openssl dgst -sha256 | awk '{print $NF}')"
+          # 固定路径：同 job 的后续步骤要复用这份锁文件（shell 变量跨 run: 不延续）
+          lockfile="/tmp/audit-lock-match.lock"
+          {
+            echo "localhost:5000/source/hello:latest@${src_digest}"
+            echo "localhost:5000/never-existed:v1@sha256:$(printf 'na'| openssl dgst -sha256 | awk '{print $NF}')"
+          } > "$lockfile"
+
+          # 两条都在 → 第一条一致、第二条上游已删除 → 漂移，退出码 2
+          set +e
+          out="$(./scripts/sync.sh --audit-lock "$lockfile" --tls-verify false 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [[ "$code" -ne 2 ]]; then
+            echo "::error::锁文件含上游已删除的条目，应以退出码 2 结束（实际 ${code}）"
+            exit 1
+          fi
+          if ! grep -q '✓ 一致' <<<"$out"; then
+            echo "::error::与源一致的条目未被报为「一致」"
+            exit 1
+          fi
+          if ! grep -q '上游已删除该 tag' <<<"$out"; then
+            echo "::error::上游不存在的条目未被报为「漂移（上游已删除）」"
+            exit 1
+          fi
+          echo "✓ 一致与上游已删除均正确分类"
+
+          # 只留一致的那条 → 退出码 0。这条同时证明「一致」来自真实比对，
+          # 不是无脑放行
+          grep 'hello:latest@' "$lockfile" > /tmp/audit-lock-match-only.lock
+          set +e
+          out="$(./scripts/sync.sh --audit-lock /tmp/audit-lock-match-only.lock --tls-verify false 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [[ "$code" -ne 0 ]] || ! grep -q '条与锁定的一致' <<<"$out"; then
+            echo "::error::锁定的 digest 仍与上游一致时，应以退出码 0 结束（实际 ${code}）"
+            exit 1
+          fi
+          echo "✓ 锁定仍有效时报一致、退出码 0"
+
+
       - name: 再次同步应被跳过
         run: |
           #!/usr/bin/env bash
@@ -987,6 +1037,19 @@ jobs:
             exit 1
           fi
           echo "✓ 内容变化后正确重新同步"
+
+          # 同一份锁文件，上游 tag 被重新构建覆盖后应转为「漂移」——
+          # 这正是 --audit-lock 要抓的现场：锁文件没变，上游变了
+          set +e
+          out="$(./scripts/sync.sh --audit-lock /tmp/audit-lock-match-only.lock --tls-verify false 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [[ "$code" -ne 2 ]] || ! grep -q '⚠ 漂移' <<<"$out"; then
+            echo "::error::上游覆盖 tag 后，锁文件校验应报「漂移」并以退出码 2 结束（实际 ${code}）"
+            exit 1
+          fi
+          echo "✓ 上游覆盖 tag 后锁文件校验报漂移"
 
       - name: 多目标同步
         run: |
