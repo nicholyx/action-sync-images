@@ -450,6 +450,7 @@ Recent highlights:
 - ✅ v1.5: single-pull multi-destination, per-registry credential mapping
 - ✅ v1.6: manifest audit, upstream release detection, per-destination naming rules
 - ✅ v1.7: audit notifications, `Check-Registry` workflow for running checks from the web UI
+- ✅ v1.8: lockfile drift detection (`--audit-lock`), report files for all checks, macOS timeout fallback
 
 Ideas welcome — [open an issue](https://github.com/nicholyx/action-sync-images/issues/new/choose).
 
