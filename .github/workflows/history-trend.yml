@@ -1,0 +1,98 @@
+# 工作流名称
+name: History-Trend
+# 工作流运行时显示名称
+run-name: ${{ github.actor }} - 趋势查询（${{ inputs.mode }}）
+
+# 怎样触发工作流
+#
+# 只有手动触发——与同步、体检同一条克制原则：什么时候去翻历史，
+# 应该是使用者的决定，不该由项目替他做。
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '趋势类型：audit（一直落后/缺失）、lock-audit（一直在漂移）或 sync（同步失败排行）'
+        required: true
+        type: choice
+        options:
+          - audit
+          - lock-audit
+          - sync
+        default: audit
+      limit:
+        description: '往回看最近 N 次运行的报告，默认 20'
+        required: false
+        default: '20'
+      image:
+        description: '只看某个镜像/锁条目（写完整名字；留空则看排行）'
+        required: false
+        default: ''
+
+# 权限最小化：不写回仓库（contents read）；gh run list/download 读
+# Actions 的运行与 Artifact，需要 actions read
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  trend:
+    name: 趋势查询
+    runs-on: ubuntu-latest
+    env:
+      MODE: ${{ inputs.mode }}
+      LIMIT: ${{ inputs.limit }}
+      IMAGE: ${{ inputs.image }}
+      # gh CLI 认证走 env（github.token 是本次运行自带的，不是 Secret）
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout Repos
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: 执行趋势查询
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          case "$MODE" in
+            audit)      args=(--check audit) ;;
+            lock-audit) args=(--check lock-audit) ;;
+            sync)       args=() ;;
+            *)
+              echo "::error::未知的趋势类型：${MODE}（可选：audit / lock-audit / sync）"
+              exit 1
+              ;;
+          esac
+
+          args+=(--report-dir ./trend --limit "$LIMIT")
+          if [[ -n "$IMAGE" ]]; then
+            args+=(--image "$IMAGE")
+          fi
+
+          # stdout 先经 tee 留档，再写进 Step Summary——退出码 2 是合法结论
+          # （窗口内存在需要处理的记录），不能让它中断 Summary 的写入：
+          # 绿 = 没有需要处理的，红 = 有，具体看 Summary。
+          out_file="$(mktemp)"
+          set +e
+          ./scripts/history.sh "${args[@]}" | tee "$out_file"
+          code=$?
+          set -e
+
+          {
+            echo ""
+            echo "> 窗口：最近 ${LIMIT} 次运行；历史中存在需要处理的记录时本次运行为红。"
+          } >> "$out_file"
+          cat "$out_file" >> "$GITHUB_STEP_SUMMARY"
+          echo "退出码：${code}（0 = 无需处理，2 = 有需要处理的记录）"
+
+          exit "$code"
+
+      - name: 上传趋势报告
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: trend-report
+          path: trend/
+          retention-days: 30
+          if-no-files-found: ignore

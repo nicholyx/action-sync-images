@@ -32,6 +32,8 @@ REPORT_NAME_EXPLICIT="false"
 WORKFLOW_FILTER=""
 WORKFLOW_EXPLICIT="false"
 CHECK_MODE=""
+REPORT_DIR=""
+TREND_NAME=""
 WORK_DIR=""
 
 # ---------------------------------------------------------------------------
@@ -81,10 +83,16 @@ history.sh —— 从历次同步/检查报告中汇总趋势
       --slowest <N>       只看平均耗时最慢的 N 个镜像（跨运行的平均值，
                           同时给出波动范围——单次异常拉高平均时，看范围
                           就能分辨「一直慢」还是「偶尔慢」）
+      --report-dir <目录> 把本次趋势结果落盘为 .md（与 stdout 同源）与
+                          .json（generated_at / query / summary / rows，
+                          机器可读）两份文件；文件按查询模式命名
+                          （sync-trend / audit-trend / lock-audit-trend /
+                          slowest-trend）。History-Trend 工作流靠它留档
   -h, --help              显示本帮助
 
 输出：
   stdout 是 Markdown 表格，可直接粘进 Issue 或文档；日志走 stderr。
+  加 --report-dir 时同时落盘 .md 与 .json。
 
 退出码：
   0  正常（没有失败记录也算正常）
@@ -154,6 +162,9 @@ parse_args() {
       --slowest)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         SLOWEST="$2"; shift 2 ;;
+      --report-dir)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        REPORT_DIR="$2"; shift 2 ;;
       -h|--help)
         usage; exit 0 ;;
       *)
@@ -192,6 +203,17 @@ parse_args() {
   # 没有唯一合理默认，保持不限、支持显式过滤
   if [[ -n "$CHECK_MODE" && "$WORKFLOW_EXPLICIT" == "false" ]]; then
     WORKFLOW_FILTER="Check-Registry"
+  fi
+
+  # --report-dir 的产物按查询模式命名（与 sync.sh 的 <check_name>-report 同一约定）
+  if [[ "$CHECK_MODE" == "audit" ]]; then
+    TREND_NAME="audit-trend"
+  elif [[ "$CHECK_MODE" == "lock-audit" ]]; then
+    TREND_NAME="lock-audit-trend"
+  elif [[ -n "$SLOWEST" ]]; then
+    TREND_NAME="slowest-trend"
+  else
+    TREND_NAME="sync-trend"
   fi
 }
 
@@ -291,6 +313,46 @@ aggregate_by_image() {
   ' "${files[@]}"
 }
 
+# ---------------------------------------------------------------------------
+# 聚合口径（渲染与 --report-dir 落盘共用的单一来源）
+#
+# 渲染函数与落盘都要同一份数据——在这里各定义一次，调用方只消费结果。
+# 直接复制 jq 字符串会让渲染的表格与落盘的 JSON 悄悄漂移。
+# ---------------------------------------------------------------------------
+
+# 同步趋势的汇总（总览段与 json 的 summary 同源）
+sync_trend_counts() {
+  local -a files=("$@")
+  jq -s '{
+      runs: length,
+      first: (map(.generated_at) | min),
+      last: (map(.generated_at) | max),
+      total: (map(.total) | add),
+      success: (map(.success) | add),
+      skipped: (map(.skipped) | add),
+      failed: (map(.failed) | add)
+    }' "${files[@]}"
+}
+
+# 同步耗时排行（print_slowest 的数据源）
+slowest_trend_rows() {
+  local -a files=("$@")
+  jq -s --argjson n "$SLOWEST" '
+    [.[] | select(.images != null) | .images[]
+         | select(.status != "skipped" and .status != "excluded")]
+    | group_by(.source)
+    | map({
+        source: .[0].source,
+        runs: length,
+        avg: ((map(.seconds // 0) | add) / length),
+        max: (map(.seconds // 0) | max),
+        min: (map(.seconds // 0) | min)
+      })
+    | sort_by(-.avg)
+    | .[:$n]
+  ' "${files[@]}"
+}
+
 status_label() {
   case "$1" in
     success)  printf '✅' ;;
@@ -305,15 +367,7 @@ print_summary() {
   local -a files=("$@")
 
   local totals
-  totals="$(jq -s '{
-      runs: length,
-      first: (map(.generated_at) | min),
-      last: (map(.generated_at) | max),
-      total: (map(.total) | add),
-      success: (map(.success) | add),
-      skipped: (map(.skipped) | add),
-      failed: (map(.failed) | add)
-    }' "${files[@]}")"
+  totals="$(sync_trend_counts "${files[@]}")"
 
   local runs first last total ok skip fail
   runs="$(jq -r '.runs' <<<"$totals")"
@@ -376,20 +430,7 @@ print_slowest() {
   local -a files=("$@")
 
   local rows
-  rows="$(jq -s --argjson n "$SLOWEST" '
-    [.[] | select(.images != null) | .images[]
-         | select(.status != "skipped" and .status != "excluded")]
-    | group_by(.source)
-    | map({
-        source: .[0].source,
-        runs: length,
-        avg: ((map(.seconds // 0) | add) / length),
-        max: (map(.seconds // 0) | max),
-        min: (map(.seconds // 0) | min)
-      })
-    | sort_by(-.avg)
-    | .[:$n]
-  ' "${files[@]}")"
+  rows="$(slowest_trend_rows "${files[@]}")"
 
   if [[ "$(jq 'length' <<<"$rows")" -eq 0 ]]; then
     printf '没有可统计耗时的记录。\n'
@@ -468,32 +509,27 @@ lock_state_icon() {
   esac
 }
 
-# audit 趋势：镜像（源+目标）→ 各状态次数。
-#
-# 分组键是 source + dest，与同步趋势（只按 source）不同：审计的状态绑定
-# 目标仓库，「同一个源在 A 目标最新、在 B 目标落后」合并计数就丢了信息。
-print_audit_trend() {
+# audit 趋势的汇总与聚合行（渲染与落盘共用，见「聚合口径」一节的说明）
+audit_trend_counts() {
   local -a files=("$@")
+  jq -s '
+    [.[] | select(.check == "audit")]
+    | {
+        runs: length,
+        first: (map(.generated_at) | min),
+        last: (map(.generated_at) | max),
+        current: ([.[].records[] | select(.state == "current")]  | length),
+        stale:   ([.[].records[] | select(.state == "stale")]    | length),
+        missing: ([.[].records[] | select(.state == "missing")]  | length),
+        unknown: ([.[].records[] | select(.state == "unknown")]  | length),
+        excluded: ([.[].records[] | select(.state == "excluded")] | length)
+      }
+  ' "${files[@]}"
+}
 
-  # 总览段：报告份数与时间范围、按记录统计的状态累计
-  local n_reports stale_n missing_n unknown_n current_n excluded_n
-  n_reports="$(jq -s '[.[] | select(.check == "audit")] | length' "${files[@]}")"
-  local first_at last_at
-  first_at="$(jq -sr '[.[].generated_at] | min' "${files[@]}")"
-  last_at="$(jq -sr '[.[].generated_at] | max' "${files[@]}")"
-  stale_n="$(jq -s '[.[] | select(.check == "audit") | .records[] | select(.state == "stale")] | length' "${files[@]}")"
-  missing_n="$(jq -s '[.[] | select(.check == "audit") | .records[] | select(.state == "missing")] | length' "${files[@]}")"
-  unknown_n="$(jq -s '[.[] | select(.check == "audit") | .records[] | select(.state == "unknown")] | length' "${files[@]}")"
-  current_n="$(jq -s '[.[] | select(.check == "audit") | .records[] | select(.state == "current")] | length' "${files[@]}")"
-  excluded_n="$(jq -s '[.[] | select(.check == "audit") | .records[] | select(.state == "excluded")] | length' "${files[@]}")"
-
-  printf "共 **%s** 次审计，覆盖 \`%s\` ~ \`%s\`\n\n" "$n_reports" "$first_at" "$last_at"
-  printf "累计 **%s** 条记录：最新 %s ｜ 落后 %s ｜ 缺失 %s ｜ 无法判定 %s ｜ 被排除 %s\n\n" \
-    "$((stale_n + missing_n + unknown_n + current_n + excluded_n))" \
-    "$current_n" "$stale_n" "$missing_n" "$unknown_n" "$excluded_n"
-
-  local rows
-  rows="$(jq -s '
+audit_trend_rows() {
+  local -a files=("$@")
+  jq -s '
     [.[] | select(.check == "audit") | .generated_at as $at | .records[] | select(.dest != null) | . + {at: $at}]
     | group_by(.source + " " + .dest)
     | map({
@@ -507,7 +543,121 @@ print_audit_trend() {
         last_state: (max_by(.at) | .state)
       })
     | sort_by(-(.stale + .missing), .source, .dest)
-  ' "${files[@]}")"
+  ' "${files[@]}"
+}
+
+# lock-audit 趋势的汇总与聚合行（同上，渲染与落盘共用）
+lock_trend_counts() {
+  local -a files=("$@")
+  jq -s '
+    [.[] | select(.check == "lock-audit")]
+    | {
+        runs: length,
+        first: (map(.generated_at) | min),
+        last: (map(.generated_at) | max),
+        match:   ([.[].records[] | select(.state == "match")]   | length),
+        drift:   ([.[].records[] | select(.state == "drift")]   | length),
+        unknown: ([.[].records[] | select(.state == "unknown")] | length),
+        nodigest: ([.[].records[] | select(.state == "nodigest")] | length),
+        marker:  ([.[].records[] | select(.state == "marker")]  | length)
+      }
+  ' "${files[@]}"
+}
+
+lock_trend_rows() {
+  local -a files=("$@")
+  jq -s '
+    [.[] | select(.check == "lock-audit") | .generated_at as $at | .records[] | . + {at: $at}]
+    | group_by(.entry)
+    | map({
+        entry: .[0].entry,
+        match:   (map(select(.state == "match"))   | length),
+        drift:   (map(select(.state == "drift"))   | length),
+        unknown: (map(select(.state == "unknown")) | length),
+        other:   (map(select(.state != "match" and .state != "drift" and .state != "unknown")) | length),
+        total: length,
+        last_state: (max_by(.at) | .state)
+      })
+    | sort_by(-.drift, .entry)
+  ' "${files[@]}"
+}
+
+# 把本次趋势结果落盘为 json（md 已由渲染输出经 tee 写好）。
+#
+# json 顶层四字段：generated_at / query / summary / rows——与检查报告的
+# 「机器可读」同一约定。summary 与 rows 调用渲染所用的同一组聚合函数，
+# 两处不会各自漂移；query 记录本次查询参数，趋势可以复现。
+# 转义交给 jq，不用手工拼字符串。
+write_trend_report_files() {
+  local trend_name="$1"
+  shift
+  local -a files=("$@")
+
+  local mode_name counts rows
+  case "$trend_name" in
+    audit-trend)
+      mode_name="audit"
+      counts="$(audit_trend_counts "${files[@]}")"
+      rows="$(audit_trend_rows "${files[@]}")" ;;
+    lock-audit-trend)
+      mode_name="lock-audit"
+      counts="$(lock_trend_counts "${files[@]}")"
+      rows="$(lock_trend_rows "${files[@]}")" ;;
+    slowest-trend)
+      mode_name="slowest"
+      counts='{}'
+      rows="$(slowest_trend_rows "${files[@]}")" ;;
+    *)
+      mode_name="sync"
+      counts="$(sync_trend_counts "${files[@]}")"
+      rows="$(aggregate_by_image "${files[@]}")" ;;
+  esac
+
+  local query
+  query="$(jq -n \
+    --arg mode "$mode_name" --arg image "$IMAGE_FILTER" \
+    --arg workflow "$WORKFLOW_FILTER" --argjson limit "$LIMIT" \
+    --argjson top "$TOP_FAILURES" \
+    '{mode: $mode,
+      image: (if $image == "" then null else $image end),
+      workflow: (if $workflow == "" then null else $workflow end),
+      limit: $limit, top_failures: $top}')"
+
+  jq -n --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    --argjson q "$query" --argjson s "$counts" --argjson r "$rows" \
+    '{generated_at: $at, query: $q, summary: $s, rows: $r}' \
+    > "${REPORT_DIR}/${trend_name}-report.json"
+
+  log_info "趋势报告已写入：${REPORT_DIR}/${trend_name}-report.md 与 .json"
+}
+
+# audit 趋势：镜像（源+目标）→ 各状态次数。
+#
+# 分组键是 source + dest，与同步趋势（只按 source）不同：审计的状态绑定
+# 目标仓库，「同一个源在 A 目标最新、在 B 目标落后」合并计数就丢了信息。
+print_audit_trend() {
+  local -a files=("$@")
+
+  # 总览段：报告份数与时间范围、按记录统计的状态累计（口径来自共享聚合函数）
+  local counts
+  counts="$(audit_trend_counts "${files[@]}")"
+  local n_reports first_at last_at current_n stale_n missing_n unknown_n excluded_n
+  n_reports="$(jq -r '.runs' <<<"$counts")"
+  first_at="$(jq -r '.first' <<<"$counts")"
+  last_at="$(jq -r '.last' <<<"$counts")"
+  current_n="$(jq -r '.current' <<<"$counts")"
+  stale_n="$(jq -r '.stale' <<<"$counts")"
+  missing_n="$(jq -r '.missing' <<<"$counts")"
+  unknown_n="$(jq -r '.unknown' <<<"$counts")"
+  excluded_n="$(jq -r '.excluded' <<<"$counts")"
+
+  printf "共 **%s** 次审计，覆盖 \`%s\` ~ \`%s\`\n\n" "$n_reports" "$first_at" "$last_at"
+  printf "累计 **%s** 条记录：最新 %s ｜ 落后 %s ｜ 缺失 %s ｜ 无法判定 %s ｜ 被排除 %s\n\n" \
+    "$((stale_n + missing_n + unknown_n + current_n + excluded_n))" \
+    "$current_n" "$stale_n" "$missing_n" "$unknown_n" "$excluded_n"
+
+  local rows
+  rows="$(audit_trend_rows "${files[@]}")"
 
   # 全排除组合的计数要在默认视图过滤**之前**做——否则它们被 jq 丢掉后，
   # 统计行就永远凑不出来（悄悄消失会让看的人以为它同步上了）
@@ -579,17 +729,18 @@ print_audit_trend() {
 print_lock_trend() {
   local -a files=("$@")
 
-  local n_reports
-  n_reports="$(jq -s '[.[] | select(.check == "lock-audit")] | length' "${files[@]}")"
-  local first_at last_at
-  first_at="$(jq -sr '[.[].generated_at] | min' "${files[@]}")"
-  last_at="$(jq -sr '[.[].generated_at] | max' "${files[@]}")"
-  local match_n drift_n unknown_n nodigest_n marker_n
-  match_n="$(jq -s '[.[] | select(.check == "lock-audit") | .records[] | select(.state == "match")] | length' "${files[@]}")"
-  drift_n="$(jq -s '[.[] | select(.check == "lock-audit") | .records[] | select(.state == "drift")] | length' "${files[@]}")"
-  unknown_n="$(jq -s '[.[] | select(.check == "lock-audit") | .records[] | select(.state == "unknown")] | length' "${files[@]}")"
-  nodigest_n="$(jq -s '[.[] | select(.check == "lock-audit") | .records[] | select(.state == "nodigest")] | length' "${files[@]}")"
-  marker_n="$(jq -s '[.[] | select(.check == "lock-audit") | .records[] | select(.state == "marker")] | length' "${files[@]}")"
+  # 口径来自共享聚合函数（渲染与落盘同源）
+  local counts
+  counts="$(lock_trend_counts "${files[@]}")"
+  local n_reports first_at last_at match_n drift_n unknown_n nodigest_n marker_n
+  n_reports="$(jq -r '.runs' <<<"$counts")"
+  first_at="$(jq -r '.first' <<<"$counts")"
+  last_at="$(jq -r '.last' <<<"$counts")"
+  match_n="$(jq -r '.match' <<<"$counts")"
+  drift_n="$(jq -r '.drift' <<<"$counts")"
+  unknown_n="$(jq -r '.unknown' <<<"$counts")"
+  nodigest_n="$(jq -r '.nodigest' <<<"$counts")"
+  marker_n="$(jq -r '.marker' <<<"$counts")"
 
   printf "共 **%s** 次锁文件校验，覆盖 \`%s\` ~ \`%s\`\n\n" "$n_reports" "$first_at" "$last_at"
   printf "累计 **%s** 条记录：一致 %s ｜ 漂移 %s ｜ 无法判定 %s ｜ 未锁定 %s ｜ 标注行 %s\n\n" \
@@ -597,20 +748,7 @@ print_lock_trend() {
     "$match_n" "$drift_n" "$unknown_n" "$nodigest_n" "$marker_n"
 
   local rows
-  rows="$(jq -s '
-    [.[] | select(.check == "lock-audit") | .generated_at as $at | .records[] | . + {at: $at}]
-    | group_by(.entry)
-    | map({
-        entry: .[0].entry,
-        match:   (map(select(.state == "match"))   | length),
-        drift:   (map(select(.state == "drift"))   | length),
-        unknown: (map(select(.state == "unknown")) | length),
-        other:   (map(select(.state != "match" and .state != "drift" and .state != "unknown")) | length),
-        total: length,
-        last_state: (max_by(.at) | .state)
-      })
-    | sort_by(-.drift, .entry)
-  ' "${files[@]}")"
+  rows="$(lock_trend_rows "${files[@]}")"
 
   # 不参与校验条目的计数在默认视图过滤之前做，理由同 audit 的全排除组合
   local other_groups=0
@@ -698,20 +836,36 @@ main() {
   fi
 
   log_info "共读取 ${#files[@]} 份报告"
-  echo ""
 
   # --slowest 是独立的查询模式：只看耗时，不再叠加失败排行
   # --check 同理：audit 趋势 / lock 趋势 / 耗时排行，三选一
+  local -a render_cmd=()
   if [[ "$CHECK_MODE" == "audit" ]]; then
-    print_audit_trend "${files[@]}"
+    render_cmd=(print_audit_trend)
   elif [[ "$CHECK_MODE" == "lock-audit" ]]; then
-    print_lock_trend "${files[@]}"
+    render_cmd=(print_lock_trend)
   elif [[ -n "$SLOWEST" ]]; then
-    print_slowest "${files[@]}"
+    render_cmd=(print_slowest)
   else
-    print_summary "${files[@]}"
+    render_cmd=(print_summary)
   fi
-  echo ""
+
+  if [[ -n "$REPORT_DIR" ]]; then
+    mkdir -p "$REPORT_DIR"
+    # md 与 stdout 同源：首尾空行与渲染输出一起 tee 进文件（只包渲染函数
+    # 的话，stdout 的空行会丢，「同源」就成了空话）。pipefail 保证
+    # 渲染函数的退出码不会被 tee 吞掉
+    {
+      echo ""
+      "${render_cmd[@]}" "${files[@]}"
+      echo ""
+    } | tee "${REPORT_DIR}/${TREND_NAME}-report.md"
+    write_trend_report_files "$TREND_NAME" "${files[@]}"
+  else
+    echo ""
+    "${render_cmd[@]}" "${files[@]}"
+    echo ""
+  fi
 
   # 历史里有「需要处理的记录」就返回 2，便于在脚本或 CI 里据此判断。
   # 注意这是「历史中有过」，不代表本次运行失败。

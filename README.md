@@ -329,7 +329,7 @@ ALIYUNCS_REGISTRY = registry.cn-hangzhou.aliyuncs.com/your-namespace
 
 它**复用已有的报告 Artifact，不引入任何新的存储**——因此不会给仓库留下持续增长的提交历史。历史的价值在于趋势，而趋势不需要永久保存。
 
-> 💡 需要 `gh` CLI 与 `jq`。默认从 GitHub 下载报告，也可以用 `--dir` 指向本地目录离线使用。
+> 💡 需要 `gh` CLI 与 `jq`。默认从 GitHub 下载报告，也可以用 `--dir` 指向本地目录离线使用。装不了 CLI？`History-Trend` 工作流在 Actions 页面就能跑趋势，结果进 Summary 并落盘 Artifact。
 
 </details>
 
