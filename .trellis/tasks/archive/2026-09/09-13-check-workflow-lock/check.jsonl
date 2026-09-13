@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/workflows/index.md", "reason": "核对工作流改动未回退供应链基线（SHA pin / persist-credentials / zizmor 基线）"}
+{"file": ".trellis/spec/engine/index.md", "reason": "Quality Check 清单：lint.sh、断言本地复现、U+FFFD 扫描"}

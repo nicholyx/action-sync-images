@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/workflows/index.md", "reason": "改 check-registry.yml 之前必读：SHA pin、persist-credentials、env 中转 ${{ }}、YAML 结构修改用手工 Edit"}
+{"file": ".trellis/spec/engine/modes.md", "reason": "audit-lock 模式的语义（不碰目标仓库、退出码 2 含义、state 值域），工作流分支的传参必须与之一致"}

@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "history.sh 是 bash 3.2 兼容脚本，全部硬规则（空数组、printf 换行、$'\\x1f'、退出码陷阱）适用于本次新增代码"}
+{"file": ".trellis/spec/engine/modes.md", "reason": "检查模式的语义矩阵与状态值域（audit/lock-audit 的 state、退出码含义），趋势的口径必须与之对齐"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "--check 模式要复用 history.sh 既有的下载/收集/聚合机制，不另起炉灶"}
+{"file": ".trellis/spec/workflows/index.md", "reason": "CI 断言进 ci.yml 时的工作流修改规则与断言写法约束"}
