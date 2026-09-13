@@ -888,6 +888,16 @@ kubeadm init \
 
 `check-updates` 不支持趋势：未收录 tag 的增减没有趋势价值（收不收本来就要人判断），显式传入会得到参数错误。被 `--filter` / `--exclude` 排除的组合与锁文件里未锁定 digest 的条目不进趋势表，但会在表后的统计行中说明数量。
 
+### 在 Actions 页面看趋势（不用装 CLI）
+
+`History-Trend` 工作流把趋势搬到了网页上：**Actions** → 左侧选 `History-Trend` → **Run workflow**，选 `mode`（`audit` / `lock-audit` / `sync`）即可。结果渲染在运行页面的 Summary，同时落盘为 Artifact（`trend-report`，含 `.md` 与机器可读的 `.json`），供归档或给别的系统消费。
+
+与体检工作流同一套红绿灯：**绿 = 窗口内没有需要处理的记录，红 = 有**（audit 是落后 / 缺失，lock-audit 是漂移，sync 是失败）——红不是「查询失败」，是「查询有结论」。
+
+> `history.sh --report-dir <目录>` 在本地也能产出同款 `.md` + `.json`，与工作流是同一份格式约定。
+
+**趋势查询不会自动跑**。工作流只有手动触发。
+
 ---
 
 ## 在本地使用

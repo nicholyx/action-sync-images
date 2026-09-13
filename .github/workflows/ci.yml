@@ -660,6 +660,44 @@ jobs:
           fi
           echo "✓ 检查报告趋势正确"
 
+      - name: 验证 history.sh --report-dir 落盘趋势结果
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          work="$(mktemp -d)"
+
+          cat > "${work}/audit-1.json" <<'JSON'
+          {"generated_at": "2026-09-01T02:00:00Z", "check": "audit", "summary": {}, "records": [
+            {"source": "docker.io/library/nginx:1.27", "dest": "r.example.com/nginx:1.27", "state": "stale", "note": ""},
+            {"source": "registry.k8s.io/pause:3.9", "dest": "r.example.com/pause:3.9", "state": "current", "note": ""}
+          ]}
+          JSON
+
+          out_dir="${work}/out"
+          # history.sh 退出码 2 = 窗口内有需要处理的记录，是预期结果——
+          # 不关掉 errexit 会在这一步中断、吞掉全部输出
+          set +e
+          ./scripts/history.sh --check audit --dir "$work" --report-dir "$out_dir" \
+            > "${work}/stdout.md" 2>/dev/null
+          set -e
+
+          # md 与 stdout 同源——两处各自漂移就失去了「同一份结果」的意义。
+          # 用文件对比而不是命令替换：后者会剥掉结尾换行，空行差异是假阳性
+          if ! diff "${work}/stdout.md" "${out_dir}/audit-trend-report.md" >/dev/null; then
+            echo "::error::趋势 md 与 stdout 不同源"
+            exit 1
+          fi
+
+          # json 顶层四字段 + 数据一致性（summary/rows 来自与渲染相同的聚合函数）
+          jq -e '
+            .generated_at != null and
+            .query.mode == "audit" and
+            (.summary.stale == 1) and (.summary.current == 1) and
+            (.rows | length == 2)
+          ' "${out_dir}/audit-trend-report.json" >/dev/null
+          echo "✓ 趋势落盘正确（md 同源、json 字段与数据一致）"
+
       - name: 验证耗时排行
         run: |
           #!/usr/bin/env bash

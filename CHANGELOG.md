@@ -17,6 +17,13 @@
   支持 `--workflow` 过滤，`--check` 默认只看体检工作流（`Check-Registry`）的
   运行，相关提示文案也按模式区分
 ### 新增
+- **趋势结果落盘并上 Actions 页面**（`history.sh --report-dir` +
+  `History-Trend` 工作流）：趋势查询此前只有装了 CLI 的本地入口，结果只进
+  stdout——不能归档，也不能给别的系统消费。现在 `--report-dir` 把趋势落盘为
+  `.md`（与 stdout 同源）与 `.json`（`generated_at` / `query` / `summary` /
+  `rows`，机器可读）；`History-Trend` 手动工作流在 Actions 页面就能跑趋势，
+  结果进 Step Summary 并上传 Artifact，红绿与体检同一套（绿 = 窗口内没有
+  需要处理的记录）。聚合口径单一来源：渲染与落盘共用同一组聚合函数
 
 ## [1.9.0] - 2026-09-13
 
