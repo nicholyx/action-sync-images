@@ -702,11 +702,12 @@ harbor.example.com/mirror/registry.k8s.io/pause:3.9                    ← 保�
 
 | 输入 | 说明 |
 | --- | --- |
-| `mode` | `audit`：清单与目标仓库的差距；`updates`：上游与清单的差距 |
-| `lockfile` | 清单文件路径，默认 `images.lock.txt` |
+| `mode` | `audit`：清单与目标仓库的差距；`updates`：上游与清单的差距；`lock`：锁文件时效校验（上游还是锁定的那份 digest 吗） |
+| `lockfile` | 清单文件路径，默认 `images.lock.txt`（`audit` / `updates` 用） |
+| `lock_file` | 锁文件路径，默认 `images.lock.resolved.txt`（**仅 `lock` 需要**，即 `--write-lock` 的产物） |
 | `dest_registry` | 目标仓库前缀，**仅 `audit` 需要**；留空则用 `ALIYUNCS_REGISTRY` 变量或内置默认值 |
 | `updates_limit` | `updates` 模式下每个仓库最多列出几条未收录的 tag，默认 5 |
-| `filter` / `exclude` | 只看清单里的一部分镜像 |
+| `filter` / `exclude` | 只看清单里的一部分镜像（`lock` 模式不适用——校验以锁文件为准，没有筛的概念） |
 | `notify_on` | `failure`（默认，仅在有落后 / 缺失 / 无法判定时推送）或 `always` |
 
 结果渲染在运行页面的 **Summary** 里（与同步报告同样的表格）。配了 `NOTIFY_WEBHOOK` 的话，结果也会推送到群里——这样定期体检就不需要有人天天去页面看。
@@ -715,7 +716,7 @@ harbor.example.com/mirror/registry.k8s.io/pause:3.9                    ← 保�
 
 **体检不会自动跑**。工作流只有手动触发。需要定时的使用者可以 fork 后自行加一行 `schedule`——「什么时候去访问一批上游仓库」应该是你自己的决定，不是项目替你做的。
 
-> `mode=updates` 时不需要 `dest_registry`；工作流不会把它传给脚本（传了也只会得到一句「不生效」的告警）。
+> `mode=updates` 与 `mode=lock` 时不需要 `dest_registry`；工作流不会把它传给脚本（传了也只会得到一句「不生效」的告警）。`mode=lock` 同样不传 `filter` / `exclude`——锁文件校验没有筛选的概念。
 
 ### 场景十六：校验锁文件的时效性（上游还是我锁的那份吗）
 
@@ -754,7 +755,7 @@ harbor.example.com/mirror/registry.k8s.io/pause:3.9                    ← 保�
 - 锁文件里**不带 digest 的行**（手写的普通引用）会出现在报告里并标为「未锁定」，不参与判定——没有基准，校验从何谈起
 - `# [失败]` / `# [已排除]` / `# [无 digest]` 标注行（上次同步未锁上的条目）同样出现在报告里并标明类别，不会被悄悄吞掉
 - `--src` / `--file` 不能与 `--audit-lock` 同用：校验清单以锁文件为准，混进来只会让语义变含糊
-- 接进定时体检（配合 `Check-Registry` 的思路）时，锁文件校验建议每次同步前跑一次
+- 锁文件校验已接进体检工作流（`Check-Registry` 的 `mode=lock`），不用装 CLI 在 Actions 页面就能跑；建议每次同步前跑一次
 - 加 `--report-dir` 可把报告落盘（`.md` + `.json`），与其他检查报告同名约定
 
 ---
