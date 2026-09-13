@@ -12,6 +12,25 @@ description: action-sync-images 项目的维护闭环流程——规划、实现
 走完一轮再开下一轮。下面是每个阶段的操作规范，以及踩过坑之后沉淀的硬规则——**规则部分优先级最高**。
 
 > 本 skill 假设项目基建（CI、治理文件、自动化、看板）已就位。如果是**新项目**要从零落实
+
+## 与 Trellis 的关系（2026-09-13 起接入）
+
+本项目已初始化 [Trellis](https://github.com/mindfold-ai/Trellis)（`.trellis/` + 平台注入层）。
+两者的分工：
+
+- **Trellis 管「知识与任务上下文」**：编码规范在 `.trellis/spec/`（会话自动注入），
+  任务 PRD 在 `.trellis/tasks/`（`task.py create/start/finish/archive`），
+  会话记忆在 `.trellis/workspace/`（`/trellis:finish-work` 收尾时记录）
+- **本 skill 管「GitHub 侧闭环」**：Issue / 里程碑 / 看板 / PR / 发布——Trellis 不覆盖这些
+
+衔接点：
+
+- 动手前读的规范已搬到 spec（`spec/engine/`、`spec/workflows/`、`spec/maintenance/`、
+  `spec/guides/`），本 skill 保留的规则是**同一套内容的操作视角**，两边同步维护
+- 一个开发任务 = 一个 Trellis task（PRD、上下文清单）+ 一个 GitHub Issue + 一个分支 PR；
+  `/trellis:finish-work` 记录会话，Issue 关闭与 CHANGELOG 仍按本 skill 的发布流程走
+- 踩坑沉淀的去向：**代码约定** → `trellis-update-spec` 写进 `.trellis/spec/`；
+  **流程规则** → 本 skill（两者不重复收藏，交叉引用即可）
 > 开源规范，先使用 `oss-bootstrap` skill 完成搭建，再回到这里进入日常迭代。
 
 开始前，若对本项目的设计不熟，先读 `docs/ARCHITECTURE.md` 与 `docs/MAINTAINER_GUIDE.md`。
