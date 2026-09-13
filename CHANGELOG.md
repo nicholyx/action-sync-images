@@ -8,6 +8,15 @@
 ---
 
 ## [Unreleased]
+### 新增
+
+- **接入 Trellis 工程框架**：`.trellis/`（规范 / 任务 / 会话记忆）与 Claude Code
+  平台层（`.claude/` 的 trellis-* skills 与 hooks）、根目录 `AGENTS.md`。规范按本仓库
+  实际结构回填为四个目录（engine / workflows / maintenance / guides），全部条目
+  来自真实代码与真实踩坑并给出出处；init 预置的 frontend / backend 模板层
+  不适用已删除。维护循环流程规范同步沉淀进 `spec/maintenance/`，
+  maintain-loop skill 补充「与 Trellis 的关系」一节。对使用者无感知，
+  对贡献者的可见变化是：`.trellis/spec/` 是动手前应读的规范入口
 
 ## [1.8.0] - 2026-09-13
 
