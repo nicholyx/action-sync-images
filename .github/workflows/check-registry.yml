@@ -12,17 +12,22 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: '检查类型：audit（清单 vs 目标仓库）或 updates（清单 vs 上游）'
+        description: '检查类型：audit（清单 vs 目标仓库）/ updates（清单 vs 上游）/ lock（锁文件时效校验）'
         required: true
         type: choice
         options:
           - audit
           - updates
+          - lock
         default: audit
       lockfile:
         description: '镜像清单文件路径'
         required: true
         default: 'images.lock.txt'
+      lock_file:
+        description: '锁文件路径（--write-lock 的产物，仅 lock 模式需要；与上面的清单是两个文件）'
+        required: false
+        default: 'images.lock.resolved.txt'
       dest_registry:
         description: '目标仓库前缀（仅 audit 需要；留空则用 ALIYUNCS_REGISTRY 或内置默认值）'
         required: false
@@ -59,6 +64,7 @@ jobs:
     env:
       MODE: ${{ inputs.mode }}
       LOCKFILE: ${{ inputs.lockfile }}
+      LOCK_FILE: ${{ inputs.lock_file }}
       DEST_REGISTRY: ${{ inputs.dest_registry || vars.ALIYUNCS_REGISTRY || 'registry.cn-shenzhen.aliyuncs.com/nicholyx' }}
       UPDATES_LIMIT: ${{ inputs.updates_limit }}
       FILTER_REGEX: ${{ inputs.filter }}
@@ -78,7 +84,7 @@ jobs:
           persist-credentials: false
 
       # audit 要读目标的私有仓库，需要推送凭证同款的读权限；
-      # updates 只查上游，完全不碰目标，因此不必登录。
+      # updates 与 lock 只查上游，完全不碰目标，因此不必登录。
       - name: Login to Registry（仅 audit 需要）
         if: inputs.mode == 'audit'
         env:
@@ -105,13 +111,21 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
 
-          if [[ ! -f "$LOCKFILE" ]]; then
-            echo "::error::清单文件不存在：${LOCKFILE}"
+          # 清单与锁文件是两个文件：audit / updates 读清单（--file），
+          # lock 读锁文件（--audit-lock <文件>）。文件缺失在这里就报错，
+          # 不等脚本跑到一半才发现。
+          case "$MODE" in
+            lock) required_file="$LOCK_FILE"; file_label="锁文件" ;;
+            *)    required_file="$LOCKFILE";  file_label="清单文件" ;;
+          esac
+          if [[ ! -f "$required_file" ]]; then
+            echo "::error::${file_label}不存在：${required_file}"
             exit 1
           fi
 
-          # 参数按模式组装。updates 不需要目标地址——传了会被脚本告警为「不生效」，
-          # 因此这里干脆不传，保持「给什么参数就做什么事」的干净。
+          # 参数按模式组装。updates / lock 只查上游，不需要目标地址——
+          # 传了会被脚本告警为「不生效」，因此这里干脆不传，
+          # 保持「给什么参数就做什么事」的干净。
           case "$MODE" in
             audit)
               args=(--file "$LOCKFILE" --dest "$DEST_REGISTRY" --audit)
@@ -122,17 +136,25 @@ jobs:
                 args+=(--updates-limit "$UPDATES_LIMIT")
               fi
               ;;
+            lock)
+              # 锁文件时效校验：--audit-lock 直接接锁文件路径，与清单无关
+              args=(--audit-lock "$LOCK_FILE")
+              ;;
             *)
-              echo "::error::未知的检查类型：${MODE}（可选：audit / updates）"
+              echo "::error::未知的检查类型：${MODE}（可选：audit / updates / lock）"
               exit 1
               ;;
           esac
 
-          if [[ -n "$FILTER_REGEX" ]]; then
-            args+=(--filter "$FILTER_REGEX")
-          fi
-          if [[ -n "$EXCLUDE_REGEX" ]]; then
-            args+=(--exclude "$EXCLUDE_REGEX")
+          # --filter / --exclude 只作用于清单条目；lock 模式下显式传入
+          # 会被脚本告警「不生效」，因此这里对 lock 跳过
+          if [[ "$MODE" != "lock" ]]; then
+            if [[ -n "$FILTER_REGEX" ]]; then
+              args+=(--filter "$FILTER_REGEX")
+            fi
+            if [[ -n "$EXCLUDE_REGEX" ]]; then
+              args+=(--exclude "$EXCLUDE_REGEX")
+            fi
           fi
 
           # 报告落盘并上传 Artifact，与同步工作流的报告机制对齐：
@@ -145,7 +167,7 @@ jobs:
             args+=(--notify-on "$NOTIFY_ON")
           fi
 
-          # 退出码 2 = 未得出「全部最新」（有差异，或有仓库没查成）。
+          # 退出码 2 = 未得出「全部最新 / 全部一致」（有差异，或有条目没查成）。
           # 这里**就是要让步骤失败**：页面上一眼能看出哪些仓库需要关注。
           # 绿 = 一切正常，红 = 需要看看——具体是哪一种看 Step Summary。
           ./scripts/sync.sh "${args[@]}"

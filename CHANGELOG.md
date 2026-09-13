@@ -9,6 +9,11 @@
 
 ## [Unreleased]
 ### 新增
+- **体检工作流支持锁文件校验**（`Check-Registry` 的 `mode=lock`）：锁文件时效
+  校验（`--audit-lock`，v1.8.0）此前只有本地入口，现在在 Actions 页面就能跑——
+  传入锁文件路径即可，报告与其他检查一样落盘上传（`check-report` Artifact），
+  为「哪个镜像一直在漂移」的趋势积累云端数据。工作流新增 `lock_file` 输入
+  （默认 `images.lock.resolved.txt`）；`--audit-lock` 脚本侧行为零改动
 
 - **接入 Trellis 工程框架**：`.trellis/`（规范 / 任务 / 会话记忆）与 Claude Code
   平台层（`.claude/` 的 trellis-* skills 与 hooks）、根目录 `AGENTS.md`。规范按本仓库
