@@ -41,6 +41,12 @@
 
 ### 修复
 
+- **macOS 本地同步不再静默失去超时保护**：`setup_timeout` 找不到 `timeout` /
+  `gtimeout` 时（macOS 默认就没有），现在用系统自带的 perl `alarm` 兜底。
+  此前所有 macOS 本地使用者开箱即处于无保护状态——一个大镜像或网络挂起会
+  卡住整个批量任务，而这正是 `--timeout` 要防的事；警告里建议的 coreutils
+  则要求使用者为项目装系统依赖。CI 的 ubuntu 永远走不到这个分支，
+  因此冒烟测试直接测兜底机制本身
 - **配了 webhook 时，macOS 上的同步会以非零退出**：`for line in "${alert_lines[@]}"`
   在数组为空时，bash 3.2（macOS 自带）配合 `set -u` 会抛 unbound variable——
   同步明明成功了，脚本却报错退出，使用者会以为同步失败。触发条件是「全部成功 +

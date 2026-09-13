@@ -722,8 +722,12 @@ ensure_regctl() {
 # 超时包装
 #
 # GNU coreutils 提供 timeout，macOS 需要装 coreutils 才有对应的 gtimeout。
-# 两者都没有时降级为不限制超时，并给出一次提示——这比直接报错更友好，
-# 毕竟超时只是保护措施，不是功能本身。
+# 三层降级：timeout → gtimeout → perl alarm。前两层都没有是 macOS 的常态
+# （系统默认不带 coreutils），此时用系统自带的 perl 兜底——alarm 的 SIGALRM
+# 会跨 exec 保留、默认动作终止进程，恰好就是 timeout 在这里的全部用法。
+# 最后一层都没有时才降级为不限制超时，并给出一次提示——这比直接报错更友好，
+# 毕竟超时只是保护措施，不是功能本身。但在 perl 也不存在的系统上，
+# 使用者应当明确知道自己跑在无保护状态，而不是看到一句可以忽略的警告。
 # ---------------------------------------------------------------------------
 declare -a TIMEOUT_CMD=()
 
@@ -736,9 +740,11 @@ setup_timeout() {
     TIMEOUT_CMD=(timeout "$TIMEOUT")
   elif command -v gtimeout >/dev/null 2>&1; then
     TIMEOUT_CMD=(gtimeout "$TIMEOUT")
+  elif command -v perl >/dev/null 2>&1; then
+    TIMEOUT_CMD=(perl -e 'alarm shift; exec @ARGV' "$TIMEOUT")
   else
     TIMEOUT_CMD=()
-    log_warn "未找到 timeout 命令，单镜像超时保护已禁用（macOS 可 brew install coreutils）"
+    log_warn "找不到 timeout / gtimeout / perl，单镜像超时保护已禁用（macOS 可 brew install coreutils）"
   fi
 }
 
