@@ -62,6 +62,12 @@ CHECK_UPDATES="false"
 # 每个源仓库最多展示几条未收录的 tag（取版本序最大的若干条）。
 # 上游仓库动辄几百个 tag，全列出来等于没有输出。
 UPDATES_LIMIT="5"
+# 锁文件时效性校验（--audit-lock <文件>）：检查锁文件里每个「镜像@digest」
+# 的上游是否还是锁定的那份。--write-lock 只完成了「能复现」这半件事——
+# 上游完全可能重新构建并覆盖同名 tag，此时锁文件没有任何变化（它记录的
+# 是历史事实），但下一次增量同步会把新内容静默搬过去。缺的环节就是
+# 定期问一句「上游的 tag 还是我锁的那份吗」。
+AUDIT_LOCK_FILE=""
 NOTIFY_WEBHOOK=""
 NOTIFY_TYPE="auto"
 NOTIFY_ON="always"
@@ -139,6 +145,14 @@ declare -a A_SRC=()
 declare -a A_DEST=()
 declare -a A_STATE=()
 declare -a A_NOTE=()
+
+# 锁文件校验的结果数组：先由 parse_lockfile 填入解析结果（标注行与未锁定行
+# 直接带上状态），校验完成的条目由 load_lock_results 用结果文件覆盖。
+# 与审计的 A_* 分开：状态值域不同（一致/漂移/无法判定 vs 最新/落后/缺失），
+# 混用会让报告与通知的语义变含糊。
+declare -a L_REF=()
+declare -a L_STATE=()
+declare -a L_NOTE=()
 
 # ---------------------------------------------------------------------------
 # 输出辅助
@@ -269,6 +283,17 @@ sync.sh —— 容器镜像同步引擎
       --updates-limit <N>  每个仓库最多列出几条未收录的 tag，默认 5。
                            无论列出几条，总数都会给出
 
+      --audit-lock <文件>  只读校验 --write-lock 生成的锁文件：锁文件里每个
+                           「镜像@digest」的上游，现在还是不是锁定的那份。
+                           --write-lock 只完成了「能复现」这半件事——上游重新
+                           构建并覆盖同名 tag 时，锁文件不会有任何变化，而
+                           下一次增量同步会把新内容静默搬过去。
+                           三种状态：一致 / 漂移 / 无法判定；上游 tag 已删除
+                           算漂移（明确发生的变更，不是「查不到」）。
+                           锁文件中不带 digest 的行与「# [失败]」等标注行
+                           会出现在报告里并标注类别，但不参与成败判定。
+                           不需要目标地址；退出码 2 表示「有漂移或没查成」
+
 源仓库凭证（同步私有镜像时使用）：
       --src-username <名>  源仓库的用户名，需与 --src-password 同时提供
       --src-password <密>  源仓库的密码或 Token
@@ -342,6 +367,11 @@ sync.sh —— 容器镜像同步引擎
      具体是哪一类看报告正文。把「没查完」也归入 2，是为了让 CI 门禁
      不会在检查本身没做完的情况下报绿
 
+--audit-lock 模式下的退出码：
+  0  全部与锁定的一致（未锁定 digest 的条目不参与判定）
+  1  参数或环境错误
+  2  有漂移（含上游已删除的 tag），或有无法判定的项
+
 示例：
   # 同步单个镜像
   ./scripts/sync.sh -s registry.k8s.io/pause:3.9 -d registry.cn-shenzhen.aliyuncs.com/nicholyx
@@ -363,6 +393,9 @@ sync.sh —— 容器镜像同步引擎
 
   # 只看状态不动手：清单里的镜像，目标仓库现在缺哪些、哪些落后了
   ./scripts/sync.sh --file images.lock.txt -d registry.cn-shenzhen.aliyuncs.com/nicholyx --audit
+
+  # 校验锁文件的时效性：上游的 tag 还是我锁定的那份 digest 吗
+  ./scripts/sync.sh --audit-lock sync-2026-09.lock
 
   # 一次推两个目标，各用各的命名规则：阿里云压平，自建 Harbor 保留路径
   ./scripts/sync.sh --file images.lock.txt \
@@ -414,6 +447,9 @@ parse_args() {
       --updates-limit)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         UPDATES_LIMIT="$2"; shift 2 ;;
+      --audit-lock)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        AUDIT_LOCK_FILE="$2"; shift 2 ;;
       --tls-verify)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         TLS_VERIFY="$2"; shift 2 ;;
@@ -2191,6 +2227,292 @@ check_updates_all() {
 }
 
 # ---------------------------------------------------------------------------
+# 锁文件时效性校验（--audit-lock）
+#
+# --write-lock 的卖点是「digest 不会变，锁下来就能精确复现」。但这只完成了
+# 半件事：上游重新构建并覆盖同名 tag 时，锁文件不会有任何变化（它记录的
+# 是历史事实，依然「正确」），而下一次增量跳过发现源变了，会把新内容静默
+# 搬进你的仓库。等你在集群行为异常时发现，已经隔了很久。
+#
+# 这里补上缺的环节：定期问一句「上游的 tag 还是我锁的那份吗」。
+#
+# 状态三分类，沿用审计家族的原则：漂移只在「明确不一致」时下结论，
+# 查不到一律算无法判定。唯一的边界是「上游 tag 已删除」——tag 消失是
+# 明确发生的变更（registry 明确回答了「不存在」），所以算漂移而不是
+# 无法判定，并在备注里注明，与「网络原因查不到」区分开。
+# ---------------------------------------------------------------------------
+
+# 锁文件条目的状态图标与名称（报告、Step Summary、通知共用）
+lock_state_mark() {
+  case "$1" in
+    match)   printf '%s✓%s' "$C_GREEN" "$C_RESET" ;;
+    drift)   printf '%s⚠%s' "$C_YELLOW" "$C_RESET" ;;
+    unknown) printf '%s?%s' "$C_YELLOW" "$C_RESET" ;;
+    *)       printf '%s⊘%s' "$C_DIM" "$C_RESET" ;;
+  esac
+}
+
+lock_state_label() {
+  case "$1" in
+    match)   printf '一致' ;;
+    drift)   printf '漂移' ;;
+    unknown) printf '无法判定' ;;
+    nodigest) printf '未锁定' ;;
+    *)       printf '标注' ;;
+  esac
+}
+
+lock_state_emoji() {
+  case "$1" in
+    match)   printf '✅' ;;
+    drift)   printf '⚠️' ;;
+    unknown) printf '❓' ;;
+    nodigest) printf '⊘' ;;
+    *)       printf 'ℹ️' ;;
+  esac
+}
+
+# 解析锁文件为待校验条目，填入 L_* 数组。
+#
+# 标注行（「# [失败] xxx」这类）不是噪音：它们记录着上次同步时哪些镜像
+# 没锁上、为什么。审计报告里应当原样带出——悄悄吞掉的话，看报告的人
+# 会以为锁文件里只有成功的条目。
+parse_lockfile() {
+  local path="$1" line trimmed
+  L_REF=()
+  L_STATE=()
+  L_NOTE=()
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    if [[ -z "$trimmed" ]]; then
+      continue
+    fi
+
+    # 标注行：write_lockfile 写出的「# [类别] 镜像」。
+    # 其余 # 开头的是普通注释（文件头说明等），跳过。
+    if [[ "$trimmed" == "#"* ]]; then
+      if [[ "$trimmed" =~ ^#\ \[(.+)\]\ (.+)$ ]]; then
+        L_REF+=("${BASH_REMATCH[2]}")
+        L_STATE+=("marker")
+        L_NOTE+=("锁文件标注「${BASH_REMATCH[1]}」，不参与校验")
+      fi
+      continue
+    fi
+
+    # 普通条目，允许行内注释（与 --file 的读取规则一致）
+    trimmed="${trimmed%%#*}"
+    trimmed="${trimmed#"${trimmed%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    if [[ -z "$trimmed" ]]; then
+      continue
+    fi
+
+    if [[ "$trimmed" != *"@"* ]]; then
+      L_REF+=("$trimmed")
+      L_STATE+=("nodigest")
+      L_NOTE+=("未锁定 digest，无法校验时效性")
+      continue
+    fi
+
+    L_REF+=("$trimmed")
+    L_STATE+=("")
+    L_NOTE+=("")
+  done < "$path"
+
+  if [[ ${#L_REF[@]} -eq 0 ]]; then
+    die "锁文件里没有可校验的条目：${path}"
+  fi
+}
+
+lock_result_file_for() {
+  printf '%s/lock-%04d' "$WORK_DIR" "$1"
+}
+
+write_lock_result() {
+  local file="$1" ref="$2" state="$3" note="$4"
+  printf '%s%s%s%s%s\n' "$ref" "$FIELD_SEP" "$state" "$FIELD_SEP" "${note//$FIELD_SEP/ }" > "$file"
+}
+
+# 校验单个锁文件条目：上游当前 digest 是否仍与锁定的一致。
+#
+# 比对口径与 --write-lock 完全同源（都是 compute_digest 的顶层 manifest
+# digest），因此「一致」意味着的正是「当时锁的就是这份」。
+audit_lock_one() {
+  local idx="$1" entry="$2"
+  local ref="${entry%%@*}"
+  local locked="${entry#*@}"
+  local file cur probe
+
+  file="$(lock_result_file_for "$idx")"
+
+  set +e
+  cur="$(compute_digest "$ref")"
+  local cur_rc=$?
+  set -e
+
+  if [[ "$cur_rc" -eq 0 && -n "$cur" ]]; then
+    if [[ "$cur" == "$locked" ]]; then
+      write_lock_result "$file" "$entry" "match" ""
+    else
+      write_lock_result "$file" "$entry" "drift" "上游已变更：锁定 ${locked}，当前 ${cur}"
+    fi
+    return 0
+  fi
+
+  # digest 拿不到，区分「上游明确说不存在」与「查不到」：
+  # 前者是明确发生的变更（漂移），后者才是无法判定
+  probe="$(probe_ref "$ref")"
+  if [[ "$probe" == "missing" ]]; then
+    write_lock_result "$file" "$entry" "drift" "上游已删除该 tag（锁定 ${locked}）"
+  elif [[ "$probe" == unreachable* ]]; then
+    write_lock_result "$file" "$entry" "unknown" "上游无法访问：${probe#*"$FIELD_SEP"}"
+  else
+    write_lock_result "$file" "$entry" "unknown" "无法获取上游 digest（probe=${probe}）"
+  fi
+  return 0
+}
+
+# 调度全部锁文件条目。标注行与未锁定行不走子进程，直接落结果。
+dispatch_audit_lock() {
+  local i idx entry
+  local total=${#L_REF[@]}
+
+  for i in "${!L_REF[@]}"; do
+    idx=$((i + 1))
+    entry="${L_REF[$i]}"
+
+    case "${L_STATE[$i]}" in
+      marker|nodigest)
+        write_lock_result "$(lock_result_file_for "$idx")" "$entry" \
+          "${L_STATE[$i]}" "${L_NOTE[$i]}"
+        continue ;;
+    esac
+
+    if [[ "$CONCURRENCY" -gt 1 ]]; then
+      while [[ "$(jobs -pr | wc -l | tr -d ' ')" -ge "$CONCURRENCY" ]]; do
+        sleep 0.3
+      done
+      audit_lock_one "$idx" "$entry" &
+    else
+      audit_lock_one "$idx" "$entry"
+    fi
+  done
+
+  if [[ "$CONCURRENCY" -gt 1 ]]; then
+    wait || true
+  fi
+}
+
+load_lock_results() {
+  local f ref state note
+  local -a files=()
+
+  for f in "${WORK_DIR}"/lock-*; do
+    [[ -e "$f" ]] || continue
+    files+=("$f")
+  done
+
+  [[ ${#files[@]} -gt 0 ]] || return 0
+
+  # 结果文件是全集（每个条目一个），按序覆盖解析时的初始值
+  L_REF=()
+  L_STATE=()
+  L_NOTE=()
+  for f in "${files[@]}"; do
+    ref=""; state=""; note=""
+    IFS="$FIELD_SEP" read -r ref state note < "$f" || true
+    L_REF+=("${ref:-}")
+    L_STATE+=("${state:-unknown}")
+    L_NOTE+=("${note:-}")
+  done
+}
+
+emit_lock_summary() {
+  local match=0 drift=0 unknown=0 nodigest=0 marker=0 i
+
+  for i in "${!L_STATE[@]}"; do
+    case "${L_STATE[$i]}" in
+      match)   match=$((match + 1)) ;;
+      drift)   drift=$((drift + 1)) ;;
+      unknown) unknown=$((unknown + 1)) ;;
+      nodigest) nodigest=$((nodigest + 1)) ;;
+      *)       marker=$((marker + 1)) ;;
+    esac
+  done
+
+  printf '\n' >&2
+  printf '%s\n' "────────────────────────────────────────────────────────" >&2
+  for i in "${!L_REF[@]}"; do
+    printf ' %s %s  %s\n' "$(lock_state_mark "${L_STATE[$i]}")" \
+      "$(lock_state_label "${L_STATE[$i]}")" "${L_REF[$i]}" >&2
+    if [[ -n "${L_NOTE[$i]}" ]]; then
+      printf '   %s%s%s\n' "$C_YELLOW" "${L_NOTE[$i]}" "$C_RESET" >&2
+    fi
+  done
+  printf '%s\n' "────────────────────────────────────────────────────────" >&2
+
+  if [[ "$drift" -eq 0 && "$unknown" -eq 0 ]]; then
+    log_ok "锁文件校验完成：${match} 条与锁定的一致"
+  else
+    log_info "锁文件校验完成：一致 ${match} ｜ 漂移 ${drift} ｜ 无法判定 ${unknown}"
+  fi
+  if [[ "$nodigest" -gt 0 ]]; then
+    log_dim "另有 ${nodigest} 条未锁定 digest，无法校验（已列在报告里）"
+  fi
+  if [[ "$marker" -gt 0 ]]; then
+    log_dim "另有 ${marker} 条锁文件标注（上次同步未锁上的条目）"
+  fi
+  if [[ "$drift" -gt 0 ]]; then
+    log_dim "漂移的镜像可从锁文件回拉精确的旧版本：把引用中的 tag 换成 @digest 即可"
+  fi
+
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    {
+      echo "## 锁文件时效性校验"
+      echo ""
+      echo "| 锁定条目 | 状态 | 说明 |"
+      echo "| --- | :---: | --- |"
+      for i in "${!L_REF[@]}"; do
+        echo "| \`${L_REF[$i]}\` | $(lock_state_emoji "${L_STATE[$i]}") $(lock_state_label "${L_STATE[$i]}") | ${L_NOTE[$i]:-—} |"
+      done
+      echo ""
+      echo "**合计**：一致 ${match} · 漂移 ${drift} · 无法判定 ${unknown} · 未锁定 ${nodigest} · 标注 ${marker}"
+    } >> "$GITHUB_STEP_SUMMARY"
+  fi
+
+  # 通知只带需要关注的条目，与 --audit 同一套克制规则
+  local detail="" listed=0 hidden=0
+  for i in "${!L_STATE[@]}"; do
+    case "${L_STATE[$i]}" in
+      drift|unknown) ;;
+      *) continue ;;
+    esac
+    if [[ "$listed" -ge 20 ]]; then
+      hidden=$((hidden + 1))
+      continue
+    fi
+    detail+="- \`${L_REF[$i]}\` **$(lock_state_label "${L_STATE[$i]}")**：${L_NOTE[$i]}"$'\n'
+    listed=$((listed + 1))
+  done
+  if [[ "$hidden" -gt 0 ]]; then
+    detail+="- …另有 ${hidden} 条未列出（完整结果见运行页面）"$'\n'
+  fi
+
+  send_check_notification "锁文件时效性校验" \
+    "共校验 **$((match + drift + unknown))** 条：一致 ${match} ｜ 漂移 ${drift} ｜ 无法判定 ${unknown}" \
+    "$detail" \
+    "$((drift + unknown))"
+
+  if [[ "$drift" -gt 0 || "$unknown" -gt 0 ]]; then
+    return 2
+  fi
+  return 0
+}
+
+
+# ---------------------------------------------------------------------------
 # 结果汇总与报告
 # ---------------------------------------------------------------------------
 load_results() {
@@ -2778,8 +3100,8 @@ main() {
     SRC_CREDENTIALS_TMPFILE="$SRC_CREDENTIALS_FILE"
   fi
 
-  # --check-updates 只查上游 tag，不碰任何目标仓库，因此不需要目标地址
-  if [[ ${#DEST_REGISTRIES[@]} -eq 0 && -z "$DEST_EXACT" && "$CHECK_UPDATES" != "true" ]]; then
+  # --check-updates / --audit-lock 不碰目标仓库，因此不需要目标地址
+  if [[ ${#DEST_REGISTRIES[@]} -eq 0 && -z "$DEST_EXACT" && "$CHECK_UPDATES" != "true" && -z "$AUDIT_LOCK_FILE" ]]; then
     log_error "缺少必填参数：--dest 或 --dest-exact"
     echo "" >&2
     usage >&2
@@ -2834,10 +3156,22 @@ main() {
   DEST_EXACT="${DEST_EXACT#docker://}"
 
   # ---- 只读检查的参数约束 ----
-  # 两个检查的对象不同（目标仓库 vs 上游），报告也是两套，混着跑会互相淹没。
-  # 都要的话跑两次就好——这类检查本来就该是随手能跑的一条命令。
+  # 三个检查的对象不同（目标仓库 / 上游 tag 列表 / 锁文件时效），报告是三套，
+  # 混着跑会互相淹没。都要的话跑三次就好——这类检查本来就该是随手能跑的命令。
   if [[ "$AUDIT" == "true" && "$CHECK_UPDATES" == "true" ]]; then
     die "--audit 与 --check-updates 不能同时使用：前者看目标仓库与清单的差距，后者看上游与清单的差距，请分两次运行"
+  fi
+  if [[ -n "$AUDIT_LOCK_FILE" && "$CHECK_UPDATES" == "true" ]]; then
+    die "--audit-lock 与 --check-updates 不能同时使用：前者校验锁定的 digest 是否仍然有效，后者列举上游未收录的 tag，请分两次运行"
+  fi
+  if [[ -n "$AUDIT_LOCK_FILE" && "$AUDIT" == "true" ]]; then
+    die "--audit-lock 与 --audit 不能同时使用：前者以锁文件为基准查上游，后者以源镜像为基准查目标仓库，请分两次运行"
+  fi
+
+  # --audit-lock 自带条目来源，不允许再混入 --src / --file，否则「校验哪些」
+  # 变成两份清单的并集，语义只能靠猜
+  if [[ -n "$AUDIT_LOCK_FILE" && ( ${#SOURCE_IMAGES[@]} -gt 0 || ${#SOURCE_FILES[@]} -gt 0 ) ]]; then
+    die "--audit-lock 自带校验清单，不要再同时使用 --src / --file"
   fi
 
   if [[ "$CHECK_UPDATES" == "true" ]]; then
@@ -2889,6 +3223,28 @@ main() {
     fi
   fi
 
+  # ---- 锁文件校验的参数约束 ----
+  if [[ -n "$AUDIT_LOCK_FILE" ]]; then
+    if [[ ! -f "$AUDIT_LOCK_FILE" ]]; then
+      die "锁文件不存在：${AUDIT_LOCK_FILE}"
+    fi
+
+    local -a lock_ignored=()
+    if [[ "$DRY_RUN" == "true" ]]; then lock_ignored+=("--dry-run"); fi
+    if [[ -n "$WRITE_LOCK" ]]; then lock_ignored+=("--write-lock"); fi
+    if [[ -n "$REPORT_DIR" ]]; then lock_ignored+=("--report-dir"); fi
+    if [[ "$NOTIFY_AFTER_FAILURES_EXPLICIT" == "true" ]]; then lock_ignored+=("--notify-after-failures"); fi
+    if [[ "$VERIFY" == "true" ]]; then lock_ignored+=("--verify"); fi
+    if [[ "$SKIP_EXISTING" == "true" ]]; then lock_ignored+=("--skip-existing"); fi
+    if [[ "$STRIP_ATTESTATION" == "true" ]]; then lock_ignored+=("--strip-attestation"); fi
+    if [[ -n "$FILTER_REGEX" || -n "$EXCLUDE_REGEX" ]]; then lock_ignored+=("--filter / --exclude"); fi
+    if [[ ${#DEST_REGISTRIES[@]} -gt 0 ]]; then lock_ignored+=("目标地址（--dest / --dest-keep-path）"); fi
+    if [[ -n "$DEST_EXACT" ]]; then lock_ignored+=("--dest-exact"); fi
+    if [[ ${#lock_ignored[@]} -gt 0 ]]; then
+      log_warn "--audit-lock 只校验锁文件，以下参数本次不生效：${lock_ignored[*]}"
+    fi
+  fi
+
   ensure_skopeo
   ensure_jq
   setup_timeout
@@ -2899,10 +3255,20 @@ main() {
     log_warn "dry-run 模式：只打印命令，不会推送任何镜像"
   fi
 
-  collect_images
-  # 筛选放在 collect_images 之后、其余校验之前：
-  # --dest-exact 要求「只有一个源镜像」，而筛选后的数量才是有意义的数量
-  apply_filters
+  if [[ -n "$AUDIT_LOCK_FILE" ]]; then
+    # 锁文件校验自带条目来源。SOURCE_IMAGES 也从锁文件填充：
+    # 私有上游的凭证要从里面推导 host，走的是同一条装载路径
+    parse_lockfile "$AUDIT_LOCK_FILE"
+    local li
+    for li in "${!L_REF[@]}"; do
+      SOURCE_IMAGES+=("${L_REF[$li]%%@*}")
+    done
+  else
+    collect_images
+    # 筛选放在 collect_images 之后、其余校验之前：
+    # --dest-exact 要求「只有一个源镜像」，而筛选后的数量才是有意义的数量
+    apply_filters
+  fi
   # 凭证依赖最终的镜像列表（未指定 --src-registry 时要从里面推导 host），
   # 因此放在筛选之后——被筛掉的镜像不该影响凭证要发给谁
   setup_src_auth
@@ -2912,7 +3278,7 @@ main() {
   local active_count
   active_count=$((${#SOURCE_IMAGES[@]} - FILTERED_OUT_COUNT))
 
-  if [[ -n "$DEST_EXACT" && "$active_count" -gt 1 && "$CHECK_UPDATES" != "true" ]]; then
+  if [[ -n "$DEST_EXACT" && "$active_count" -gt 1 && "$CHECK_UPDATES" != "true" && -z "$AUDIT_LOCK_FILE" ]]; then
     die "--dest-exact 只能搭配单个源镜像使用（当前提供了 ${active_count} 个）；批量同步请改用 --dest 前缀模式"
   fi
 
@@ -2947,6 +3313,8 @@ main() {
 
   if [[ "$CHECK_UPDATES" == "true" ]]; then
     log_info "待检查镜像 ${total} 个（只查上游 tag，不需要目标地址）"
+  elif [[ -n "$AUDIT_LOCK_FILE" ]]; then
+    log_info "待校验锁文件条目 ${total} 个（${AUDIT_LOCK_FILE}）"
   elif [[ -n "$DEST_EXACT" ]]; then
     log_info "待${action}镜像 ${total} 个 → ${DEST_EXACT}"
   else
@@ -2966,7 +3334,9 @@ main() {
 
   local start end check_rc=0
   start="$(date +%s)"
-  if [[ "$AUDIT" == "true" ]]; then
+  if [[ -n "$AUDIT_LOCK_FILE" ]]; then
+    dispatch_audit_lock
+  elif [[ "$AUDIT" == "true" ]]; then
     dispatch_audit
   elif [[ "$CHECK_UPDATES" == "true" ]]; then
     # 接住退出码再放行：set -e 下它会直接结束脚本，连总耗时都打不出来
@@ -2980,7 +3350,12 @@ main() {
   end="$(date +%s)"
   log_info "总耗时：$((end - start)) 秒"
 
-  # 三种模式的报告是分开的：状态值域不同，汇总方式与退出码也不同
+  # 各模式的报告是分开的：状态值域不同，汇总方式与退出码也不同
+  if [[ -n "$AUDIT_LOCK_FILE" ]]; then
+    load_lock_results
+    emit_lock_summary
+    return $?
+  fi
   if [[ "$AUDIT" == "true" ]]; then
     load_audit_results
     emit_audit_summary
