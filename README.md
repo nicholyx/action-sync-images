@@ -65,7 +65,7 @@
 - **锁文件可校验** —— `--audit-lock` 定期确认上游的 tag 还是你锁定的那份 digest，上游悄悄覆盖 tag 时第一时间知道
 - **网页上就能体检** —— `Check-Registry` 工作流一键跑上面两项检查，不用装任何工具，结果进运行页面的 Summary 并可推送通知
 - **结果一目了然** —— 运行结束直接生成结果表格，无需翻日志
-- **可看趋势** —— `scripts/history.sh` 汇总历次报告，回答「哪个镜像总在失败」
+- **可看趋势** —— `scripts/history.sh` 汇总历次报告，回答「哪个镜像总在失败」「哪个镜像一直落后 / 一直在漂移」
 - **可在本地复现** —— 同一套逻辑封装成 `scripts/sync.sh`，本地也能跑，支持 `--dry-run`
 - **目标仓库可配置** —— 换命名空间或区域不需要改代码
 - **静态检查齐全** —— actionlint + yamllint + shellcheck + 提交信息规范，`./scripts/lint.sh` 一键跑完
@@ -308,6 +308,12 @@ ALIYUNCS_REGISTRY = registry.cn-hangzhou.aliyuncs.com/your-namespace
 
 # 失败最多的 5 个镜像
 ./scripts/history.sh --top-failures 5
+
+# 哪个镜像一直落后 / 一直缺失（检查报告趋势）
+./scripts/history.sh --check audit
+
+# 哪个锁条目一直在漂移
+./scripts/history.sh --check lock-audit
 ```
 
 输出是 Markdown 表格，可以直接贴进 Issue：

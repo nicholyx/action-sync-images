@@ -497,6 +497,169 @@ jobs:
           fi
           echo "✓ 查询模式正确"
 
+      - name: 验证 history.sh --check 聚合检查报告趋势
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          work="$(mktemp -d)"
+
+          # 伪造检查报告 fixture：聚合逻辑是纯函数（jq + bash），给它合法输入
+          # 断言输出即可；报告本身的落盘真实性由上面的「检查模式的报告落盘」
+          # 步骤负责。混放 sync / check-updates 报告，验证按顶层 .check 字段过滤。
+          cat > "${work}/audit-1.json" <<'JSON'
+          {"generated_at": "2026-09-01T02:00:00Z", "check": "audit", "summary": {}, "records": [
+            {"source": "docker.io/library/nginx:1.27", "dest": "r.example.com/nginx:1.27", "state": "stale", "note": ""},
+            {"source": "registry.k8s.io/pause:3.9", "dest": "r.example.com/pause:3.9", "state": "current", "note": ""},
+            {"source": "quay.io/flux/source-controller", "dest": "r.example.com/flux:1.0", "state": "missing", "note": ""}
+          ]}
+          JSON
+          cat > "${work}/audit-2.json" <<'JSON'
+          {"generated_at": "2026-09-05T02:00:00Z", "check": "audit", "summary": {}, "records": [
+            {"source": "docker.io/library/nginx:1.27", "dest": "r.example.com/nginx:1.27", "state": "stale", "note": ""},
+            {"source": "registry.k8s.io/pause:3.9", "dest": "r.example.com/pause:3.9", "state": "current", "note": ""},
+            {"source": "quay.io/flux/source-controller", "dest": "r.example.com/flux:1.0", "state": "missing", "note": ""}
+          ]}
+          JSON
+          cat > "${work}/lock-1.json" <<'JSON'
+          {"generated_at": "2026-09-02T02:00:00Z", "check": "lock-audit", "summary": {}, "records": [
+            {"entry": "registry.k8s.io/pause:3.9@sha256:013b", "state": "match", "note": ""},
+            {"entry": "docker.io/library/nginx:1.27@sha256:dddd", "state": "drift", "note": "上游已变更"},
+            {"entry": "docker.io/library/redis:7", "state": "nodigest", "note": "未锁定 digest"}
+          ]}
+          JSON
+          # 干扰文件：同步报告（无 check 字段）与 check-updates 报告（不参与趋势）
+          cat > "${work}/sync-report.json" <<'JSON'
+          {"generated_at": "2026-09-03T02:00:00Z", "total": 1, "success": 1, "skipped": 0, "failed": 0, "excluded": 0,
+           "images": [{"source": "docker.io/library/nginx:1.27", "dest": "r.example.com/nginx:1.27", "status": "success", "seconds": 3}]}
+          JSON
+          cat > "${work}/check-updates-report.json" <<'JSON'
+          {"generated_at": "2026-09-04T02:00:00Z", "check": "check-updates", "summary": {}, "records": [
+            {"repo": "docker.io/library/nginx:1.27", "in_manifest": "1", "state": "covered", "latest_tags": "", "note": ""}
+          ]}
+          JSON
+
+          echo "=== audit 趋势 ==="
+          set +e
+          out="$(./scripts/history.sh --check audit --dir "$work" 2>/dev/null)"
+          code=$?
+          set -e
+          echo "$out"
+
+          # 累计应为 6 条（2 份报告 × 3 条）——同步与 check-updates 的干扰文件被过滤
+          if ! grep -q '累计 \*\*6\*\* 条记录' <<<"$out"; then
+            echo "::error::--check audit 的累计统计不正确（混放过滤可能失效）"
+            exit 1
+          fi
+
+          # 一直落后的镜像在表中，且「最近一次」图标正确
+          if ! grep -q 'docker.io/library/nginx:1.27.*⚠️' <<<"$out"; then
+            echo "::error::--check audit 未列出一直落后的镜像"
+            exit 1
+          fi
+          # 一直缺失的镜像在表中（✗ 图标行，而非只匹配表头文字）
+          if ! grep -q 'quay.io/flux/source-controller.*✗' <<<"$out"; then
+            echo "::error::--check audit 未列出一直缺失的镜像"
+            exit 1
+          fi
+          # 全最新的镜像不该占榜单
+          if grep -q '^| .*registry.k8s.io/pause' <<<"$out"; then
+            echo "::error::--check audit 的榜单不应包含全最新的镜像"
+            exit 1
+          fi
+
+          # 历史中有确定异常（落后/缺失）即退出码 2
+          if [[ "$code" -ne 2 ]]; then
+            echo "::error::存在落后/缺失时应以退出码 2 结束，实际 ${code}"
+            exit 1
+          fi
+
+          echo "=== lock-audit 趋势 ==="
+          set +e
+          out="$(./scripts/history.sh --check lock-audit --dir "$work" 2>/dev/null)"
+          code=$?
+          set -e
+          echo "$out"
+
+          if ! grep -q 'docker.io/library/nginx:1.27@sha256:dddd.*⚠️' <<<"$out"; then
+            echo "::error::--check lock-audit 未列出一直在漂移的条目"
+            exit 1
+          fi
+          # 未锁定 digest 的条目不进表但要有统计行——悄悄吞掉等于假装锁文件很干净
+          if grep -q '^| .*docker.io/library/redis:7' <<<"$out"; then
+            echo "::error::未锁定 digest 的条目不应出现在趋势表中"
+            exit 1
+          fi
+          if ! grep -q '不参与趋势' <<<"$out"; then
+            echo "::error::--check lock-audit 缺少不参与校验条目的统计行"
+            exit 1
+          fi
+          if [[ "$code" -ne 2 ]]; then
+            echo "::error::存在漂移时应以退出码 2 结束，实际 ${code}"
+            exit 1
+          fi
+
+          echo "=== 空态与参数校验 ==="
+          # 全最新的窗口：退出码 0
+          clean="$(mktemp -d)"
+          cat > "${clean}/audit-1.json" <<'JSON'
+          {"generated_at": "2026-09-01T02:00:00Z", "check": "audit", "summary": {}, "records": [
+            {"source": "docker.io/library/nginx:1.27", "dest": "r.example.com/nginx:1.27", "state": "current", "note": ""}
+          ]}
+          JSON
+          set +e
+          ./scripts/history.sh --check audit --dir "$clean" >/dev/null 2>&1
+          code=$?
+          set -e
+          if [[ "$code" -ne 0 ]]; then
+            echo "::error::窗口内全最新时应以退出码 0 结束，实际 ${code}"
+            exit 1
+          fi
+
+          # 无法判定不触发退出码 2（查不成不等于出问题）
+          unk="$(mktemp -d)"
+          cat > "${unk}/audit-1.json" <<'JSON'
+          {"generated_at": "2026-09-01T02:00:00Z", "check": "audit", "summary": {}, "records": [
+            {"source": "quay.io/private/app:1.0", "dest": "r.example.com/app:1.0", "state": "unknown", "note": "上游无法访问"}
+          ]}
+          JSON
+          set +e
+          ./scripts/history.sh --check audit --dir "$unk" >/dev/null 2>&1
+          code=$?
+          set -e
+          if [[ "$code" -ne 0 ]]; then
+            echo "::error::仅存在无法判定时不应触发退出码 2，实际 ${code}"
+            exit 1
+          fi
+
+          # check-updates 明确不支持
+          set +e
+          msg="$(./scripts/history.sh --check check-updates --dir "$work" 2>&1)"
+          code=$?
+          set -e
+          if [[ "$code" -ne 1 ]] || ! grep -q '不支持 check-updates' <<<"$msg"; then
+            echo "::error::--check check-updates 应报参数错误退出 1"
+            exit 1
+          fi
+
+          # 无匹配报告
+          set +e
+          ./scripts/history.sh --check audit --dir "$unk/no-such-sub" >/dev/null 2>&1
+          code=$?
+          set -e
+          if [[ "$code" -ne 1 ]]; then
+            echo "::error::目录不存在时应报错退出 1，实际 ${code}"
+            exit 1
+          fi
+
+          # --image 查不到时给出明确提示
+          out="$(./scripts/history.sh --check audit --dir "$work" --image no-such:1.0 2>/dev/null || true)"
+          if ! grep -q '没有找到源镜像' <<<"$out"; then
+            echo "::error::--check 模式 --image 查不到时应给出明确提示"
+            exit 1
+          fi
+          echo "✓ 检查报告趋势正确"
+
       - name: 验证耗时排行
         run: |
           #!/usr/bin/env bash
