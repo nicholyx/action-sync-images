@@ -194,6 +194,26 @@ jobs:
           fi
           echo "✓ 并发同步执行完毕，结果顺序与输入一致"
 
+          # perl 兜底是 macOS 的唯一防线（系统默认没有 timeout/gtimeout），
+          # ubuntu 上走不到那个分支，所以直接测兜底机制本身：alarm 应在 2 秒
+          # 内终止 sleep 10（SIGALRM 默认退出码 142），正常命令与参数透传不受影响
+          start="$(date +%s)"
+          if perl -e 'alarm shift; exec @ARGV' 2 sleep 10 2>/dev/null; then
+            echo "::error::perl alarm 未终止超时命令"
+            exit 1
+          fi
+          elapsed=$(( $(date +%s) - start ))
+          if [[ "$elapsed" -ge 9 ]]; then
+            echo "::error::perl alarm 未在超时点终止命令（耗时 ${elapsed}s）"
+            exit 1
+          fi
+          out="$(perl -e 'alarm shift; exec @ARGV' 5 printf '%s-%s\n' arg1 arg2)"
+          if [[ "$out" != "arg1-arg2" ]]; then
+            echo "::error::perl 兜底下参数透传异常：${out}"
+            exit 1
+          fi
+          echo "✓ perl alarm 兜底可用（${elapsed}s 终止超时命令，参数透传正常）"
+
       - name: 验证非法参数被立即拒绝
         run: |
           #!/usr/bin/env bash
