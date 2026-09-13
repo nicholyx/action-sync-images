@@ -9,6 +9,11 @@
 
 ## [Unreleased]
 ### 新增
+
+## [1.9.0] - 2026-09-13
+
+本轮把审计数据用起来：锁文件时效校验有了云端入口，检查报告能聚合趋势——「哪个镜像一直落后 / 一直在漂移」从单次报告里的猜测，变成窗口内可回答的问题。
+
 - **检查报告的趋势查询**（`history.sh --check audit` / `--check lock-audit`）：
   把历次检查报告摊在一起，回答「哪个镜像一直落后 / 一直缺失」「哪个锁条目
   一直在漂移」——单次报告只讲「这一次」，而漂移和落后恰恰要看「是不是一直」。
@@ -22,7 +27,6 @@
   传入锁文件路径即可，报告与其他检查一样落盘上传（`check-report` Artifact），
   为「哪个镜像一直在漂移」的趋势积累云端数据。工作流新增 `lock_file` 输入
   （默认 `images.lock.resolved.txt`）；`--audit-lock` 脚本侧行为零改动
-
 - **接入 Trellis 工程框架**：`.trellis/`（规范 / 任务 / 会话记忆）与 Claude Code
   平台层（`.claude/` 的 trellis-* skills 与 hooks）、根目录 `AGENTS.md`。规范按本仓库
   实际结构回填为四个目录（engine / workflows / maintenance / guides），全部条目
