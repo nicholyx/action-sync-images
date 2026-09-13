@@ -184,6 +184,15 @@ bash 里「值」和「状态」跨过进程边界时的流向，必须与进程
   ```
 
   注意非幂等操作的重复执行风险（见发布幂等）。
+- **HTTPS 对 github.com 不通时先试 SSH，再考虑重试**。曾有整晚 443 端口间歇性
+  超时（`git fetch` 卡满 75 秒才报错），而 SSH 22 端口一直通：
+  `ssh -T git@github.com` 十几秒就能验证。用临时 remote 兜底，别动使用者的
+  `origin` 配置：`git remote add ssh-origin git@github.com:<owner>/<repo>.git`，
+  用完 `git remote remove` 删掉（或事先问过使用者再改 origin）。
+- **`gh` 只认 `origin`，分支推在别的 remote 上时用 `--head`**。分支推到
+  `ssh-origin` 后，`gh pr create` 会报 `you must first push the current branch
+  to a remote`——这不是网络问题，重试 20 次也不会好（真实踩过）。加
+  `--head <owner>:<branch>` 一次就过。排查网络类报错前先看报错原文说的是什么。
 
 ## 五、发布
 
