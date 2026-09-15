@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "新小节要与既有「关键设计决策」小节的风格与论证方式一致，避免另起炉灶"}
+{"file": ".trellis/spec/engine/index.md", "reason": "Quality Check 里的 U+FFFD 扫描流程与「改设计前先确认不是把记录过的决定改回去」的动机"}
