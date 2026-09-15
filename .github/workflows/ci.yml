@@ -873,6 +873,67 @@ jobs:
           [[ "$code" -eq 1 ]] || { echo "::error::--notify-after-failures 0 应被拒绝（退出码 1），实际 ${code}"; exit 1; }
           echo "✓ 非法阈值被拒绝"
 
+      - name: 验证报告下载失败的分类判定
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # download_reports 的核心分类逻辑用 mock 验证：真实环境里「带附件
+          # 但下载失败」依赖网络抖动，没法稳定构造——Issue #87 的起因正是它。
+          # mock 的对象是 gh api（附件存在性确认）；stderr 分类走生产代码。
+          sed -n '/^classify_download_failure()/,/^}/p' scripts/history.sh > /tmp/download-fns.sh
+          sed -n '/^confirm_artifact_exists()/,/^}/p' scripts/history.sh >> /tmp/download-fns.sh
+
+          cat > /tmp/test-download.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          source /tmp/download-fns.sh
+
+          # gh mock：api 按 GH_MOCK_FIXTURE 返回对应 fixture，其余子命令一律失败
+          gh() {
+            if [[ "$1" == "api" ]]; then
+              case "${GH_MOCK_FIXTURE:-}" in
+                yes)     printf '{"artifacts":[{"name":"check-report","expired":false}]}' ;;
+                expired) printf '{"artifacts":[{"name":"check-report","expired":true}]}' ;;
+                absent)  printf '{"artifacts":[{"name":"other-report","expired":false}]}' ;;
+                empty)   printf '{"artifacts":[]}' ;;
+                *)       printf 'Get "https://objects.githubusercontent.com/...": EOF' >&2; return 1 ;;
+              esac
+            else
+              return 127
+            fi
+          }
+
+          classify() { classify_download_failure "$1"; }
+          confirm() { GH_MOCK_FIXTURE="$1" confirm_artifact_exists 123 check-report; }
+
+          # 分类：gh 的两条「无附件」文案归正常；其余（EOF、空输出）一律
+          # 保守归可疑，交给 API 确认——文案分错也不会把无附件误报成下载失败
+          [[ "$(classify 'no valid artifacts found to download')" == "no-artifact" ]] \
+            || { echo "FAIL: 完全无附件应归 no-artifact"; exit 1; }
+          [[ "$(classify 'no artifact matches any of the names or patterns provided')" == "no-artifact" ]] \
+            || { echo "FAIL: 名字不匹配应归 no-artifact"; exit 1; }
+          [[ "$(classify 'Get "https://objects.githubusercontent.com/...": EOF')" == "suspicious" ]] \
+            || { echo "FAIL: 网络 EOF 应归 suspicious"; exit 1; }
+          [[ "$(classify '')" == "suspicious" ]] \
+            || { echo "FAIL: 空输出应保守归 suspicious"; exit 1; }
+
+          # 确认：同名附件 → yes；过期 → expired；无同名 → absent；
+          # API 查不动（网络抖动）→ unknown，由调用方如实计入下载失败
+          [[ "$(confirm yes)" == "yes" ]] || { echo "FAIL: 有附件应为 yes"; exit 1; }
+          [[ "$(confirm expired)" == "expired" ]] || { echo "FAIL: 过期附件应为 expired"; exit 1; }
+          [[ "$(confirm absent)" == "absent" ]] || { echo "FAIL: 名字不匹配应为 absent"; exit 1; }
+          [[ "$(confirm empty)" == "absent" ]] || { echo "FAIL: 无附件应为 absent"; exit 1; }
+          [[ "$(confirm boom)" == "unknown" ]] || { echo "FAIL: API 失效应为 unknown"; exit 1; }
+
+          echo "MOCK-OK"
+          SCRIPT
+          bash /tmp/test-download.sh | grep -q 'MOCK-OK' || {
+            echo "::error::报告下载失败的分类判定不符合预期"
+            exit 1
+          }
+          echo "✓ 下载失败分类正确（无附件 / 名字不匹配 / 网络 EOF / 过期 / unknown）"
+
       - name: 验证凭证映射文件
         run: |
           #!/usr/bin/env bash
