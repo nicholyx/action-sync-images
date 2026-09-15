@@ -18,6 +18,24 @@
 - **包装函数不得吞退出码**：结尾不写 `return 0`，写 `return $?` 或什么都不写。曾让 401 失败的同步被记成成功（CI 当场抓到）
 - **命令替换是子 shell**：`var="$(fn)"` 里 fn 对全局变量的赋值传不回父进程，`set -u` 下读会炸。多值传出用全局变量 + 返回码
 - **`output="$(cmd)"` 的退出码就是 cmd 的退出码**：errexit 下 cmd 失败会在 `echo "$output"` 之前中断步骤、吞掉全部输出。可能失败的命令用 `set +e` 包裹后再捕获
+- **`if state="$(a | b)"` 的管道退出码默认只看最后一个命令**：a 失败而 b 对空输入「成功」时，整条管道按成功处理——除非调用方恰好开了 `pipefail`。「失败时输出 unknown、成功时输出判定值」这类语义不能依赖调用方的 shell 选项（函数会被 CI 单测提取到独立上下文执行，行为随上下文翻转）。分段查退出码，让失败有显式输出值：
+
+  ```bash
+  # 错：gh api 失败时 jq 对空输入照样成功，unknown 永远走不到
+  if state="$(gh api "$url" | jq -r '...')"; then
+    :
+  else
+    state="unknown"
+  fi
+
+  # 对：分段判，unknown 是保守默认
+  state="unknown"
+  if api_out="$(gh api "$url" 2>/dev/null)"; then
+    state="$(printf '%s\n' "$api_out" | jq -r '...')" || state="unknown"
+  fi
+  ```
+
+  （Issue #87 的质量检查阶段发现：`confirm_artifact_exists` 若整条管道一起判，「API 查不动」会静默落成 `absent`——无法判定冒充正常，恰是那个任务要消除的混淆。范本见 `scripts/history.sh`）
 - **`find` 的退出码只表示「遍历成功」**，与是否匹配无关；按「有没有匹配」判断要看输出非空
 
 ## printf 与字段分隔

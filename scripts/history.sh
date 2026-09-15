@@ -225,6 +225,36 @@ parse_args() {
 #
 # 每次运行的附件都放进各自的子目录，否则同名文件会互相覆盖——而覆盖掉的
 # 恰好是除最后一次以外的全部数据。
+
+# 分类 gh run download 的失败原因。$1 = 该次运行的合并输出（stderr 为主）。
+# 输出 no-artifact（运行本来就没有可下载的报告，正常现象）或
+# suspicious（多半是网络 / 传输问题，需要二次确认）。
+# 匹配的两条文案是 gh 2.x 的报错原文；分错了也无害——suspicious 会走
+# artifacts API 二次确认纠正，不会把「无附件」误报成「下载失败」。
+classify_download_failure() {
+  case "$1" in
+    *"no valid artifacts found"* | *"no artifact matches"*) printf '%s\n' 'no-artifact' ;;
+    *) printf '%s\n' 'suspicious' ;;
+  esac
+}
+
+# 确认一次运行是否真有名为 $2 的附件。$1 = run id。
+# 输出 yes / expired / absent；API 也查不动（网络抖动）时输出 unknown。
+confirm_artifact_exists() {
+  local id="$1" name="$2" state="unknown" api_out
+  # API 调用与 jq 解析分开查退出码：gh api 失败时 jq 对空输入照样成功，
+  # 整条管道一起判的话，「查不动」能不能落到 unknown 就得看调用方有没有
+  # 开 pipefail——而 unknown（计入下载失败）与 absent（静默跳过）在调用方
+  # 语义不同，这里不能有这种隐含前提
+  if api_out="$(gh api "repos/{owner}/{repo}/actions/runs/${id}/artifacts" 2>/dev/null)"; then
+    state="$(printf '%s\n' "$api_out" | jq -r --arg name "$name" \
+      '[.artifacts[] | select(.name == $name)][0]
+       | if . == null then "absent" elif .expired then "expired" else "yes" end')" || state="unknown"
+  fi
+  [[ -n "$state" ]] || state="absent"
+  printf '%s\n' "$state"
+}
+
 download_reports() {
   command -v gh >/dev/null 2>&1 || die "未找到 gh CLI。安装：https://cli.github.com —— 或用 --dir 指定本地报告目录"
   command -v jq >/dev/null 2>&1 || die "未找到 jq"
@@ -251,12 +281,38 @@ download_reports() {
   [[ ${#run_ids[@]} -gt 0 ]] || die "没有取到任何运行记录。请确认当前目录在一个 GitHub 仓库中，gh 已登录，且工作流「${WORKFLOW_FILTER:-}」至少跑过一次（--check 模式下这是体检工作流；也可用 --dir 指定本地报告目录）"
 
   local got=0
+  local failed_downloads=0
+  local dl_out verdict
   for id in "${run_ids[@]}"; do
-    # 下载失败是正常的：不是每次运行都在做同步或体检，
-    # 那些运行自然没有这个附件。因此这里只计数，不报错。
-    if gh run download "$id" -n "$REPORT_NAME" -D "${WORK_DIR}/${id}" >/dev/null 2>&1; then
+    if dl_out="$(gh run download "$id" -n "$REPORT_NAME" -D "${WORK_DIR}/${id}" 2>&1)"; then
       got=$((got + 1))
+      continue
     fi
+    # 下载失败分两类，不得混淆（Issue #87，2026-09-14 真实踩到）：运行
+    # 本来就不做同步或体检、自然没有这个附件，属正常；而带附件的运行被
+    # 网络抖动中断，报成「没有附件」会误导排查方向。先按 gh 的报错文案
+    # 分类，拿不准的（EOF 等传输错误）用 artifacts API 二次确认。
+    verdict="$(classify_download_failure "$dl_out")"
+    if [[ "$verdict" == "no-artifact" ]]; then
+      continue
+    fi
+    case "$(confirm_artifact_exists "$id" "$REPORT_NAME")" in
+      yes)
+        failed_downloads=$((failed_downloads + 1))
+        log_warn "运行 ${id} 有「${REPORT_NAME}」附件但下载失败（多为网络原因，可重试）"
+        ;;
+      expired)
+        log_warn "运行 ${id} 的「${REPORT_NAME}」附件已按 GitHub 保留期清理，无法下载"
+        ;;
+      absent)
+        # 文案分类误报，API 纠正：确实没有附件，照旧静默跳过
+        ;;
+      *)
+        # 存在性也确认不了（网络不稳）：如实计入下载失败，不假装知道附件在不在
+        failed_downloads=$((failed_downloads + 1))
+        log_warn "运行 ${id} 下载失败，且附件存在性确认也失败（网络原因，可重试）"
+        ;;
+    esac
   done
 
   if [[ -n "$CHECK_MODE" ]]; then
@@ -264,7 +320,13 @@ download_reports() {
   else
     log_info "本次运行列表中有 ${got} 次带同步报告"
   fi
+  if [[ ${failed_downloads} -gt 0 ]]; then
+    log_warn "其中 ${failed_downloads} 次应下载却失败（多为网络原因，可重试）"
+  fi
   if [[ "$got" -eq 0 ]]; then
+    if [[ ${failed_downloads} -gt 0 ]]; then
+      die "这 ${#run_ids[@]} 次运行里没有一次成功下载「${REPORT_NAME}」报告：${failed_downloads} 次应下载却失败，多为网络原因，可重试；也可用 --dir 指定本地报告目录"
+    fi
     if [[ -n "$CHECK_MODE" ]]; then
       die "这 ${#run_ids[@]} 次运行里没有任何「${REPORT_NAME}」附件。--check 模式取的是体检工作流（Check-Registry）的运行——请确认它至少跑过一次（Actions 页面手动触发），或用 --dir 指定本地报告目录"
     fi
