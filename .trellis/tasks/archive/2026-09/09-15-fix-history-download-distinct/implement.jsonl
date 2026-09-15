@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "bash 3.2 硬规则：数组判空、printf 换行、命令替换子 shell 陷阱——新逻辑必须遵守"}
+{"file": ".trellis/spec/engine/index.md", "reason": "Quality Check 清单：lint、mock 验证、CI 断言先本地复现、U+FFFD 扫描"}
+{"file": ".trellis/spec/workflows/index.md", "reason": "要动 .github/workflows/ci.yml 加单测步骤：供应链基线与 YAML 编辑规则"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "复用既有 log/log_warn/die 与重试模式，不另起炉灶"}
