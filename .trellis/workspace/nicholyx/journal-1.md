@@ -86,3 +86,25 @@ Trellis 初始化时把项目此前 8 个版本的迭代史与关键教训写入
 ### Status
 
 [OK] **Completed**
+
+
+## Session 3: docs: 架构设计记录补到 v1.11（#91，v1.12.0）
+<!-- trellis-session: v=2 fp=7c16bf7ad58db245 -->
+
+**Date**: 2026-09-16
+**Task**: docs: 架构设计记录补到 v1.11（#91，v1.12.0）
+**Branch**: `main`
+
+### Summary
+
+延续 #43/#63 惯例：ARCHITECTURE「关键设计决策」按版本时序补 6 个小节（audit-lock 查上游不查本地、检查报告落盘、lock 校验上云、--check 做趋势而 check-updates 不做、趋势落盘 md+json 与口径单一来源、下载失败与无附件区分），README 路线图补 v1.9/v1.10 条目并修空行。check 阶段修正一处事实精度：检查报告 md 与 Step Summary 同源（非 stdout），「同源」在两个脚本里指的东西不同。逐节对照代码核过事实，PR #92 全绿合并，#91 关闭。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `4b8de49` | docs(architecture): 设计记录补到 v1.11，README 路线图补齐（#91） |
+
+### Status
+
+[OK] **Completed**
