@@ -472,6 +472,9 @@ brew install skopeo regclient   # macOS
 
 - [x] 检查结果的通知与「仓库体检」工作流（`Check-Registry`）
 - [x] 锁文件时效性校验（`--audit-lock`）与检查报告落盘
+- [x] 检查报告的趋势聚合（`history.sh --check`：一直落后 / 一直缺失 / 一直在漂移）
+- [x] 趋势结果落盘与 Actions 页面查看（`history.sh --report-dir` 与 History-Trend 工作流）
+
 ### 计划中
 
 完整清单见 [路线图 Issue #4](https://github.com/nicholyx/action-sync-images/issues/4)——那里是面向贡献者的工作清单，每项都对应一个独立 Issue，包含背景、入手位置与验收标准。
