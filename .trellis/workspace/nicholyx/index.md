@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 0
-- **Last Active**: -
+- **Total Sessions**: 2
+- **Last Active**: 2026-09-15
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~0 | Active |
+| `journal-1.md` | ~88 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 2 | 2026-09-15 | fix(history): 下载失败与无附件区分（#87，v1.11.0） | `5877729` | `main` |
 <!-- @@@/auto:session-history -->
 
 ---

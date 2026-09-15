@@ -64,3 +64,25 @@ Trellis 初始化时把项目此前 8 个版本的迭代史与关键教训写入
   观察真实使用者反馈
 - 后续开发改用 Trellis 工作流：任务走 `task.py`，规范注入走 trellis-before-dev，
   收尾走 /trellis:finish-work；GitHub 侧闭环（Issue/PR/发布）仍按 spec/maintenance/index.md
+
+
+## Session 2: fix(history): 下载失败与无附件区分（#87，v1.11.0）
+<!-- trellis-session: v=2 fp=e0926641cd87090b -->
+
+**Date**: 2026-09-15
+**Task**: fix(history): 下载失败与无附件区分（#87，v1.11.0）
+**Branch**: `main`
+
+### Summary
+
+立项 #87 为 v1.11.0：download_reports 按 gh 报错文案分类下载失败，可疑失败用 artifacts API 确认（yes/expired/absent/unknown），汇总与报错文案区分「应下载却失败」与「无附件」，退出码不变。冒烟真实复现 #87 场景验证修复；check 阶段抓到 if 条件里整条管道判退出码的 pipefail 隐含依赖（unknown 会静默落成 absent），改为分段判退出码，教训已沉淀进 spec/engine/bash-rules.md。CI 新增 mock 单测 step（分类 4 类 + 确认 4 态），PR #89 全绿合并，#87 随 Closes 自动关闭。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `5877729` | fix(history): 报告附件下载失败不得误报为「没有任何附件」（#87） (#89) |
+
+### Status
+
+[OK] **Completed**
