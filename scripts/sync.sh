@@ -331,7 +331,8 @@ sync.sh —— 容器镜像同步引擎
                            同样仅对 skopeo 路径生效
 
 输出与通知：
-      --dry-run            只打印将要执行的命令，不实际推送
+      --dry-run            输出同步计划与将要执行的命令，不实际推送。
+                           计划不预测跳过结果，也不虚构未显式指定的平台
       --report-dir <目录>  把报告写入该目录（同时生成 .md 与 .json）。
                            同步与三种检查（--audit / --check-updates /
                            --audit-lock）均支持，文件名可区分
@@ -1489,6 +1490,117 @@ duration_ranking_rows() {
         printf "| %ss | \`%s\` → \`%s\` |\n" \
           "${R_SECONDS[$idx]}" "${R_SRC[$idx]}" "${R_DEST[$idx]}"
       done
+}
+
+# 渲染 dry-run 的同步计划预览。
+#
+# 这不是第二种 dry-run 实现：真实执行的参数仍由 sync_via_skopeo /
+# sync_via_regctl 输出。这里只汇总它们即将覆盖的源 → 目标映射，并把
+# 「跳过判定 / 自动探测平台」这类必须实际执行才能知道的信息留作提示，
+# 不在计划里虚构结果。
+print_dry_run_plan() {
+  local active_count="$1"
+  local raw_src normalized dest row
+  local dest_count=0
+  local command_count=0
+  local execution_path
+  local platform_strategy
+  local -a plan_rows=()
+  local -a plan_lines=()
+
+  if [[ -n "$DEST_EXACT" ]]; then
+    dest_count=1
+  else
+    dest_count=${#DEST_REGISTRIES[@]}
+  fi
+
+  if [[ "$STRIP_ATTESTATION" == "true" ]]; then
+    execution_path="regctl index create"
+    if [[ -n "$PLATFORMS" ]]; then
+      # 与 sync_via_regctl 一致：先按逗号拆开、去空白，再重组展示。
+      # 不能直接复述原始输入，否则空段和空格会让计划偏离实际参数。
+      local platform
+      local -a explicit_platforms=()
+      while IFS= read -r platform; do
+        platform="${platform// /}"
+        if [[ -n "$platform" ]]; then
+          explicit_platforms+=("$platform")
+        fi
+      done < <(printf '%s\n' "$PLATFORMS" | tr ',' '\n')
+      if [[ ${#explicit_platforms[@]} -eq 0 ]]; then
+        platform_strategy="实际执行会失败：平台列表解析结果为空"
+      else
+        platform_strategy="$(IFS=,; printf '%s' "${explicit_platforms[*]}")"
+      fi
+    else
+      platform_strategy="实际执行时自动探测（失败回退 linux/amd64,linux/arm64）"
+    fi
+  else
+    execution_path="skopeo copy --all"
+    platform_strategy="全部（--all）"
+  fi
+
+  local idx=0
+  local total=${#SOURCE_IMAGES[@]}
+  for raw_src in "${SOURCE_IMAGES[@]}"; do
+    idx=$((idx + 1))
+    [[ -z "${EXCLUDE_REASONS[$((idx - 1))]:-}" ]] || continue
+
+    normalized="$(normalize_ref "$raw_src")"
+    if ! validate_ref "$normalized" >/dev/null 2>&1; then
+      log_error "  [${idx}/${total}] ${normalized} —— 镜像引用无效，实际执行会失败"
+      continue
+    fi
+
+    resolve_dest_refs "$normalized"
+    for dest in "${DEST_REFS[@]}"; do
+      command_count=$((command_count + 1))
+      plan_lines+=("  [${command_count}] ${normalized} → ${dest}")
+      # shellcheck disable=SC2016
+      row="$(printf '| `%s` | `%s` | `%s` | %s |' \
+        "$normalized" "$dest" "$execution_path" "$platform_strategy")"
+      plan_rows+=("$row")
+    done
+  done
+
+  log_info "同步计划预览（dry-run）"
+  log_info "源镜像 ${active_count} 个 · 目标 ${dest_count} 个 · 预计命令 ${command_count} 条"
+  log_info "执行路径：${execution_path} · 平台策略：${platform_strategy}"
+  if [[ "$FILTERED_OUT_COUNT" -gt 0 ]]; then
+    log_info "另有 ${FILTERED_OUT_COUNT} 个源镜像被筛选排除，不进入计划"
+  fi
+  if [[ "$SKIP_EXISTING" == "true" && "$STRIP_ATTESTATION" != "true" ]]; then
+    log_info "skip-existing 只能在实际执行时判断，本计划不预测跳过结果"
+  fi
+  log_info "计划映射："
+  if [[ ${#plan_rows[@]} -gt 0 ]]; then
+    printf '%s\n' "${plan_lines[@]}" >&2
+  fi
+  log_info "预计命令合计：${command_count} 条"
+
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    {
+      echo "## Dry-run 同步计划"
+      echo ""
+      echo "| 源镜像 | 目标镜像 | 执行路径 | 平台策略 |"
+      echo "| --- | --- | --- | --- |"
+      if [[ ${#plan_rows[@]} -gt 0 ]]; then
+        printf '%s\n' "${plan_rows[@]}"
+      fi
+      echo ""
+      echo "**预计命令**：${command_count} 条"
+      if [[ "$FILTERED_OUT_COUNT" -gt 0 ]]; then
+        echo ""
+        echo "> 另有 ${FILTERED_OUT_COUNT} 个源镜像被 \`--filter\` / \`--exclude\` 排除。"
+      fi
+      if [[ "$SKIP_EXISTING" == "true" && "$STRIP_ATTESTATION" != "true" ]]; then
+        echo ""
+        echo "> \`--skip-existing\` 只能在实际执行时判断；本计划不预测跳过结果。"
+      fi
+      echo ""
+      echo "> ⚠️ 本次为 dry-run，未推送任何镜像。"
+    } >> "$GITHUB_STEP_SUMMARY"
+  fi
 }
 
 write_result() {
@@ -3329,7 +3441,7 @@ main() {
     ensure_regctl
   fi
   if [[ "$DRY_RUN" == "true" ]]; then
-    log_warn "dry-run 模式：只打印命令，不会推送任何镜像"
+    log_warn "dry-run 模式：输出同步计划与命令，不会推送任何镜像"
   fi
 
   if [[ -n "$AUDIT_LOCK_FILE" ]]; then
@@ -3408,6 +3520,10 @@ main() {
   # 用函数而不是内联字符串：退出时要清理的不止 WORK_DIR（还有源仓库认证文件），
   # 写成函数后新增清理项只改 cleanup 一处，不必再核对这行的展开时机
   trap cleanup EXIT
+
+  if [[ "$DRY_RUN" == "true" && "$AUDIT" != "true" && "$CHECK_UPDATES" != "true" && -z "$AUDIT_LOCK_FILE" ]]; then
+    print_dry_run_plan "$active_count"
+  fi
 
   local start end check_rc=0
   start="$(date +%s)"

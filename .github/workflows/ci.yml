@@ -137,6 +137,147 @@ jobs:
             --dest registry.example.com/smoke \
             --dry-run
 
+      - name: 验证 dry-run 同步计划预览
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          summary="$(mktemp)"
+          output="$(GITHUB_STEP_SUMMARY="$summary" ./scripts/sync.sh \
+            --src 'nginx:1.27,redis:7.4' \
+            --dest registry.example.com/smoke \
+            --exclude redis \
+            --skip-existing \
+            --dry-run 2>&1)"
+
+          echo "$output"
+
+          if ! grep -q '同步计划预览（dry-run）' <<<"$output"; then
+            echo "::error::dry-run 未输出同步计划预览"
+            exit 1
+          fi
+          if ! grep -q '预计命令 1 条' <<<"$output"; then
+            echo "::error::dry-run 计划未按筛选后的数量统计命令"
+            exit 1
+          fi
+          if ! grep -F 'nginx:1.27 → registry.example.com/smoke/nginx:1.27' <<<"$output"; then
+            echo "::error::dry-run 计划缺少正确的源到目标映射"
+            exit 1
+          fi
+          if ! grep -q '执行路径：skopeo copy --all' <<<"$output"; then
+            echo "::error::dry-run 计划未说明执行路径"
+            exit 1
+          fi
+          if ! grep -q '平台策略：全部（--all）' <<<"$output"; then
+            echo "::error::dry-run 计划未说明平台策略"
+            exit 1
+          fi
+          if ! grep -q 'skip-existing 只能在实际执行时判断' <<<"$output"; then
+            echo "::error::dry-run 计划不应把目标已存在判定为确定的跳过"
+            exit 1
+          fi
+
+          # Markdown 表格中的反引号是固定文本，禁用 shellcheck 的误报告警。
+          # shellcheck disable=SC2016
+          if ! grep -q '## Dry-run 同步计划' "$summary" \
+            || ! grep -F '| `nginx:1.27` | `registry.example.com/smoke/nginx:1.27` |' "$summary"; then
+            echo "::error::dry-run 计划未写入 Step Summary"
+            cat "$summary"
+            exit 1
+          fi
+          echo "✓ dry-run 计划预览与 Step Summary 正确"
+
+          # strip-attestation 会改用 regctl 重建索引，计划必须如实区分路径与平台来源。
+          output="$(./scripts/sync.sh --src nginx:1.27 --dest registry.example.com/smoke \
+            --strip-attestation --platforms linux/amd64,linux/arm64 --dry-run 2>&1)"
+          if ! grep -q '执行路径：regctl index create' <<<"$output" \
+            || ! grep -q '平台策略：linux/amd64,linux/arm64' <<<"$output"; then
+            echo "::error::regctl dry-run 计划未如实说明路径与平台策略"
+            echo "$output"
+            exit 1
+          fi
+          echo "✓ regctl dry-run 计划路径与平台策略正确"
+
+          # 多目标计划要反映每个目标的独立命名规则，数量必须是命令数而非源镜像数。
+          output="$(GITHUB_STEP_SUMMARY="$summary" ./scripts/sync.sh \
+            --src library/nginx:1.27 \
+            --dest registry.example.com/flat \
+            --dest-keep-path registry.example.com/keep \
+            --dry-run 2>&1)"
+          echo "$output"
+          if ! grep -q '源镜像 1 个 · 目标 2 个 · 预计命令 2 条' <<<"$output" \
+            || ! grep -F 'library/nginx:1.27 → registry.example.com/flat/library_nginx:1.27' <<<"$output" \
+            || ! grep -F 'library/nginx:1.27 → registry.example.com/keep/library/nginx:1.27' <<<"$output"; then
+            echo "::error::多目标 dry-run 计划缺少全部独立目标映射"
+            echo "$output"
+            exit 1
+          fi
+          # shellcheck disable=SC2016
+          if ! grep -F '| `library/nginx:1.27` | `registry.example.com/flat/library_nginx:1.27` |' "$summary" \
+            || ! grep -F '| `library/nginx:1.27` | `registry.example.com/keep/library/nginx:1.27` |' "$summary"; then
+            echo "::error::多目标 dry-run 计划未完整写入 Step Summary"
+            cat "$summary"
+            exit 1
+          fi
+          echo "✓ 多目标 dry-run 计划完整"
+
+          # dest-exact 不做路径拼接；计划必须复述使用者给定的完整地址。
+          output="$(./scripts/sync.sh --src nginx:1.27 \
+            --dest-exact registry.example.com/custom/nginx:stable --dry-run 2>&1)"
+          if ! grep -F 'nginx:1.27 → registry.example.com/custom/nginx:stable' <<<"$output"; then
+            echo "::error::dest-exact dry-run 计划未保留完整目标地址"
+            echo "$output"
+            exit 1
+          fi
+          echo "✓ dest-exact dry-run 计划正确"
+
+          # 未显式传平台时，计划不能虚构探测结果，只能说明实际执行时的策略。
+          # 用非法引用避免 dry-run 冒烟测试真的访问 Docker Hub 探测平台。
+          set +e
+          output="$(./scripts/sync.sh --src nginx --dest registry.example.com/smoke \
+            --strip-attestation --dry-run 2>&1)"
+          code=$?
+          set -e
+          if [[ "$code" -ne 2 ]] \
+            || ! grep -q '平台策略：实际执行时自动探测' <<<"$output"; then
+            echo "::error::regctl dry-run 计划不应虚构自动探测出的平台"
+            echo "$output"
+            exit 1
+          fi
+          echo "✓ regctl 自动探测策略说明正确"
+
+          # 非法引用不能生成看似可执行的目标映射；脚本会返回 2，先暂时放开 errexit。
+          set +e
+          output="$(./scripts/sync.sh --src 'nginx' --dest registry.example.com/smoke --dry-run 2>&1)"
+          code=$?
+          set -e
+          if [[ "$code" -ne 2 ]] \
+            || ! grep -q '镜像引用无效，实际执行会失败' <<<"$output" \
+            || ! grep -q '预计命令 0 条' <<<"$output" \
+            || grep -q 'nginx → registry.example.com/smoke' <<<"$output"; then
+            echo "::error::非法引用的 dry-run 计划不应生成映射"
+            echo "$output"
+            exit 1
+          fi
+          echo "✓ 非法引用不生成映射"
+
+          # --dry-run 在只读检查模式下保持既有语义：显式忽略，不渲染同步计划。
+          # 只放 marker 行，可验证参数告警而不用访问 registry。
+          lock="$(mktemp)"
+          printf '# [失败] nginx:1.27\n' > "$lock"
+          output="$(./scripts/sync.sh --audit-lock "$lock" --dry-run 2>&1)"
+          if grep -q '同步计划预览（dry-run）' <<<"$output"; then
+            echo "::error::audit 模式不应输出同步计划预览"
+            echo "$output"
+            exit 1
+          fi
+          if ! grep -q -- '--dry-run' <<<"$output"; then
+            echo "::error::audit 模式应保持 --dry-run 显式忽略告警"
+            echo "$output"
+            exit 1
+          fi
+          echo "✓ 只读检查模式不渲染同步计划"
+
       - name: 验证非法镜像引用会被拦下
         run: |
           #!/usr/bin/env bash
@@ -392,6 +533,22 @@ jobs:
             fi
           done
           echo "✓ 多平台全部传递，未丢弃最后一个"
+
+          # 空段全部过滤后没有可用平台；dry-run 计划可以如实标注会失败，
+          # 但后续执行仍必须走既有 die 语义，退出码保持 1。
+          set +e
+          output="$(./scripts/sync.sh --src nginx:1.27 --dest r.example.com/x \
+            --strip-attestation --platforms ',' --dry-run 2>&1)"
+          code=$?
+          set -e
+          if [[ "$code" -ne 1 ]] \
+            || ! grep -q '平台策略：实际执行会失败：平台列表解析结果为空' <<<"$output" \
+            || ! grep -q '平台列表解析结果为空：,' <<<"$output"; then
+            echo "::error::空平台列表应先给出计划告警，再按既有语义失败"
+            echo "$output"
+            exit 1
+          fi
+          echo "✓ 空平台列表不会触发 unbound variable"
 
       - name: 验证重试参数的作用范围
         run: |

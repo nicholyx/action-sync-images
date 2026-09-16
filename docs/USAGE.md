@@ -257,7 +257,7 @@ registry.k8s.io/pause:3.9, nginx:1.27, redis:7.4
 | `platforms` | | 自动探测 | 保留哪些平台，如 `linux/amd64,linux/arm64`。**仅在勾选上一项时生效** |
 | `concurrency` | | `4` | 并发同步的镜像数量。填 `1` 即回到串行 |
 | `skip_existing` | | `true` | 跳过目标仓库中已存在且完全相同的镜像 |
-| `dry_run` | | `false` | 只打印将要执行的命令，不实际推送。用于确认目标地址是否正确 |
+| `dry_run` | | `false` | 先输出同步计划，再打印命令；不实际推送。用于确认筛选结果与目标地址 |
 
 > 每次同步都会自动记录源与目标的 digest（详见[关于 digest](#关于-digest)），无需额外配置。
 
@@ -359,15 +359,31 @@ ALIYUNCS_REGISTRY = registry.cn-hangzhou.aliyuncs.com/your-company
 
 > ⚠️ Docker Hub 免费账号有拉取速率限制，且**公共仓库的镜像对所有人可见**。同步前请确认镜像内容适合公开。
 
-### 场景六：用 `dry_run` 先确认目标地址
+### 场景六：用 `dry_run` 先确认同步计划
 
-不确定镜像名会被转成什么样？先勾上 `dry_run` 跑一次，日志里会打印出完整命令：
+不确定筛选结果、目标名或执行路径？先勾上 `dry_run` 跑一次。默认同步模式会先输出同步计划预览，再打印完整命令：
 
 ```text
+[信息] 同步计划预览（dry-run）
+[信息] 源镜像 1 个 · 目标 1 个 · 预计命令 1 条
+[信息] 执行路径：skopeo copy --all · 平台策略：全部（--all）
+[信息] 计划映射：
+  [1] registry.k8s.io/coredns/coredns:v1.11.1 → registry.cn-shenzhen.aliyuncs.com/nicholyx/registry.k8s.io_coredns_coredns:v1.11.1
+
 [dry-run] skopeo copy --all --retry-times 3 \
   docker://registry.k8s.io/coredns/coredns:v1.11.1 \
   docker://registry.cn-shenzhen.aliyuncs.com/nicholyx/registry.k8s.io_coredns_coredns:v1.11.1
 ```
+
+在 Actions 里运行时，计划也会写入 **Summary** 的 `Dry-run 同步计划` 表格，方便确认所有源 → 目标映射。
+
+计划预览刻意只回答「这次会执行哪些搬运命令」：
+
+- 映射来自同一套目标解析逻辑，而不是重新拼接一份输入
+- `--skip-existing` 是否能跳过需要查询目标仓库，计划**不预测**跳过结果
+- `--strip-attestation` 未显式指定平台时，计划只说明「实际执行时自动探测」，不会虚构平台列表
+- 非法引用不会生成映射，并会在计划里标出实际执行会失败
+- `--audit` / `--check-updates` / `--audit-lock` 的 `--dry-run` 仍按只读检查的既有语义忽略，不渲染同步计划
 
 确认无误后取消勾选，再正式跑一次。
 
@@ -908,7 +924,7 @@ kubeadm init \
 # macOS
 brew install skopeo regclient
 
-# 预览，不实际推送
+# 预览同步计划和实际命令，不实际推送
 ./scripts/sync.sh \
   --src registry.k8s.io/pause:3.9 \
   --dest registry.cn-shenzhen.aliyuncs.com/nicholyx \
