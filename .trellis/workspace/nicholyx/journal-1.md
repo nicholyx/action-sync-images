@@ -108,3 +108,25 @@ Trellis 初始化时把项目此前 8 个版本的迭代史与关键教训写入
 ### Status
 
 [OK] **Completed**
+
+
+## Session 4: feat: 报告下载的批量重试（#97，v1.14.0）+ v1.13.0 发布
+<!-- trellis-session: v=2 fp=b5e076c007b3da63 -->
+
+**Date**: 2026-09-16
+**Task**: feat: 报告下载的批量重试（#97，v1.14.0）+ v1.13.0 发布
+**Branch**: `main`
+
+### Summary
+
+发布 v1.13.0（liang-zhenxiang 的 dry-run 计划预览，CHANGELOG 标注贡献者并致谢）。自主立项 v1.14.0（#97）：download_reports 对「确认有附件但下载失败 / 无法判定」的运行在主循环后做一轮批量重试（天然退避 + 5s 间隔），挽回计入 got，只重试一轮，无附件与过期不重试，不参数化。mock 单测三类路径（文件计数绕开 bash 3.2 无关联数组），CI 真实执行通过。冒烟中发现 gh run list 网络失败被吞掉误报「没有取到任何运行记录」，留档 #98。PR #99 全绿合并。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `239b0cd` | feat(history): 报告下载的批量重试，瞬时抖动自动挽回（#97） (#99) |
+
+### Status
+
+[OK] **Completed**
