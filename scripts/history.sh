@@ -283,6 +283,7 @@ download_reports() {
   local got=0
   local failed_downloads=0
   local dl_out verdict
+  local -a retry_ids=()
   for id in "${run_ids[@]}"; do
     if dl_out="$(gh run download "$id" -n "$REPORT_NAME" -D "${WORK_DIR}/${id}" 2>&1)"; then
       got=$((got + 1))
@@ -299,7 +300,8 @@ download_reports() {
     case "$(confirm_artifact_exists "$id" "$REPORT_NAME")" in
       yes)
         failed_downloads=$((failed_downloads + 1))
-        log_warn "运行 ${id} 有「${REPORT_NAME}」附件但下载失败（多为网络原因，可重试）"
+        log_warn "运行 ${id} 有「${REPORT_NAME}」附件但下载失败（多为网络原因，将自动重试）"
+        retry_ids+=("$id")
         ;;
       expired)
         log_warn "运行 ${id} 的「${REPORT_NAME}」附件已按 GitHub 保留期清理，无法下载"
@@ -310,10 +312,33 @@ download_reports() {
       *)
         # 存在性也确认不了（网络不稳）：如实计入下载失败，不假装知道附件在不在
         failed_downloads=$((failed_downloads + 1))
-        log_warn "运行 ${id} 下载失败，且附件存在性确认也失败（网络原因，可重试）"
+        log_warn "运行 ${id} 下载失败，且附件存在性确认也失败（网络原因，将自动重试）"
+        retry_ids+=("$id")
         ;;
     esac
   done
+
+  # 一轮批量重试（Issue #97）：瞬时抖动是最常见的失败形态。把重试放在
+  # 主循环之后，其余运行先下载完——批量本身形成退避，每个之间再固定等
+  # 5 秒。只重试一轮：持续抖动不是脚本该解决的（实测连续 5 次整命令重跑
+  # 仍失败属极端环境），如实报错 + --dir 兜底足够。重试次数与间隔不做
+  # 参数化：为极少调整的值增加表面积不划算，新参数还得进「显式传入不
+  # 生效告警」矩阵。
+  if [[ ${#retry_ids[@]} -gt 0 ]]; then
+    log_info "对 ${#retry_ids[@]} 次失败的下载重试（每次间隔 5 秒）..."
+    local retried=0
+    for id in "${retry_ids[@]}"; do
+      sleep 5
+      if gh run download "$id" -n "$REPORT_NAME" -D "${WORK_DIR}/${id}" >/dev/null 2>&1; then
+        got=$((got + 1))
+        retried=$((retried + 1))
+      fi
+    done
+    if [[ ${retried} -gt 0 ]]; then
+      failed_downloads=$((failed_downloads - retried))
+      log_info "重试挽回 ${retried} 次下载"
+    fi
+  fi
 
   if [[ -n "$CHECK_MODE" ]]; then
     log_info "本次运行列表中有 ${got} 次带检查报告"
