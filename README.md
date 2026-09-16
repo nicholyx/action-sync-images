@@ -66,7 +66,7 @@
 - **网页上就能体检** —— `Check-Registry` 工作流一键跑上面两项检查，不用装任何工具，结果进运行页面的 Summary 并可推送通知
 - **结果一目了然** —— 运行结束直接生成结果表格，无需翻日志
 - **可看趋势** —— `scripts/history.sh` 汇总历次报告，回答「哪个镜像总在失败」「哪个镜像一直落后 / 一直在漂移」
-- **可在本地复现** —— 同一套逻辑封装成 `scripts/sync.sh`，本地也能跑，支持 `--dry-run`
+- **可在本地复现** —— 同一套逻辑封装成 `scripts/sync.sh`，本地也能跑；`--dry-run` 会先输出源 → 目标同步计划，再打印实际命令
 - **目标仓库可配置** —— 换命名空间或区域不需要改代码
 - **静态检查齐全** —— actionlint + yamllint + shellcheck + 提交信息规范，`./scripts/lint.sh` 一键跑完
 
@@ -144,7 +144,7 @@ registry.k8s.io/kube-scheduler:v1.31.0
 | `platforms` | | 自动探测 | 保留的平台，如 `linux/amd64,linux/arm64`。仅在上项勾选时生效 |
 | `concurrency` | | `4` | 并发同步的镜像数量，批量时提速明显 |
 | `skip_existing` | | `true` | 跳过目标仓库中已存在且完全相同的镜像 |
-| `dry_run` | | `false` | 只打印命令不推送，用来确认目标地址 |
+| `dry_run` | | `false` | 先输出同步计划，再打印命令；不实际推送。用于确认筛选结果与目标地址 |
 
 ### Sync-Images-to-Harbor
 
@@ -188,7 +188,7 @@ registry.k8s.io/kube-scheduler:v1.31.0
 
 保留 registry 域名是为了避免不同来源的同名镜像互相覆盖——`registry.k8s.io/pause` 和 `docker.io/pause` 会落到两个不同的仓库。
 
-不确定会变成什么样？**勾上 `dry_run` 跑一次**，日志里会打印完整的命令。
+不确定会变成什么样？**勾上 `dry_run` 跑一次**，日志里会先输出同步计划，再打印完整命令。
 
 自建 Harbor 支持多级路径，用的是精确模式（不做压平）：
 
@@ -388,7 +388,7 @@ registry.k8s.io/kube-apiserver
 ```bash
 brew install skopeo regclient   # macOS
 
-# 先预览
+# 先预览：同步计划 + 实际命令
 ./scripts/sync.sh --src registry.k8s.io/pause:3.9 --dest registry.cn-shenzhen.aliyuncs.com/nicholyx --dry-run
 
 # 确认后正式同步（需先 docker login）

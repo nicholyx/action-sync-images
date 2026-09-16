@@ -68,7 +68,7 @@ The runner sits overseas with direct access to all upstream registries. You clic
 - **Lockfile verification** — `--audit-lock` periodically confirms upstream tags still match the digests you locked, so a silently re-pushed upstream tag is caught immediately
 - **Check from the web UI** — the `Check-Registry` workflow runs either check with one click, no tooling required; results land in the run's Summary and can be pushed as notifications
 - **Trends** — `scripts/history.sh` aggregates past reports to answer "which image keeps failing"
-- **Local reproduction** — the same logic ships as `scripts/sync.sh` with `--dry-run`
+- **Local reproduction** — the same logic ships as `scripts/sync.sh`; `--dry-run` shows a source → destination plan before printing real commands
 - **Configurable destination** — change namespace or region without touching code
 - **Full static checks** — actionlint + yamllint + shellcheck + commit conventions via `./scripts/lint.sh`
 
@@ -146,7 +146,7 @@ Edit [`images.lock.txt`](images.lock.txt) at the repo root, then trigger the `Sy
 | `platforms` | | auto-detect | Platforms to keep, e.g. `linux/amd64,linux/arm64`. Only applies when the previous option is checked |
 | `concurrency` | | `4` | How many images to sync in parallel |
 | `skip_existing` | | `true` | Skip images the destination already has |
-| `dry_run` | | `false` | Print commands without pushing, to preview destination names |
+| `dry_run` | | `false` | Show a sync plan before printing commands, without pushing; use it to verify filtering and destination names |
 
 ### Sync-Images-to-Harbor
 
@@ -190,7 +190,7 @@ Dest:   <your prefix>/registry.k8s.io_coredns_coredns:v1.11.1
 
 Keeping the registry domain in the name prevents collisions between same-named images from different sources — `registry.k8s.io/pause` and `docker.io/pause` land in different repositories.
 
-Not sure what a name becomes? **Run with `dry_run` once** and read the printed commands.
+Not sure what a name becomes? **Run with `dry_run` once** to review the sync plan and printed commands.
 
 Self-hosted Harbor supports nested paths and uses exact mode (no flattening):
 
@@ -379,7 +379,7 @@ Only the 5 highest-by-version tags are listed by default (`--updates-limit`), bu
 ```bash
 brew install skopeo regclient   # macOS
 
-# Preview
+# Preview: sync plan + real commands
 ./scripts/sync.sh --src registry.k8s.io/pause:3.9 --dest registry.cn-shenzhen.aliyuncs.com/nicholyx --dry-run
 
 # Real sync (docker login first)
