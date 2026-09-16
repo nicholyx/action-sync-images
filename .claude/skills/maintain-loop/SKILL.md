@@ -238,6 +238,20 @@ bash 里「值」和「状态」跨过进程边界时的流向，必须与进程
 第二次 `gh release create` 因 Release 已存在而 422。工作流已做「先查后建」（已存在改走 edit），
 **推送 tag 前先用 `git ls-remote --tags origin vX.Y.Z` 确认不存在**，避免制造无意义的失败运行。
 
+### 判断成败禁止管道接 tail/head（v1.14.0 发布事故，2026-09-16）
+
+`if gh pr merge N --squash | tail -1; then` 判断的是 **tail 的退出码**——合并没有发生也报成功，
+tag 跟着打在错误提交上、release 用错误内容生成；重推时 `git push | tail -1` 又把一次真实的
+SSL 失败误读为成功，release 空窗近一小时才发现。同类错误一天内连犯两次，而 spec 里
+「包装函数吞退出码」早有记录——教训是具体模式没被点名：
+
+- 判断成败一律 `if out="$(cmd 2>&1)"`，输出打印放在判断**之后**
+- merge / push 之后必须复核远端真实状态：`gh pr view N --json state`、
+  `git ls-remote --tags origin vX.Y.Z`
+- tag 打错时修复顺序：删远端 tag（`git push origin :refs/tags/vX.Y.Z`）→ 删错误
+  release（`gh release delete`）→ 确认 main 含归档提交 → 重推 tag → 验证
+  release 内容（`gh release view` 正文开头应为本轮主题句）
+
 ## 六、发布后：继续规划
 
 - 更新 Roadmap（Issue #4）：本轮条目移入「已完成」。
