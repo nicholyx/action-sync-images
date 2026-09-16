@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "逐条核对新增 bash 是否踩禁用特性"}
+{"file": ".trellis/spec/engine/index.md", "reason": "按 Quality Check 清单验收"}
