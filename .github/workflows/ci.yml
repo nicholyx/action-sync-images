@@ -177,6 +177,8 @@ jobs:
             exit 1
           fi
 
+          # Markdown 表格中的反引号是固定文本，禁用 shellcheck 的误报告警。
+          # shellcheck disable=SC2016
           if ! grep -q '## Dry-run 同步计划' "$summary" \
             || ! grep -F '| `nginx:1.27` | `registry.example.com/smoke/nginx:1.27` |' "$summary"; then
             echo "::error::dry-run 计划未写入 Step Summary"
@@ -210,6 +212,7 @@ jobs:
             echo "$output"
             exit 1
           fi
+          # shellcheck disable=SC2016
           if ! grep -F '| `library/nginx:1.27` | `registry.example.com/flat/library_nginx:1.27` |' "$summary" \
             || ! grep -F '| `library/nginx:1.27` | `registry.example.com/keep/library/nginx:1.27` |' "$summary"; then
             echo "::error::多目标 dry-run 计划未完整写入 Step Summary"
