@@ -1091,6 +1091,126 @@ jobs:
           }
           echo "✓ 下载失败分类正确（无附件 / 名字不匹配 / 网络 EOF / 过期 / unknown）"
 
+          # 重试逻辑（Issue #97）同样只能 mock：「带附件但下载失败」依赖网络
+          # 抖动，真实环境构造不出来。download_reports 整体跑在 mock gh 上，
+          # 三个用例覆盖「重试成功 / 重试仍失败 / 不重试的类别」
+          sed -n '/^download_reports()/,/^}/p' scripts/history.sh >> /tmp/download-fns.sh
+
+          cat > /tmp/test-retry.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          source /tmp/download-fns.sh
+
+          # 生产文件的日志函数（mock：直接写 stderr，文本即断言对象）
+          log_info()  { printf '%s\n' "$*" >&2; }
+          log_warn()  { printf '%s\n' "$*" >&2; }
+          log_error() { printf '%s\n' "$*" >&2; }
+          die() { log_error "$*"; exit 1; }
+
+          WORK_BASE="$(mktemp -d)"
+          trap 'rm -rf "$WORK_BASE"' EXIT
+
+          # 间隔的值不在断言范围（PRD 明确不做参数化），mock 掉让 CI 不白等。
+          # 计数走文件而不是变量：download_reports 在命令替换的子 shell 里
+          # 执行，子 shell 里对全局变量的赋值传不回父进程
+          sleep() { echo x >> "${WORK_BASE}/sleeps"; }
+
+          # gh mock：run list 返回 GH_RUN_IDS；download 按 GH_BEHAVIOR_<id> 表现
+          # （fail-first=首败后成功 / always-fail=一直网络错误 / no-artifact=无附件）；
+          # api 按 GH_API_FIXTURE 返回。download 计数用文件（bash 3.2 没有关联数组）
+          gh() {
+            if [[ "$1" == "run" && "$2" == "list" ]]; then
+              printf '%s\n' "${GH_RUN_IDS[@]}"
+              return 0
+            fi
+            if [[ "$1" == "run" && "$2" == "download" ]]; then
+              local id="$3" cnt behavior
+              cnt="$(cat "${WORK_BASE}/dl-${id}" 2>/dev/null || echo 0)"
+              cnt=$((cnt + 1))
+              echo "$cnt" > "${WORK_BASE}/dl-${id}"
+              behavior="GH_BEHAVIOR_${id}"
+              case "${!behavior:-}" in
+                fail-first)  if [[ "$cnt" -eq 1 ]]; then printf 'Get "https://objects.githubusercontent.com/x": EOF' >&2; return 1; fi; return 0 ;;
+                always-fail) printf 'Get "https://objects.githubusercontent.com/x": EOF' >&2; return 1 ;;
+                no-artifact) printf 'no valid artifacts found to download' >&2; return 1 ;;
+                *) return 0 ;;
+              esac
+            fi
+            if [[ "$1" == "api" ]]; then
+              if [[ "${GH_API_FIXTURE:-}" == "yes" ]]; then
+                printf '{"artifacts":[{"name":"rep","expired":false}]}'
+              else
+                printf '{"artifacts":[]}'
+              fi
+              return 0
+            fi
+            return 127
+          }
+
+          # 公共环境
+          LIMIT=5
+          REPORT_NAME="rep"
+          WORKFLOW_FILTER=""
+          CHECK_MODE=""
+          WORK_DIR=""
+
+          # --- 用例 A：重试成功（100 首败后成功，200 无附件不重试）---
+          GH_RUN_IDS=(100 200)
+          GH_BEHAVIOR_100="fail-first"
+          GH_BEHAVIOR_200="no-artifact"
+          GH_API_FIXTURE="yes"
+          rm -f "${WORK_BASE}/sleeps"
+          out="$(download_reports 2>&1)"
+          grep -q '对 1 次失败的下载重试' <<<"$out" || { echo "FAIL: 应对 1 次失败重试"; echo "$out"; exit 1; }
+          grep -q '重试挽回 1 次下载' <<<"$out" || { echo "FAIL: 应挽回 1 次下载"; echo "$out"; exit 1; }
+          grep -q '有 1 次带同步报告' <<<"$out" || { echo "FAIL: got 应为 1"; echo "$out"; exit 1; }
+          grep -q '应下载却失败' <<<"$out" && { echo "FAIL: 重试成功后不应再报失败"; echo "$out"; exit 1; }
+          [[ "$(cat "${WORK_BASE}/dl-200")" == "1" ]] || { echo "FAIL: 无附件运行不应被重试（只下载 1 次）"; exit 1; }
+          sleeps="$(grep -c . "${WORK_BASE}/sleeps" 2>/dev/null)" || sleeps=0
+          [[ "$sleeps" -eq 1 ]] || { echo "FAIL: 应只在重试前等待 1 次，实际 ${sleeps}"; exit 1; }
+          echo "✓ 重试成功：计入 got、无附件不重试"
+
+          # --- 用例 B：重试仍失败（100 一直失败，确认有附件）---
+          GH_RUN_IDS=(100)
+          GH_BEHAVIOR_100="always-fail"
+          GH_API_FIXTURE="yes"
+          rm -f "${WORK_BASE}/sleeps"
+          set +e
+          out="$(download_reports 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 1 ]] || { echo "FAIL: 全部失败应 die（退出码 1），实际 ${code}"; exit 1; }
+          grep -q '对 1 次失败的下载重试' <<<"$out" || { echo "FAIL: 应有重试动作"; echo "$out"; exit 1; }
+          grep -q '重试挽回' <<<"$out" && { echo "FAIL: 不应谎报挽回"; exit 1; }
+          grep -q '1 次应下载却失败' <<<"$out" || { echo "FAIL: 报错文案应如实报告失败"; echo "$out"; exit 1; }
+          sleeps="$(grep -c . "${WORK_BASE}/sleeps" 2>/dev/null)" || sleeps=0
+          [[ "$sleeps" -eq 1 ]] || { echo "FAIL: 仍失败也应等待后重试 1 次，实际 ${sleeps}"; exit 1; }
+          echo "✓ 重试仍失败：退出码与文案与 v1.11 一致"
+
+          # --- 用例 C：无附件不触发重试 ---
+          GH_RUN_IDS=(100)
+          GH_BEHAVIOR_100="no-artifact"
+          GH_API_FIXTURE="empty"
+          rm -f "${WORK_BASE}/sleeps"
+          set +e
+          out="$(download_reports 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 1 ]] || { echo "FAIL: 无附件应 die（退出码 1），实际 ${code}"; exit 1; }
+          grep -q '重试' <<<"$out" && { echo "FAIL: 无附件不应触发重试"; echo "$out"; exit 1; }
+          grep -q '没有任何' <<<"$out" || { echo "FAIL: 应报现有文案"; echo "$out"; exit 1; }
+          sleeps="$(grep -c . "${WORK_BASE}/sleeps" 2>/dev/null)" || sleeps=0
+          [[ "$sleeps" -eq 0 ]] || { echo "FAIL: 不重试就不应等待，实际 ${sleeps}"; exit 1; }
+          echo "✓ 无附件：不重试，文案不变"
+
+          echo "MOCK-OK"
+          SCRIPT
+          bash /tmp/test-retry.sh | grep -q 'MOCK-OK' || {
+            echo "::error::报告下载的重试逻辑不符合预期"
+            exit 1
+          }
+          echo "✓ 下载重试正确（挽回计入 got / 全败如实报错 / 无附件与过期不重试）"
+
       - name: 验证凭证映射文件
         run: |
           #!/usr/bin/env bash
