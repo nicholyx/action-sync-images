@@ -10,7 +10,14 @@
 ## [Unreleased]
 ### 新增
 
-- **dry-run 同步计划预览**：默认同步模式在 `--dry-run` 时先输出筛选后的源镜像、目标数量、执行路径、平台策略与源 → 目标映射，并写入 GitHub Step Summary。计划复用同一套目标解析，不预测 `--skip-existing` 结果，也不虚构未显式指定的平台；只读检查模式保持原有 dry-run 忽略语义
+## [1.13.0] - 2026-09-16
+
+本轮主题是动手之前先看到将要发生什么：`--dry-run` 从「打印命令」升级为「先给计划」。这也是项目的第一个外部功能贡献。
+
+### 新增
+
+- **dry-run 同步计划预览**（[@liang-zhenxiang](https://github.com/liang-zhenxiang) 的首次贡献，[#94](https://github.com/nicholyx/action-sync-images/issues/94)）：默认同步模式在 `--dry-run` 时先输出筛选后的源镜像、目标数量、执行路径、平台策略与源 → 目标映射，并写入 GitHub Step Summary。计划复用同一套目标解析，不预测 `--skip-existing` 结果，也不虚构未显式指定的平台；只读检查模式保持原有 dry-run 忽略语义
+
 ## [1.12.0] - 2026-09-16
 
 本轮主题是文档同步：把 v1.8~v1.11 落地时的设计决策补进架构文档，README 路线图跟上——设计记录的价值在于改设计前先确认不是把记录过的决定改回去。
