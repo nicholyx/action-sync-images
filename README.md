@@ -65,6 +65,7 @@
 - **锁文件可校验** —— `--audit-lock` 定期确认上游的 tag 还是你锁定的那份 digest，上游悄悄覆盖 tag 时第一时间知道
 - **网页上就能体检** —— `Check-Registry` 工作流一键跑上面两项检查，不用装任何工具，结果进运行页面的 Summary 并可推送通知
 - **结果一目了然** —— 运行结束直接生成结果表格，无需翻日志
+- **失败后知道怎么办** —— 同步失败时，运行页面直接给出**可粘贴的重跑清单**（`Sync-Batch` 给锚定正则），复制一次就能只重跑失败的那些，不必自己从表格里一个个抄
 - **可看趋势** —— `scripts/history.sh` 汇总历次报告，回答「哪个镜像总在失败」「哪个镜像一直落后 / 一直在漂移」
 - **可在本地复现** —— 同一套逻辑封装成 `scripts/sync.sh`，本地也能跑；`--dry-run` 会先输出源 → 目标同步计划，再打印实际命令
 - **目标仓库可配置** —— 换命名空间或区域不需要改代码
@@ -479,7 +480,9 @@ brew install skopeo regclient   # macOS
 
 完整清单见 [路线图 Issue #4](https://github.com/nicholyx/action-sync-images/issues/4)——那里是面向贡献者的工作清单，每项都对应一个独立 Issue，包含背景、入手位置与验收标准。
 
-> 目前暂无排期中的新功能。有想法？欢迎[提 Issue](https://github.com/nicholyx/action-sync-images/issues/new/choose) 讨论——高质量的提议最好带上真实的使用场景。
+**v1.15.0 · 失败后的可操作化**（进行中）：同步失败后，Step Summary 与报告里直接给出可粘贴的失败项清单（`Sync-Batch` 为锚定 filter 正则），把重跑交到人手里 —— [#101](https://github.com/nicholyx/action-sync-images/issues/101)
+
+> 有想法？欢迎[提 Issue](https://github.com/nicholyx/action-sync-images/issues/new/choose) 讨论——高质量的提议最好带上真实的使用场景。
 
 ---
 
