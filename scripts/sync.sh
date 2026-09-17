@@ -137,6 +137,13 @@ declare -a R_NOTE=()
 declare -a R_SRC_DIGEST=()
 declare -a R_DEST_DIGEST=()
 
+# 重跑指引：同步失败之后，告诉使用者「重跑什么、怎么重跑」。
+# 由 collect_rerun_items 一次算出，Step Summary / 报告 md / 报告 json 三处
+# 共用同一份结果——三处各自再算一遍的话，口径漂移会让它们互相矛盾。
+declare -a RERUN_IMAGES=()
+RERUN_FILTER=""
+RERUN_NOT_RERUNNABLE=0
+
 # 审计结果数组，由 load_audit_results 从 WORK_DIR 读入。
 # 刻意与同步结果分开：审计的状态值域（最新 / 落后 / 缺失 / 无法判定）
 # 与同步（成功 / 跳过 / 失败）不是一回事，混在一套数组里会让报告、
@@ -3075,6 +3082,148 @@ send_notification() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# 重跑指引
+#
+# v1.11 让失败如实报告，v1.14 让瞬时抖动自动挽回一轮。这一段补的是持续失败
+# 之后的最后一跳：把「重跑」直接交到使用者手里——复制一段、粘一次即可，
+# 不必自己从报告里抄镜像名、再去拼一条带筛选参数的运行。
+# ---------------------------------------------------------------------------
+
+# 转义 ERE 元字符，让镜像引用能安全地拼进 --filter 的正则。
+#
+# 必须转义：--filter 走的是 grep -E，`.` 之类会退化成通配，而镜像引用里点号
+# 几乎必然出现。实测 BSD sed（macOS 自带）与 GNU sed（CI）行为一致。
+ere_escape() {
+  printf '%s' "$1" | sed 's/[][\^$.|*+?(){}]/\\&/g'
+}
+
+# 当前跑在哪个同步工作流里，决定重跑指引给哪种形态。
+#
+# 用 GITHUB_WORKFLOW_REF（含工作流文件名）而不是 GITHUB_WORKFLOW（页面上的
+# 显示名）：后者随时可以改，前者跟着文件走。两个都拿不到（本地跑）时退化为
+# list —— 镜像清单对任何入口都有参考价值，正则给错了则会把作用域指偏。
+rerun_style() {
+  case "${GITHUB_WORKFLOW_REF:-}" in
+    *sync-images-batch.yml*) printf '%s' "filter" ;;
+    *)                       printf '%s' "list" ;;
+  esac
+}
+
+# 挑出「值得重跑」的失败项。三处消费方共用这一份结果。
+#
+# 判定是两条：状态为 failed，且失败原因不是「镜像引用格式错误」——后者重跑
+# 多少次都还是同样的结果，列进清单只会让人白跑一趟。被排除的项不静默消失，
+# 计数留在 RERUN_NOT_RERUNNABLE 里由渲染层交代（「排除的东西必须可见」）。
+#
+# 结果走全局变量：本文件对「命令替换是子 shell、赋值传不回父进程」有过多轮
+# 教训，多值一律用全局变量传出。
+collect_rerun_items() {
+  RERUN_IMAGES=()
+  RERUN_FILTER=""
+  RERUN_NOT_RERUNNABLE=0
+
+  # dry-run 没有真正推送过任何东西，谈不上「重跑失败项」。
+  [[ "$DRY_RUN" == "true" ]] && return 0
+
+  local i ref
+  local -a seen=()
+  for i in "${!R_STATUS[@]}"; do
+    [[ "${R_STATUS[$i]}" == "failed" ]] || continue
+
+    if [[ "${R_NOTE[$i]}" == 镜像引用格式错误* ]]; then
+      RERUN_NOT_RERUNNABLE=$((RERUN_NOT_RERUNNABLE + 1))
+      continue
+    fi
+
+    ref="${R_SRC[$i]}"
+    [[ -n "$ref" ]] || continue
+
+    # 保序去重：多目标时同一个源会出现多行，而重跑只要列一次。
+    # bash 3.2 没有关联数组，失败项数量又小，线性查一遍足够。
+    local dup=""
+    if [[ ${#seen[@]} -gt 0 ]]; then
+      local s
+      for s in "${seen[@]}"; do
+        if [[ "$s" == "$ref" ]]; then dup=1; break; fi
+      done
+    fi
+    [[ -n "$dup" ]] && continue
+
+    seen+=("$ref")
+    RERUN_IMAGES+=("$ref")
+  done
+
+  # 拼锚定正则。锚点是必须的：--filter 是部分匹配（grep -E），不锚定的话
+  # nginx:1.27 会连带把 nginx:1.27-alpine 一类也匹配进来。
+  # 另外要容忍 docker:// 前缀——filter 匹配的是**规范化之前**的原始串，
+  # 而清单里的 ref 取自规范化之后的结果，两者可能差一个前缀。
+  if [[ ${#RERUN_IMAGES[@]} -gt 0 ]]; then
+    local joined="" part
+    for ref in "${RERUN_IMAGES[@]}"; do
+      part="$(ere_escape "$ref")"
+      [[ -n "$joined" ]] && joined+="|"
+      joined+="$part"
+    done
+    RERUN_FILTER="^(docker://)?(${joined})$"
+  fi
+
+  return 0
+}
+
+# 渲染「重跑失败项」这一节（markdown，写到 stdout）。
+#
+# 没有失败项或 dry-run 时输出空，调用方据此决定要不要写出这一节——
+# 全绿不打扰。参数是标题级别：Step Summary 的顶层小节用 ###，报告 md 用 ##。
+render_rerun_section() {
+  local level="${1:-###}"
+
+  if [[ ${#RERUN_IMAGES[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  local n=${#RERUN_IMAGES[@]}
+  local style
+  style="$(rerun_style)"
+
+  # 只有 Batch 走正则形态，且正则必须通过语法自检——拼错了宁可不给正则，
+  # 也不能给一条会把作用域指偏的。其余情况一律退回清单形态。
+  #
+  # 这里刻意不调 validate_regex：那个函数发现非法正则时会 die，而当前只是
+  # 渲染阶段，正则不可用应当降级，不该让整个运行挂掉。
+  local use_filter=""
+  if [[ "$style" == "filter" ]] && [[ -n "$RERUN_FILTER" ]]; then
+    local code=0
+    printf '' | grep -Eq -- "$RERUN_FILTER" 2>/dev/null || code=$?
+    if [[ "$code" -ne 2 ]]; then
+      use_filter=1
+    fi
+  fi
+
+  printf '\n%s 重跑失败项\n\n' "$level"
+
+  # 代码块围栏的反引号写在双引号格式串里并转义——写在单引号里会触发
+  # SC2016（静态检查把反引号当成不会展开的表达式）。
+  if [[ -n "$use_filter" ]]; then
+    printf "本次有 %s 个镜像失败。复制下面的正则，粘进本工作流的 \`filter\` 输入，重新运行即可只重跑它们：\n\n" "$n"
+    printf "\`\`\`\n%s\n\`\`\`\n" "$RERUN_FILTER"
+  else
+    printf "本次有 %s 个镜像失败。复制下面的镜像列表，粘进本工作流的 \`images_src\` 输入，重新运行即可只重跑它们：\n\n" "$n"
+    printf "\`\`\`\n"
+    local ref
+    for ref in "${RERUN_IMAGES[@]}"; do
+      printf '%s\n' "$ref"
+    done
+    printf "\`\`\`\n"
+  fi
+
+  if [[ "$RERUN_NOT_RERUNNABLE" -gt 0 ]]; then
+    printf '\n> 另有 %s 个因镜像引用格式错误，重跑不会成功，未列入。\n' "$RERUN_NOT_RERUNNABLE"
+  fi
+
+  return 0
+}
+
 emit_summary() {
   local ok=0 fail=0 skipped=0 excluded=0 i
   for i in "${!R_STATUS[@]}"; do
@@ -3116,6 +3265,11 @@ emit_summary() {
   done
   printf '%s\n' "────────────────────────────────────────────────────────" >&2
 
+  # ---- 重跑指引的聚合 ----
+  # 三个消费方（Step Summary、报告 md、报告 json）共用这一份结果，所以在这里
+  # 算一次，而不是各算各的——口径不一致时，页面和报告会互相矛盾。
+  collect_rerun_items
+
   # ---- GitHub Step Summary ----
   # 这是 GitHub 原生的能力：运行结束后在 Actions 页面直接渲染成表格，
   # 不需要点开日志逐行翻找。
@@ -3140,6 +3294,14 @@ emit_summary() {
       if [[ "$excluded" -gt 0 ]]; then
         echo ""
         echo "> 另有 ${excluded} 个镜像被 \`--filter\` / \`--exclude\` 排除，未参与本次同步。"
+      fi
+
+      # 重跑指引排在耗时排行之前：失败之后最要紧的是「怎么办」，
+      # 它比「哪些慢」更该先被看到。
+      local rerun_md
+      rerun_md="$(render_rerun_section "###")"
+      if [[ -n "$rerun_md" ]]; then
+        echo "$rerun_md"
       fi
 
       # 耗时排行。一批镜像的总耗时几乎总是被其中一两个主导——
@@ -3213,6 +3375,14 @@ write_report() {
       echo "| \`${R_SRC[$i]}\` | \`${R_DEST[$i]}\` | ${icon} | ${R_PLATFORM[$i]:-—} | \`${R_SRC_DIGEST[$i]:-—}\` | \`${R_DEST_DIGEST[$i]:-—}\` | ${R_SECONDS[$i]}s |"
     done
 
+    # 与 Step Summary 共用同一段渲染，避免两处各写一遍后悄悄漂移。
+    # 标题级别不同：这里是报告的顶层小节（##），Summary 里是 ###。
+    local rerun_md
+    rerun_md="$(render_rerun_section "##")"
+    if [[ -n "$rerun_md" ]]; then
+      echo "$rerun_md"
+    fi
+
     local ranking
     ranking="$(duration_ranking_rows 5)"
     if [[ -n "$ranking" ]]; then
@@ -3238,6 +3408,19 @@ write_report() {
     printf '  "excluded": %s,\n' "$excluded"
     printf '  "filter": "%s",\n' "$FILTER_REGEX"
     printf '  "exclude": "%s",\n' "$EXCLUDE_REGEX"
+    # 重跑指引的机器可读形态。filter 里的反斜杠必须转义成 \\，否则拼出来的
+    # 就不是合法 JSON——这里是裸 printf 拼接，没有 jq 兜底。
+    # 无失败项时三个字段都是零值，字段本身始终存在，消费方不必判空。
+    printf '  "rerun": {"images": ['
+    if [[ ${#RERUN_IMAGES[@]} -gt 0 ]]; then
+      for i in "${!RERUN_IMAGES[@]}"; do
+        printf '"%s"' "${RERUN_IMAGES[$i]}"
+        if [[ "$i" -lt $((${#RERUN_IMAGES[@]} - 1)) ]]; then
+          printf ', '
+        fi
+      done
+    fi
+    printf '], "filter": "%s", "not_rerunnable": %s},\n' "${RERUN_FILTER//\\/\\\\}" "$RERUN_NOT_RERUNNABLE"
     printf '  "images": [\n'
     for i in "${!R_SRC[@]}"; do
       printf '    {"source": "%s", "dest": "%s", "status": "%s", "platforms": "%s", "source_digest": "%s", "dest_digest": "%s", "seconds": %s}' \
