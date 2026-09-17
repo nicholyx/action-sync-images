@@ -907,6 +907,116 @@ jobs:
           fi
           echo "✓ 无有效耗时数据时排行自动隐去"
 
+      - name: 验证重跑指引
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 重跑指引用「提取生产函数 + 伪造 R_* 输入」验证：稳定的同步失败
+          # 需要网络与凭证，构造不出可重复的场景。
+          for fn in ere_escape rerun_style collect_rerun_items render_rerun_section \
+                    short_digest duration_ranking_rows write_report emit_summary; do
+            sed -n "/^${fn}()/,/^}/p" scripts/sync.sh
+          done > /tmp/rerun-fns.sh
+          grep -q 'collect_rerun_items()' /tmp/rerun-fns.sh || { echo "::error::函数提取失败"; exit 1; }
+
+          cat > /tmp/test-rerun-ci.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          source /tmp/rerun-fns.sh
+
+          # mock 掉外部依赖，只留被测逻辑
+          log_info() { :; }
+          log_dim() { :; }
+          write_lockfile() { :; }
+          send_notification() { :; }
+          C_GREEN=""; C_RESET=""; C_DIM=""; C_RED=""; C_YELLOW=""
+
+          fail() { echo "FAIL: $1"; exit 1; }
+
+          setup() {
+            DRY_RUN=false
+            REPORT_DIR="$(mktemp -d)"
+            REPORT_NAME="sync-report"
+            DEST_EXACT="r.example.com/x"
+            DEST_REGISTRIES=()
+            STRIP_ATTESTATION=false
+            FILTER_REGEX=""; EXCLUDE_REGEX=""; WRITE_LOCK=""
+            GITHUB_STEP_SUMMARY="$(mktemp)"
+            R_SRC=('nginx:1.27' 'redis:7.2' 'bad::ref')
+            R_DEST=('r/x/nginx:1.27' 'r/x/redis:7.2' '—')
+            R_STATUS=('failed' 'success' 'failed')
+            R_PLATFORM=('linux/amd64' 'linux/amd64' '—')
+            R_SECONDS=('3' '2' '0')
+            R_SRC_DIGEST=('sha256:aa' 'sha256:bb' '')
+            R_DEST_DIGEST=('' 'sha256:bb' '')
+            R_NOTE=('同步失败，详见上方日志' '' '镜像引用格式错误：仓库名不合法')
+          }
+
+          # --- 1. 转义与锚定的精确性（走真实 grep -E，与 --filter 同一条路径）---
+          esc="$(ere_escape 'nginx:1.27')"
+          [[ "$esc" == 'nginx:1\.27' ]] || fail "转义结果不对：$esc"
+          re="^(docker://)?(${esc})$"
+          printf '%s\n' 'nginx:1.27'           | grep -Eq -- "$re" || fail "应匹配原串"
+          printf '%s\n' 'docker://nginx:1.27'  | grep -Eq -- "$re" || fail "应容忍 docker:// 前缀"
+          if printf '%s\n' 'nginx:1.27-alpine' | grep -Eq -- "$re"; then
+            fail "锚定失效：误命中了 nginx:1.27-alpine"
+          fi
+
+          # --- 2. Aliyuncs 形态：给清单 + 指引 images_src ---
+          setup
+          GITHUB_WORKFLOW_REF='o/r/.github/workflows/sync-images-aliyuncs.yml@refs/heads/main'
+          emit_summary >/dev/null 2>&1 || true
+          grep -q '重跑失败项' "$GITHUB_STEP_SUMMARY" || fail "Summary 缺少重跑节"
+          grep -q 'images_src' "$GITHUB_STEP_SUMMARY" || fail "未指引 images_src"
+          grep -q '另有 1 个因镜像引用格式错误' "$GITHUB_STEP_SUMMARY" || fail "缺少不可重跑计数句"
+
+          # 重跑节里只能有失败项——断言只针对这一节：主表格本来就列全部镜像
+          awk '/重跑失败项/{f=1} f' "$GITHUB_STEP_SUMMARY" > "${REPORT_DIR}/block.txt"
+          grep -q 'nginx:1.27' "${REPORT_DIR}/block.txt" || fail "重跑节缺失败镜像"
+          if grep -q 'redis:7.2' "${REPORT_DIR}/block.txt"; then fail "重跑节混入了成功项"; fi
+
+          grep -q '重跑失败项' "${REPORT_DIR}/sync-report.md" || fail "md 报告缺少重跑节"
+
+          # --- 3. json 字段与往返一致性 ---
+          jq -e '.rerun' "${REPORT_DIR}/sync-report.json" >/dev/null || fail "json 缺 rerun 字段"
+          [[ "$(jq -r '.rerun.images | join(",")' "${REPORT_DIR}/sync-report.json")" == "nginx:1.27" ]] \
+            || fail "json images 不对"
+          [[ "$(jq -r '.rerun.not_rerunnable' "${REPORT_DIR}/sync-report.json")" == "1" ]] \
+            || fail "json not_rerunnable 不对"
+          [[ "$(jq -r '.rerun.filter' "${REPORT_DIR}/sync-report.json")" == '^(docker://)?(nginx:1\.27)$' ]] \
+            || fail "json filter 往返不一致（反斜杠转义有问题）"
+
+          # --- 4. Batch 形态：给锚定正则 + 指引 filter ---
+          setup
+          GITHUB_WORKFLOW_REF='o/r/.github/workflows/sync-images-batch.yml@refs/heads/main'
+          emit_summary >/dev/null 2>&1 || true
+          # 用 -F：待断言的是正则字面量，裸 grep 会按 BRE 解释，永远匹配不上
+          grep -qF '^(docker://)?(nginx:1\.27)$' "$GITHUB_STEP_SUMMARY" || fail "Batch 未给出锚定正则"
+
+          # --- 5. 全绿时整节不出现 ---
+          setup
+          R_SRC=('nginx:1.27'); R_STATUS=('success'); R_NOTE=('')
+          emit_summary >/dev/null 2>&1 || true
+          if grep -q '重跑失败项' "$GITHUB_STEP_SUMMARY"; then fail "全绿时不应出现重跑节"; fi
+          if grep -q '重跑失败项' "${REPORT_DIR}/sync-report.md"; then fail "全绿时 md 不应出现重跑节"; fi
+          [[ "$(jq -r '.rerun.images | length' "${REPORT_DIR}/sync-report.json")" == "0" ]] \
+            || fail "全绿时 json 应为零值"
+
+          # --- 6. dry-run 不出现（没有真正推送过，谈不上重跑）---
+          setup
+          DRY_RUN=true
+          R_SRC=('nginx:1.27'); R_STATUS=('failed'); R_NOTE=('同步失败')
+          emit_summary >/dev/null 2>&1 || true
+          if grep -q '重跑失败项' "$GITHUB_STEP_SUMMARY"; then fail "dry-run 不应出现重跑节"; fi
+
+          echo "RERUN-OK"
+          SCRIPT
+
+          output="$(bash /tmp/test-rerun-ci.sh 2>&1)" || { echo "$output"; echo "::error::重跑指引不符合预期"; exit 1; }
+          grep -q 'RERUN-OK' <<<"$output" || { echo "$output"; echo "::error::重跑指引未通过"; exit 1; }
+          echo "✓ 重跑指引的形态选择、可重跑判定与三个落点都正确"
+
       - name: 验证完整性校验的差异判定
         run: |
           #!/usr/bin/env bash
