@@ -1,0 +1,9 @@
+{"file": ".trellis/spec/engine/index.md", "reason": "改 sync.sh 的开工前必读：既有封装、并发模型、新参数必须进「不生效」告警矩阵"}
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "bash 3.2 硬规则——本次新增数组遍历、字符串处理与全局变量传出，每条都踩过"}
+{"file": ".trellis/spec/engine/modes.md", "reason": "同步模式状态值域与报告 schema 契约；确认不新增参数即可不动告警矩阵"}
+{"file": ".trellis/spec/guides/index.md", "reason": "九条设计原则，其中原则 1（错误信息比没有信息更糟）、2（排除必须可见）、4（检查与搬运分开）、8（失败定位到最小单元）直接约束本次取舍"}
+{"file": ".trellis/tasks/09-17-rerun-command/design.md", "reason": "本任务技术设计：函数划分、判定契约、呈现形态、被否掉的方案"}
+{"file": ".trellis/tasks/09-17-rerun-command/research/failure-collection-and-reports.md", "reason": "R_* 并行数组结构、write_report 的 md/json 真实字段名与插入点、三种失败来源"}
+{"file": ".trellis/tasks/09-17-rerun-command/research/check-modes-and-step-summary.md", "reason": "Step Summary 的五处写入点与同步模式的当前结构（插入位置依据）"}
+{"file": ".trellis/tasks/09-17-rerun-command/research/rerun-capabilities-and-filter-semantics.md", "reason": "filter 是部分匹配 + 单值覆盖 + 匹配未规范化串——本设计核心风险点，锚定与转义的依据"}
+{"file": ".trellis/tasks/09-17-rerun-command/research/workflow-layer-parameters.md", "reason": "四个工作流的传参与入口差异，决定形态选择（清单 vs 正则）"}

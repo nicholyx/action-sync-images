@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/engine/index.md", "reason": "Quality Check 清单：lint 全绿、本地 mock 验证、CI 断言先在本地复现"}
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "逐条核对 bash 3.2 禁忌与退出码规则"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "报告 json 的 schema 是跨层契约，consumer 是 history.sh——核对类型与字段"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "确认改后不再有第二份 json 构造实现"}

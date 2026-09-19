@@ -1,0 +1,8 @@
+{"file": ".trellis/spec/engine/index.md", "reason": "Quality Check 清单：lint 全绿、新增行为本地验证、真实路径进 CI"}
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "核对新增代码是否踩 bash 3.2 禁忌；空数组遍历前是否判长度；命令替换是否被误用于多值传出"}
+{"file": ".trellis/spec/engine/modes.md", "reason": "核对报告 schema 与两条铁律（无法判定单独成类、被排除项必须可见）是否被遵守"}
+{"file": ".trellis/spec/guides/index.md", "reason": "逐条核对九条设计原则，重点是原则 1（不给会误跑的指引）与原则 2（未列入项必须交代）"}
+{"file": ".trellis/tasks/09-17-rerun-command/prd.md", "reason": "验收标准逐条核对"}
+{"file": ".trellis/tasks/09-17-rerun-command/design.md", "reason": "核对实现是否偏离设计契约：形态选择、json 字段、正则自检降级路径、dry-run 不出现"}
+{"file": ".trellis/tasks/09-17-rerun-command/research/failure-collection-and-reports.md", "reason": "核对插入点与字段名与实际代码一致（json 字段顺序、note 的三种来源）"}
+{"file": ".trellis/tasks/09-17-rerun-command/research/rerun-capabilities-and-filter-semantics.md", "reason": "核对锚定与转义断言是否覆盖已知误命中场景（nginx:1.27 vs nginx:1.27-alpine）"}

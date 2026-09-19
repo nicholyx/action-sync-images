@@ -3395,45 +3395,66 @@ write_report() {
     fi
   } > "$md"
 
+  # json 交给 jq 构造：镜像引用可能含引号、反斜杠或控制字符（FIELD_SEP 就是
+  # U+001F），手工拼接要完整实现一遍 JSON 字符串转义才可能正确。字符串用
+  # --arg、数字用 --argjson 传，保住类型不被降级成 string——history.sh 的
+  # map(.total) | add 依赖 number。与 write_check_report_files 同一条路径。
   local json="${REPORT_DIR}/${REPORT_NAME}.json"
-  {
-    printf '{\n'
-    printf '  "generated_at": "%s",\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-    printf '  "dest_registry": "%s",\n' "${DEST_EXACT:-${DEST_REGISTRIES[*]}}"
-    printf '  "strip_attestation": %s,\n' "$STRIP_ATTESTATION"
-    printf '  "total": %s,\n' "$total"
-    printf '  "success": %s,\n' "$ok"
-    printf '  "skipped": %s,\n' "$skipped"
-    printf '  "failed": %s,\n' "$fail"
-    printf '  "excluded": %s,\n' "$excluded"
-    printf '  "filter": "%s",\n' "$FILTER_REGEX"
-    printf '  "exclude": "%s",\n' "$EXCLUDE_REGEX"
-    # 重跑指引的机器可读形态。filter 里的反斜杠必须转义成 \\，否则拼出来的
-    # 就不是合法 JSON——这里是裸 printf 拼接，没有 jq 兜底。
-    # 无失败项时三个字段都是零值，字段本身始终存在，消费方不必判空。
-    printf '  "rerun": {"images": ['
-    if [[ ${#RERUN_IMAGES[@]} -gt 0 ]]; then
-      for i in "${!RERUN_IMAGES[@]}"; do
-        printf '"%s"' "${RERUN_IMAGES[$i]}"
-        if [[ "$i" -lt $((${#RERUN_IMAGES[@]} - 1)) ]]; then
-          printf ', '
-        fi
-      done
-    fi
-    printf '], "filter": "%s", "not_rerunnable": %s},\n' "${RERUN_FILTER//\\/\\\\}" "$RERUN_NOT_RERUNNABLE"
-    printf '  "images": [\n'
-    for i in "${!R_SRC[@]}"; do
-      printf '    {"source": "%s", "dest": "%s", "status": "%s", "platforms": "%s", "source_digest": "%s", "dest_digest": "%s", "seconds": %s}' \
-        "${R_SRC[$i]}" "${R_DEST[$i]}" "${R_STATUS[$i]}" "${R_PLATFORM[$i]:-}" \
-        "${R_SRC_DIGEST[$i]:-}" "${R_DEST_DIGEST[$i]:-}" "${R_SECONDS[$i]}"
-      if [[ "$i" -lt $((${#R_SRC[@]} - 1)) ]]; then
-        printf ','
-      fi
-      printf '\n'
-    done
-    printf '  ]\n'
-    printf '}\n'
-  } > "$json"
+  # 中间文件用 mktemp 而不是 WORK_DIR：write_report 会被单测整段抽出到独立
+  # 上下文执行（见 CI 的「验证重跑指引」），那里没有 WORK_DIR，set -u 下普通
+  # 展开会当场 unbound variable。自身的临时文件不该依赖运行的临时目录生命周期。
+  local records_file
+  records_file="$(mktemp "${TMPDIR:-/tmp}/sync-report-images.XXXXXX")"
+  : > "$records_file"
+  for i in "${!R_SRC[@]}"; do
+    jq -n --arg source "${R_SRC[$i]}" \
+          --arg dest "${R_DEST[$i]}" \
+          --arg status "${R_STATUS[$i]}" \
+          --arg platforms "${R_PLATFORM[$i]:-}" \
+          --arg source_digest "${R_SRC_DIGEST[$i]:-}" \
+          --arg dest_digest "${R_DEST_DIGEST[$i]:-}" \
+          --argjson seconds "${R_SECONDS[$i]:-0}" \
+      '{source:$source, dest:$dest, status:$status, platforms:$platforms,
+        source_digest:$source_digest, dest_digest:$dest_digest, seconds:$seconds}' \
+      >> "$records_file"
+  done
+
+  # 重跑指引的机器可读形态。无失败项时三个字段都是零值，字段本身始终存在，
+  # 消费方不必判空。
+  #
+  # 空数组必须走 else 分支单独写：bash 3.2 + set -u 下 "空数组[@]" 的展开会抛
+  # unbound variable（CI 的 bash 5 不复现，只在 macOS 自带 bash 暴露）。
+  local rerun_json
+  if [[ ${#RERUN_IMAGES[@]} -gt 0 ]]; then
+    # 用 $ARGS.positional 而不是 $ARGS：后者是整个 {positional, named} 对象，
+    # 写错会把 images 变成对象而不是字符串数组。
+    rerun_json="$(jq -n --arg filter "$RERUN_FILTER" \
+      --argjson not_rerunnable "$RERUN_NOT_RERUNNABLE" \
+      --args '{images:$ARGS.positional, filter:$filter, not_rerunnable:$not_rerunnable}' \
+      "${RERUN_IMAGES[@]}")"
+  else
+    rerun_json="$(jq -n --arg filter "$RERUN_FILTER" \
+      --argjson not_rerunnable "$RERUN_NOT_RERUNNABLE" \
+      '{images:[], filter:$filter, not_rerunnable:$not_rerunnable}')"
+  fi
+
+  # --argjson 把上一步的 JSON 文本嵌回来，jq 原样保留其结构而不会二次转义成
+  # 字符串；--slurpfile 对空文件产出 [] 而不是 null。
+  jq -n --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    --arg dest "${DEST_EXACT:-${DEST_REGISTRIES[*]}}" \
+    --argjson strip "$STRIP_ATTESTATION" \
+    --argjson total "$total" --argjson success "$ok" \
+    --argjson skipped "$skipped" --argjson failed "$fail" \
+    --argjson excluded "$excluded" \
+    --arg filter "$FILTER_REGEX" --arg exclude "$EXCLUDE_REGEX" \
+    --argjson rerun "$rerun_json" \
+    --slurpfile images "$records_file" \
+    '{generated_at:$at, dest_registry:$dest, strip_attestation:$strip,
+      total:$total, success:$success, skipped:$skipped, failed:$failed,
+      excluded:$excluded, filter:$filter, exclude:$exclude,
+      rerun:$rerun, images:$images}' > "$json"
+
+  rm -f "$records_file"
 
   log_info "报告已写入：${md}"
   log_info "报告已写入：${json}"

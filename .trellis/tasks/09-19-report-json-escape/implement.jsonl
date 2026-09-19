@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/engine/index.md", "reason": "改 sync.sh 前必读：本层既有模式清单与质量门（lint、本地复现 CI 断言、U+FFFD 扫描）"}
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "bash 3.2 禁忌：空数组在 set -u 下展开会抛 unbound variable（本任务 rerun.images 的空分支正踩这条）、退出码与子 shell"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "本任务的病根就是同一文件里两种 json 构造方式并存，改前先看复用原则"}

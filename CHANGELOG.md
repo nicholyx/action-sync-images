@@ -12,6 +12,10 @@
 
 - **重跑指引**：同步失败后，Step Summary 与落盘报告里直接给出**可粘贴的失败项清单**——`Sync-Images-to-AliYuncs` / `Sync-Images-to-Harbor` 给镜像列表（粘进 `images_src` 即可只重跑失败项），`Sync-Batch` 给锚定 filter 正则（粘进 `filter` 输入即可）。正则以 `^…$` 锚定并转义 ERE 元字符，不会把 `nginx:1.27-alpine` 这类同前缀 tag 一并带进来。「镜像引用格式错误」这类重跑也不会成功的项被排除在外，并用一句计数交代，不静默消失。报告 json 新增机器可读的 `rerun` 字段。全绿与 dry-run 时该节不出现
 
+### 修复
+
+- **`sync-report.json` 的 JSON 转义**（[#103](https://github.com/nicholyx/action-sync-images/issues/103)）：json 报告此前由裸 `printf` 逐字段拼接，镜像引用含 `"`、`\` 或控制字符（如 tab）时会**静默产出非法 JSON**——终端照常显示成功，从同步到落盘全程零报错，直到 `history.sh` 解析时才炸，排查时不会联想到「某次同步的镜像名里有引号」。现在改由 `jq` 构造，与三类只读检查报告收拢到同一条路径；字段名、层级、顺序完全不变，类型也锁死：计数类与 `seconds` / `rerun.not_rerunnable` 保持 number，`strip_attestation` 保持 boolean，无失败项时 `rerun.images` 仍是 `[]`
+
 ## [1.14.0] - 2026-09-16
 
 本轮主题是网络韧性：瞬时抖动导致「有附件但下载失败」时自动挽回一次，不必自己重跑整条命令。
