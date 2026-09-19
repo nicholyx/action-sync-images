@@ -278,6 +278,84 @@ jobs:
           fi
           echo "✓ 只读检查模式不渲染同步计划"
 
+      - name: 验证报告 JSON 转义与字段类型
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 镜像引用含引号、反斜杠或控制字符时，sync-report.json 仍必须是合法
+          # JSON，且解析回来的值与输入逐字符相等。裸 printf 拼接时代这里会静默
+          # 产出坏数据，直到 history.sh 解析时才炸——那时已远离现场。
+          report_dir="$(mktemp -d)"
+          ./scripts/sync.sh --src 'ngi"nx:1.0' --dest registry.example.com/smoke \
+            --report-dir "$report_dir" --dry-run >/dev/null
+          json="$report_dir/sync-report.json"
+
+          if ! jq -e . "$json" >/dev/null; then
+            echo "::error::含引号的镜像引用产出了非法 JSON"
+            cat "$json"
+            exit 1
+          fi
+          if [[ "$(jq -r '.images[0].source' "$json")" != 'ngi"nx:1.0' ]]; then
+            echo "::error::source 未与输入逐字符相等"
+            jq -r '.images[0].source' "$json"
+            exit 1
+          fi
+          # dest 由「目标前缀 + 源引用」生成，同样带着那个引号
+          if [[ "$(jq -r '.images[0].dest' "$json")" != 'registry.example.com/smoke/ngi"nx:1.0' ]]; then
+            echo "::error::dest 未与输入逐字符相等"
+            jq -r '.images[0].dest' "$json"
+            exit 1
+          fi
+
+          # 字段类型不变性：history.sh 的 map(.total) | add 依赖 number，
+          # 用 --arg 传值会退化成 string，那比原缺陷更具破坏性。
+          for k in total success skipped failed excluded; do
+            if [[ "$(jq -r ".${k} | type" "$json")" != "number" ]]; then
+              echo "::error::顶层字段 ${k} 不是 number"
+              exit 1
+            fi
+          done
+          if [[ "$(jq -r '.strip_attestation | type' "$json")" != "boolean" ]]; then
+            echo "::error::strip_attestation 不是 boolean"
+            exit 1
+          fi
+          if [[ "$(jq -r '.images[0].seconds | type' "$json")" != "number" ]] \
+            || [[ "$(jq -r '.rerun.not_rerunnable | type' "$json")" != "number" ]]; then
+            echo "::error::seconds / rerun.not_rerunnable 不是 number"
+            exit 1
+          fi
+
+          # 无失败项时 rerun.images 是 []（不是 null），三个字段一个都不能少
+          if ! jq -e '.rerun.images == []' "$json" >/dev/null \
+            || ! jq -e '.rerun | has("filter") and has("not_rerunnable")' "$json" >/dev/null; then
+            echo "::error::无失败项时 rerun 的零值语义不正确"
+            exit 1
+          fi
+
+          # 反斜杠与控制字符（tab）同样不能破坏 JSON
+          for src in 'ngi\x:1.0' $'ngi\tx:1.0'; do
+            dir="$(mktemp -d)"
+            ./scripts/sync.sh --src "$src" --dest registry.example.com/smoke \
+              --report-dir "$dir" --dry-run >/dev/null
+            if ! jq -e --arg s "$src" --arg d "registry.example.com/smoke/$src" \
+              '.images[0].source == $s and .images[0].dest == $d' \
+              "$dir/sync-report.json" >/dev/null; then
+              echo "::error::镜像引用 $(printf '%q' "$src") 未正确转义"
+              exit 1
+            fi
+          done
+          echo "✓ 报告 JSON 转义与字段类型正确"
+
+          # 下游必须能消费新报告（趋势 / 聚合都读同一份 schema）
+          hist_dir="$(mktemp -d)"
+          cp "$json" "$hist_dir/"
+          if ! ./scripts/history.sh --dir "$hist_dir" >/dev/null 2>&1; then
+            echo "::error::history.sh 无法消费新的 sync-report.json"
+            exit 1
+          fi
+          echo "✓ history.sh 可消费新报告"
+
       - name: 验证非法镜像引用会被拦下
         run: |
           #!/usr/bin/env bash
