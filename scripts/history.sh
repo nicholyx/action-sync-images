@@ -578,11 +578,36 @@ print_slowest() {
 # 检查报告趋势（--check audit / --check lock-audit）
 # ---------------------------------------------------------------------------
 
+# 把报告文件分成「能解析」与「不能解析」两组，结果经全局变量传出。
+#
+# 为什么需要：一份坏文件不该让全部趋势失效（jq -s 是一次读整批，一个坏则全废），
+# 也不该被静默丢掉（少算的历史会让「连续失败次数」偏小、该响的告警不响）。
+#
+# 判据只到「是不是合法 JSON」为止，**不做结构校验**：报告 schema 会演进
+# （v1.14 加了 rerun、v1.15 加了 note），旧报告缺新字段是正常的，判成「坏」
+# 会让升级本身变成一次数据失效。
+#
+# 结果走全局变量：本文件对「命令替换是子 shell、赋值传不回父进程」有过多轮教训。
+split_parsable_reports() {
+  PARSABLE_REPORTS=()
+  UNPARSABLE_REPORTS=()
+
+  local f
+  for f in "$@"; do
+    if jq -e . "$f" >/dev/null 2>&1; then
+      PARSABLE_REPORTS+=("$f")
+    else
+      UNPARSABLE_REPORTS+=("$f")
+    fi
+  done
+}
+
 # 从收集到的报告里只留顶层 .check 字段匹配的检查报告。
 #
 # 按 JSON 字段过滤而不是文件名：--dir 目录下可能混放同步报告与
 # 各种检查报告，文件名只是约定，字段才是事实。
-# 解析失败的文件在这里告警跳过——一份坏文件不该毁掉整个趋势。
+# 无法解析的文件已由 split_parsable_reports 在预检阶段拦下并告警，
+# 走到这里 else 分支只剩「能解析、但 check 字段不是我要的那个」一种含义。
 filter_by_check() {
   local check_type="$1"
   shift
@@ -595,7 +620,10 @@ filter_by_check() {
     if [[ -n "$match" ]]; then
       FILTERED_FILES+=("$f")
     else
-      log_warn "跳过非 ${check_type} 报告或无法解析的文件：${f}"
+      # 解析失败的已在 split_parsable_reports 里被拦下并告警，走到这里的
+      # 是「能解析、但 check 字段不是我要的那个」——两种跳过原因必须分得开，
+      # 否则使用者不知道该删文件还是该换 --check
+      log_warn "跳过非 ${check_type} 的报告：${f}"
     fi
   done
 
@@ -943,6 +971,28 @@ main() {
 
   if [[ ${#files[@]} -eq 0 ]]; then
     die "在 ${base} 下没有找到任何 JSON 报告"
+  fi
+
+  # 必须先于 filter_by_check：它同样要读这些文件，坏文件在那里会被它的
+  # `2>/dev/null || true` 静默吞掉——那是第二处静默，且文案与「类型不匹配」混在一起
+  split_parsable_reports "${files[@]}"
+  files=()
+  if [[ ${#PARSABLE_REPORTS[@]} -gt 0 ]]; then
+    files=("${PARSABLE_REPORTS[@]}")
+  fi
+
+  if [[ ${#files[@]} -eq 0 ]]; then
+    die "共 ${#UNPARSABLE_REPORTS[@]} 份 JSON 报告，没有一份能解析。首个无法解析的是 ${UNPARSABLE_REPORTS[0]}"
+  fi
+  if [[ ${#UNPARSABLE_REPORTS[@]} -gt 0 ]]; then
+    # 逐个拼接，不用 `printf '%s、' "${arr[@]}"`——那样末尾会多一个顿号，
+    # 而告警里的文件清单是给人复制了去删文件的，多余字符只会碍事
+    local skipped_list="" _u
+    for _u in "${UNPARSABLE_REPORTS[@]}"; do
+      [[ -n "$skipped_list" ]] && skipped_list+="、"
+      skipped_list+="${_u}"
+    done
+    log_warn "跳过 ${#UNPARSABLE_REPORTS[@]} 份无法解析的报告：${skipped_list}"
   fi
 
   # --check 模式先按顶层 .check 字段过滤（--dir 下混放多种报告是常态），

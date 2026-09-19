@@ -1170,6 +1170,176 @@ jobs:
           ' "${out_dir}/audit-trend-report.json" >/dev/null
           echo "✓ 趋势落盘正确（md 同源、json 字段与数据一致）"
 
+      - name: 验证坏掉的历史报告被可见地跳过
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # artifact 保留期（默认 30 天）内仍躺着 v1.15.0 之前产出的坏 JSON。
+          # 两条消费路径原来各自「整体崩掉」或「静默丢弃」——一份坏文件既不该
+          # 让全部趋势失效，也不该让连续失败次数悄悄少算（该响的告警不响）。
+          work="$(mktemp -d)"
+          mkdir -p "${work}/good" "${work}/bad"
+
+          cat > "${work}/good/sync-report.json" <<'JSON'
+          {"generated_at": "2026-09-01T00:00:00Z", "total": 2, "success": 2, "skipped": 0, "failed": 0,
+           "images": [
+            {"source": "a.example.com/x:1", "dest": "d/x", "status": "success", "seconds": 1},
+            {"source": "b.example.com/y:1", "dest": "d/y", "status": "success", "seconds": 2}
+           ]}
+          JSON
+          # 坏报告：模拟 v1.15.0 之前产出的那种（镜像名含引号，裸 printf 拼接的产物）
+          printf '{\n "generated_at": "2026-09-02T00:00:00Z",\n "total": 1, "success": 0, "skipped": 0, "failed": 1,\n "images": [\n  {"source": "a"b:1", "dest": "d", "status": "failed", "seconds": 1}\n ]\n}\n' \
+            > "${work}/bad/sync-report.json"
+
+          echo "=== 一份好 + 一份坏 ==="
+          set +e
+          out="$(./scripts/history.sh --dir "$work" 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+
+          # 结果数字只来自好的那份——坏文件既不整体作废，也不凑合算
+          if ! grep -qF '累计同步 **2** 个镜像次' <<<"$out"; then
+            echo "::error::坏报告影响了正常报告的分析结果"
+            exit 1
+          fi
+          # 跳过必须可见，且能定位到具体文件
+          if ! grep -qF "${work}/bad/sync-report.json" <<<"$out"; then
+            echo "::error::坏报告被跳过却没有指明是哪个文件"
+            exit 1
+          fi
+          # 坏文件属「无法判定」，不触发退出码 2——网络抖动和匿名访问不该让
+          # 退出码失去「需要处理」的含义（见 history.sh 里趋势退出码处的注释）
+          if [[ "$code" -ne 0 ]]; then
+            echo "::error::坏报告不应触发非 0 退出码，实际 ${code}"
+            exit 1
+          fi
+          echo "✓ 坏报告被可见地跳过，退出码语义不变"
+
+          echo "=== 全部坏 ==="
+          set +e
+          out="$(./scripts/history.sh --dir "${work}/bad" 2>&1)"
+          set -e
+          echo "$out"
+
+          if ! grep -qF '没有一份能解析' <<<"$out"; then
+            echo "::error::全部坏时应说明「没有一份能解析」"
+            exit 1
+          fi
+          if ! grep -qF "${work}/bad/sync-report.json" <<<"$out"; then
+            echo "::error::全部坏时应指出首个无法解析的文件"
+            exit 1
+          fi
+          # 裸的 jq parse error 不再直接抛给使用者
+          if grep -qF 'jq: parse error' <<<"$out"; then
+            echo "::error::不应把 jq 的 parse error 直接抛给使用者"
+            exit 1
+          fi
+          echo "✓ 全部坏时给出可定位的明确报错"
+
+          echo "=== --check：两种跳过原因可分 ==="
+          check_dir="$(mktemp -d)"
+          cat > "${check_dir}/audit-1.json" <<'JSON'
+          {"generated_at": "2026-09-01T02:00:00Z", "check": "audit", "summary": {}, "records": [
+            {"source": "docker.io/library/nginx:1.27", "dest": "r.example.com/nginx:1.27", "state": "current", "note": ""}
+          ]}
+          JSON
+          cat > "${check_dir}/sync-report.json" <<'JSON'
+          {"generated_at": "2026-09-03T02:00:00Z", "total": 0, "success": 0, "skipped": 0, "failed": 0, "images": []}
+          JSON
+          cp "${work}/bad/sync-report.json" "${check_dir}/broken.json"
+
+          set +e
+          out="$(./scripts/history.sh --check audit --dir "$check_dir" 2>&1)"
+          set -e
+          echo "$out"
+
+          # 「无法解析」与「类型不匹配」必须各有各的说法——否则使用者不知道
+          # 该删文件还是该换 --check
+          if ! grep -qF '跳过 1 份无法解析的报告' <<<"$out"; then
+            echo "::error::--check 下坏报告未被明确告警（预检必须先于 filter）"
+            exit 1
+          fi
+          if ! grep -qF '跳过非 audit 的报告' <<<"$out"; then
+            echo "::error::类型不匹配的跳过原因未区分"
+            exit 1
+          fi
+          if ! grep -qF 'broken.json' <<<"$out"; then
+            echo "::error::--check 下的告警未指出坏文件"
+            exit 1
+          fi
+          echo "✓ 两种跳过原因可分"
+
+          echo "=== fetch_sync_history：坏报告不再静默 ==="
+          # 与「报告下载失败的分类判定」同思路：坏文件的组合只能 mock。
+          # 生产函数整段抽出，只补它引用的全局与日志函数——它必须自包含
+          sed -n '/^fetch_sync_history()/,/^}/p' scripts/sync.sh > /tmp/fetch-sync-history-fn.sh
+
+          cat > /tmp/test-fetch-history.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          source /tmp/fetch-sync-history-fn.sh
+
+          HISTORY_ARTIFACT="sync-report"
+          log_warn() { printf 'WARN: %s\n' "$*" >&2; }
+
+          fix="$(mktemp -d)"
+          cat > "${fix}/good.json" <<'JSON'
+          {"generated_at": "2026-09-01T00:00:00Z", "total": 1, "success": 0, "skipped": 0, "failed": 1,
+           "images": [{"source": "a.example.com/x:1", "dest": "d", "status": "failed", "seconds": 1}]}
+          JSON
+          # 合法但没有 images 字段（检查报告混放同一 artifact）：最容易误判的一种
+          cat > "${fix}/check.json" <<'JSON'
+          {"generated_at": "2026-09-02T00:00:00Z", "check": "audit", "records": []}
+          JSON
+          printf '{\n "generated_at": "2026-09-03T00:00:00Z",\n "total": 1, "success": 0, "skipped": 0, "failed": 1,\n "images": [\n  {"source": "a"b:1", "dest": "d", "status": "failed", "seconds": 1}\n ]\n}\n' \
+            > "${fix}/broken.json"
+
+          gh() {
+            if [[ "$1" == "run" && "$2" == "list" ]]; then
+              printf '111\n'
+              return 0
+            fi
+            if [[ "$1" == "run" && "$2" == "download" ]]; then
+              local dir=""
+              while [[ $# -gt 0 ]]; do
+                [[ "$1" == "-D" ]] && dir="$2"
+                shift
+              done
+              mkdir -p "$dir"
+              cp "${fix}/good.json" "${fix}/check.json" "${fix}/broken.json" "$dir/"
+              return 0
+            fi
+            return 127
+          }
+
+          out_file="$(mktemp)"
+          warn_file="$(mktemp)"
+          fetch_sync_history "$out_file" 2> "$warn_file"
+
+          cat "$warn_file" >&2
+          # 好报告的记录照常展开，且只有它产出了记录
+          grep -qF 'a.example.com/x:1' "$out_file" || { echo "FAIL: 好报告的记录未被提取"; exit 1; }
+          [[ "$(wc -l < "$out_file" | tr -d ' ')" == "1" ]] || { echo "FAIL: 记录数不正确"; exit 1; }
+          # 坏报告必须告警、能定位、并说清后果（「跳过 1 份」是事实，
+          # 「判断可能偏小」才是使用者需要据此调整的信息）
+          grep -qF '无法解析' "$warn_file" || { echo "FAIL: 坏报告无告警（仍是静默丢弃）"; exit 1; }
+          grep -qF 'broken.json' "$warn_file" || { echo "FAIL: 告警未指出文件"; exit 1; }
+          grep -qF '连续失败次数的判断可能偏小' "$warn_file" || { echo "FAIL: 告警未说清后果"; exit 1; }
+          # 合法但无 images 的报告是正常的，不该被计为坏
+          if grep -qF 'check.json' "$warn_file"; then
+            echo "FAIL: 合法但无 images 的报告被误判为坏"
+            exit 1
+          fi
+          echo "MOCK-OK"
+          SCRIPT
+          bash /tmp/test-fetch-history.sh | grep -qF 'MOCK-OK' || {
+            echo "::error::fetch_sync_history 的坏报告处理不符合预期"
+            exit 1
+          }
+          echo "✓ fetch_sync_history 坏报告可见地跳过并说明后果"
+
       - name: 验证耗时排行
         run: |
           #!/usr/bin/env bash

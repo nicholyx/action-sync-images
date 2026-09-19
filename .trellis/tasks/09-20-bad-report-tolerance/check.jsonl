@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/engine/index.md", "reason": "Quality Check：断言可信度三条（恒假 / 弱断言 / 对正确实现假报错）"}
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "逐条核对；重点是空数组与退出码语义是否被改动"}
+{"file": ".trellis/spec/guides/index.md", "reason": "核对：被跳过的报告是否可见、后果是否说清"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "退出码是跨层契约（CI 依赖它），改动不得破坏"}
