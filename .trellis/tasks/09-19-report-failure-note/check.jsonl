@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/engine/index.md", "reason": "Quality Check 清单（lint、本地复现 CI 断言、U+FFFD 扫描）"}
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "逐条核对；重点是抽取执行与 printf/字段分隔"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "报告 schema 是跨层契约，消费方 history.sh 必须不受影响"}
+{"file": ".trellis/spec/guides/index.md", "reason": "设计原则：排除的东西必须可见——通知里未达阈值的项、不可重跑的项都不能静默消失"}

@@ -356,6 +356,243 @@ jobs:
           fi
           echo "✓ history.sh 可消费新报告"
 
+      - name: 验证失败原因进入报告与 Step Summary
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 失败原因（R_NOTE）此前只出现在终端日志里：同一份运行，终端知道原因，报告与
+          # Step Summary 不知道。三种只读检查的报告都带 note，唯独同步主模式没有，使用者
+          # 因此无法区分「改输入」与「重跑」。
+          #
+          # 用一条没有 tag 的非法引用造真实失败，不需要 registry 与网络。同一份报告里
+          # 再放一个合法引用，用来验证成功项的 note 是空串（字段存在且不被省略）。
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+
+          report_dir="$(mktemp -d)"
+          summary_file="$(mktemp)"
+          # 失败项按设计以退出码 2 结束，不是异常
+          GITHUB_STEP_SUMMARY="$summary_file" ./scripts/sync.sh \
+            --src 'nginx:1.27,nginx' --dest registry.example.com/smoke \
+            --report-dir "$report_dir" --dry-run >/dev/null 2>&1 || true
+
+          json="$report_dir/sync-report.json"
+          md="$report_dir/sync-report.md"
+
+          # ---- json：字段始终存在，失败项带出真实原因，成功项为空串 ----
+          # 必须用 all(...) 逐个判：`jq -e '.images[] | has("note")'` 的退出码只看
+          # **最后一个**输出值，只要末条有 note，前面几条缺字段也照样返回 0——
+          # 那样这条断言就只剩「末条有没有 note」，与它声称的「始终存在」不符。
+          jq -e '.images | length == 2' "$json" >/dev/null || fail "预期 2 条记录"
+          jq -e 'all(.images[]; has("note"))' "$json" >/dev/null \
+            || fail "images[].note 字段缺失（消费方不必判空，字段必须始终存在）"
+          jq -e 'all(.images[]; (.note | type) == "string")' "$json" >/dev/null \
+            || fail "images[].note 不是 string"
+
+          ok_note="$(jq -r '.images[] | select(.status=="success") | .note' "$json")"
+          [[ -z "$ok_note" ]] || fail "成功项的 note 应为空串，实际：[${ok_note}]"
+
+          fail_note="$(jq -r '.images[] | select(.status=="failed") | .note' "$json")"
+          [[ "$fail_note" == 镜像引用格式错误* ]] || fail "失败项未带出真实原因：[${fail_note}]"
+
+          # ---- md：新增「说明」列，失败行写原因，无原因的行写 — ----
+          # 表头与数据行的列数必须一致——说明列里的 note 含 | 或换行时不得多切一列
+          # （转义由 md_cell 负责）。只查数据行会漏掉「表头少了说明列」这种表头/数据
+          # 脱节，所以这里把表头与紧随其后的每个表格行放在一起核对。
+          md_header="$(grep -F '| 源镜像 |' "$md" | grep -F '结果' | head -1)"
+          [[ -n "$md_header" ]] || fail "md 里找不到同步结果表头"
+          grep -qF '说明' <<<"$md_header" || fail "md 表头缺少「说明」列：[$md_header]"
+          hdr_cols="$(awk '{print gsub(/\|/,"")}' <<<"$md_header")"
+          [[ "$hdr_cols" -eq 9 ]] || fail "md 表头竖线数不是 9（即 8 列）：${hdr_cols}"
+
+          # 数的是**未转义**的竖线：md_cell 把 note 里的 | 写成 \|，那些不是列分隔，
+          # 若一并计入，一条转义正确的行会被数成多一列——断言就成了对正确实现的假报错。
+          awk -F'|' -v n="$hdr_cols" '
+            /^\| 源镜像 \|/ && /结果/ { intbl=1; next }
+            intbl && /^\|/ {
+              line = $0
+              gsub(/\\\|/, "", line)          # 已转义的竖线不算列分隔
+              c = gsub(/\|/, "", line)
+              if (c != n) { print "cols=" c " want=" n; bad=1 }
+              next
+            }
+            intbl && !/^\|/ { intbl=0 }
+            END { exit bad }
+          ' "$md" >/tmp/md-cols.out || fail "md 表格有行与表头列数不一致：$(cat /tmp/md-cols.out)"
+
+          md_fail_row="$(grep -F 'nginx' "$md" | grep -F '❌' || true)"
+          [[ -n "$md_fail_row" ]] || fail "md 里找不到失败行"
+          grep -qF '镜像引用格式错误' <<<"$md_fail_row" || fail "md 失败行没有带出原因"
+
+          md_ok_row="$(grep -F 'nginx:1.27' "$md" | head -1)"
+          md_ok_note="$(awk -F'|' '{gsub(/^ +| +$/,"",$9); print $9}' <<<"$md_ok_row")"
+          [[ "$md_ok_note" == "—" ]] || fail "md 成功行的说明列应为 —，实际：[${md_ok_note}]"
+
+          # ---- Step Summary：与 md 同源同口径，同样有「说明」列 ----
+          sum_header="$(grep -F '| 源镜像 |' "$summary_file" | grep -F 'Digest | 耗时' | head -1)"
+          [[ -n "$sum_header" ]] || fail "Step Summary 里找不到同步结果表头"
+          grep -qF '说明' <<<"$sum_header" || fail "Step Summary 表头缺少「说明」列：[$sum_header]"
+          sum_cols="$(awk '{print gsub(/\|/,"")}' <<<"$sum_header")"
+          [[ "$sum_cols" -eq 8 ]] || fail "Step Summary 表头竖线数不是 8（即 7 列）：${sum_cols}"
+
+          # 同 md：只数未转义的竖线，转义正确的行不该被数成多一列
+          awk -F'|' -v n="$sum_cols" '
+            /^\| 源镜像 \|/ && /Digest \| 耗时/ { intbl=1; next }
+            intbl && /^\|/ {
+              line = $0
+              gsub(/\\\|/, "", line)
+              c = gsub(/\|/, "", line)
+              if (c != n) { print "cols=" c " want=" n; bad=1 }
+              next
+            }
+            intbl && !/^\|/ { intbl=0 }
+            END { exit bad }
+          ' "$summary_file" >/tmp/sum-cols.out || fail "Step Summary 表格有行与表头列数不一致：$(cat /tmp/sum-cols.out)"
+
+          sum_fail_row="$(grep -F '❌' "$summary_file" || true)"
+          [[ -n "$sum_fail_row" ]] || fail "Step Summary 里找不到失败行"
+          grep -qF '镜像引用格式错误' <<<"$sum_fail_row" || fail "Step Summary 失败行没有带出原因"
+
+          # ---- md 与 Step Summary 的「说明」列共用 md_cell 转义 ----
+          # 失败原因里出不了 |（两条固定文案、一条是 digest 描述），所以转义规则
+          # 单独提出来测——与 CI 其他步骤用「提取生产函数」的手法一致。
+          # 说明列**能**收到带 | 的文本的可复现路径在下面（排除原因带出 filter 正则）。
+          sed -n '/^md_cell()/,/^}/p' scripts/sync.sh > /tmp/cell-fns.sh
+          grep -qF 'printf' /tmp/cell-fns.sh || fail "未能从 sync.sh 抽出 md_cell"
+
+          cat > /tmp/test-cell.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          source /tmp/cell-fns.sh
+          fail() { echo "FAIL: $*" >&2; exit 1; }
+
+          # 竖线会多切一列：必须转义
+          out="$(md_cell 'a|b')"
+          [[ "$out" == 'a\|b' ]] || fail "竖线未转义：[$out]"
+
+          # 换行会截断整行：必须收敛为单行
+          out="$(md_cell $'a\nb')"
+          [[ "$out" == 'a b' ]] || fail "换行未收敛为单行：[$out]"
+
+          # 两者都含时仍是单行，且没有裸竖线
+          out="$(md_cell $'a|b\nc|d')"
+          [[ "$out" == 'a\|b c\|d' ]] || fail "混合输入：[$out]"
+          case "$out" in
+            *[^\\]\|*) fail "仍有未转义的竖线：[$out]" ;;
+          esac
+
+          # 空串返回空串——调用方据此显示 —
+          out="$(md_cell '')"
+          [[ -z "$out" ]] || fail "空串应返回空串：[$out]"
+
+          # 真实文案原样通过（不含待转义字符）
+          out="$(md_cell '完整性校验失败：sha256:aaa != sha256:bbb')"
+          [[ "$out" == '完整性校验失败：sha256:aaa != sha256:bbb' ]] || fail "真实文案被改动：[$out]"
+
+          echo "CELL-OK"
+          SCRIPT
+
+          if ! cell_out="$(bash /tmp/test-cell.sh 2>&1)"; then
+            printf '%s\n' "$cell_out"
+            fail "md_cell 的表格转义不符合预期"
+          fi
+          grep -qF 'CELL-OK' <<<"$cell_out" || {
+            printf '%s\n' "$cell_out"
+            fail "md_cell 的表格转义不符合预期"
+          }
+
+          # ---- 说明列真的收到带 | 的文本时，表格列数不变（可复现路径）----
+          # 设计文档说「含 | 的真实 note 造不出来」——对**失败原因**成立，但排除原因
+          # 会把 --filter 的正则原样带进说明列：一条带 | 的过滤表达式就够了，dry-run
+          # 即可，不需要 registry 与网络。这正是 md_cell 存在的理由，值得端到端跑一次。
+          pipe_dir="$(mktemp -d)"
+          ./scripts/sync.sh --src 'nginx:1.27,redis:7.4' --dest registry.example.com/smoke \
+            --filter 'nginx|foo' --report-dir "$pipe_dir" --dry-run >/dev/null 2>&1 || true
+          pipe_md="$pipe_dir/sync-report.md"
+          grep -qF '未匹配 --filter「nginx\|foo」' "$pipe_md" \
+            || fail "排除原因里的 | 没有转义成 \\|（md 表格会被多切一列）"
+          pipe_row="$(grep -F 'redis:7.4' "$pipe_md" | head -1)"
+          # 去掉已转义的 \| 之后再数列分隔：8 列的行应当仍是 9 个
+          pipe_cols="$(printf '%s\n' "$pipe_row" | sed 's/\\|//g' | awk '{print gsub(/\|/,"")}')"
+          [[ "$pipe_cols" -eq 9 ]] \
+            || fail "含 | 的说明列把表格切坏了：cols=${pipe_cols}（期望 9）"
+          # 表头与数据行必须一样宽——只查一行的话，表头少列会漏掉
+          pipe_hdr_cols="$(grep -F '| 源镜像 |' "$pipe_md" | awk '{print gsub(/\|/,"")}' | head -1)"
+          [[ "$pipe_hdr_cols" -eq "$pipe_cols" ]] \
+            || fail "含 | 时表头与数据行列数不一致：表头 ${pipe_hdr_cols} 数据 ${pipe_cols}"
+
+          echo "CI-FAILURE-NOTE-OK"
+
+      - name: 验证失败原因真的随通知发得出去
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 失败原因进入通知的端到端验证。同步失败的通知此前只有「提取函数 + mock」的
+          # 单元测试，而段序解析（cnt 不能再取最后一段）恰好是最容易改错的一处——
+          # 这里真发一次，确认「失败详情」里带出的是原因而不是把次数读成原因文本。
+          #
+          # 用非法引用造失败，dry-run 即可，不需要 registry 与网络。
+          cat > /tmp/hook-note.py <<'PY'
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+          class H(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  n = int(self.headers.get('Content-Length', 0))
+                  with open('/tmp/hook-note-payload.json', 'wb') as f:
+                      f.write(self.rfile.read(n))
+                  self.send_response(200)
+                  self.end_headers()
+                  self.wfile.write(b'ok')
+
+              def log_message(self, *a):
+                  pass
+
+
+          HTTPServer(('127.0.0.1', 8898), H).serve_forever()
+          PY
+          rm -f /tmp/hook-note-payload.json
+          python3 /tmp/hook-note.py &
+          hook_pid=$!
+          trap 'kill "$hook_pid" 2>/dev/null || true' EXIT
+          sleep 2
+
+          set +e
+          ./scripts/sync.sh --src 'nginx' --dest registry.example.com/smoke \
+            --dry-run --notify-webhook http://127.0.0.1:8898/hook --notify-type generic >/dev/null 2>&1
+          set -e
+
+          if [[ ! -s /tmp/hook-note-payload.json ]]; then
+            echo "::error::同步失败时未发送通知"
+            exit 1
+          fi
+
+          text="$(jq -r '.text' /tmp/hook-note-payload.json)"
+
+          # 失败详情必须带出原因，且是「- 镜像：原因」的形态
+          grep -qF '### 失败详情' <<<"$text" || {
+            echo "::error::通知里没有失败详情小节"
+            printf '%s\n' "$text"
+            exit 1
+          }
+          grep -qF -- '- nginx：镜像引用格式错误' <<<"$text" || {
+            echo "::error::失败详情未带出真实原因（段序解析是否把次数读成了原因？）"
+            printf '%s\n' "$text"
+            exit 1
+          }
+          # 次数为 1 时不该出现「连续第 N 次失败」——那说明 cnt 被解析成了别的东西
+          if grep -qF '连续第' <<<"$text"; then
+            echo "::error::次数为 1 却渲染出连续失败标记，cnt 解析错位"
+            printf '%s\n' "$text"
+            exit 1
+          fi
+
+          echo "✓ 同步失败的通知带出了失败原因"
+
       - name: 验证非法镜像引用会被拦下
         run: |
           #!/usr/bin/env bash
@@ -992,8 +1229,11 @@ jobs:
 
           # 重跑指引用「提取生产函数 + 伪造 R_* 输入」验证：稳定的同步失败
           # 需要网络与凭证，构造不出可重复的场景。
+          # md_cell 是 write_report / emit_summary 渲染「说明」列的依赖，必须与
+          # 它们一起抽取：漏掉时它未定义，note 会被静默填成 —（调用点的
+          # `|| true` 抑制了 errexit，不会有任何报错）。
           for fn in ere_escape rerun_style collect_rerun_items render_rerun_section \
-                    short_digest duration_ranking_rows write_report emit_summary; do
+                    short_digest duration_ranking_rows md_cell write_report emit_summary; do
             sed -n "/^${fn}()/,/^}/p" scripts/sync.sh
           done > /tmp/rerun-fns.sh
           grep -q 'collect_rerun_items()' /tmp/rerun-fns.sh || { echo "::error::函数提取失败"; exit 1; }
@@ -1055,6 +1295,16 @@ jobs:
           if grep -q 'redis:7.2' "${REPORT_DIR}/block.txt"; then fail "重跑节混入了成功项"; fi
 
           grep -q '重跑失败项' "${REPORT_DIR}/sync-report.md" || fail "md 报告缺少重跑节"
+
+          # 说明列：失败项带出真实原因。这条同时守住 md_cell 的抽取依赖——
+          # 它没被抽出来时函数调用失败，而调用点上方的 `|| true` 抑制了 errexit，
+          # note 会被静默填成 —，报告看起来「正常」，原因却丢了。
+          grep -qF '同步失败，详见上方日志' "${REPORT_DIR}/sync-report.md" \
+            || fail "md 说明列未带出失败原因（md_cell 是否未被抽取？）"
+          grep -qF '镜像引用格式错误：仓库名不合法' "${REPORT_DIR}/sync-report.md" \
+            || fail "md 说明列未带出第二条失败原因"
+          grep -qF '同步失败，详见上方日志' "$GITHUB_STEP_SUMMARY" \
+            || fail "Summary 说明列未带出失败原因"
 
           # --- 3. json 字段与往返一致性 ---
           jq -e '.rerun' "${REPORT_DIR}/sync-report.json" >/dev/null || fail "json 缺 rerun 字段"
@@ -1154,16 +1404,19 @@ jobs:
           fi
           echo "✓ 默认行为不变"
 
-      - name: 验证连续失败计数的判定逻辑
+      - name: 验证连续失败计数与失败原因渲染的判定逻辑
         run: |
           #!/usr/bin/env bash
           set -euo pipefail
 
           # 跨运行状态无法在单次运行中端到端产生（需要多次真实失败的运行），
           # 所以与校验一样用「提取生产函数 + 伪造输入」的方式测判定逻辑本身。
-          sed -n '/^readonly FIELD_SEP=/p' scripts/sync.sh > /tmp/notify-fns.sh
-          sed -n '/^count_consecutive_failures()/,/^}/p' scripts/sync.sh >> /tmp/notify-fns.sh
-          sed -n '/^gather_alert_images()/,/^}/p' scripts/sync.sh >> /tmp/notify-fns.sh
+          {
+            sed -n '/^readonly FIELD_SEP=/p' scripts/sync.sh
+            sed -n '/^count_consecutive_failures()/,/^}/p' scripts/sync.sh
+            sed -n '/^gather_alert_images()/,/^}/p' scripts/sync.sh
+            sed -n '/^format_alert_line()/,/^}/p' scripts/sync.sh
+          } > /tmp/notify-fns.sh
 
           cat > /tmp/test-notify.sh <<'SCRIPT'
           #!/usr/bin/env bash
@@ -1183,13 +1436,18 @@ jobs:
             printf '2026-09-10T01:00:00Z%sb.example.com/y:1%ssuccess\n' "$FS" "$FS"
           } > "$hist"
 
+          # R_NOTE 与 R_SRC / R_STATUS 一样是运行期的输入，夹具必须一起伪造。
           R_SRC=(a.example.com/x:1 b.example.com/y:1 c.example.com/z:1)
           R_STATUS=(failed failed failed)
+          R_NOTE=('镜像引用格式错误：缺少 tag' '同步失败，详见上方日志' '')
 
           out="$(gather_alert_images "$hist")"
 
           grep -q "$(printf 'a.example.com/x:1\x1f3')" <<<"$out" \
             || { echo "FAIL: a 应为连续 3 次（2 历史 + 1 本次）"; exit 1; }
+          # 失败原因字段：追加在末段之后，既有的子串断言仍然命中
+          grep -qF "$(printf 'a.example.com/x:1\x1f3\x1f镜像引用格式错误：缺少 tag')" <<<"$out" \
+            || { echo "FAIL: 失败原因未随通知输出"; exit 1; }
           grep -q 'b.example.com' <<<"$out" \
             && { echo "FAIL: b 上次成功应清零，未达阈值"; exit 1; }
           grep -q 'c.example.com' <<<"$out" \
@@ -1201,15 +1459,43 @@ jobs:
           [[ "$(grep -c 'example.com' <<<"$out")" -eq 3 ]] \
             || { echo "FAIL: 阈值 1 应通知全部 3 个失败"; exit 1; }
 
+          # 失败详情的渲染。段序读错时 cnt 会拿到原因文本，次数标记随之丢失——
+          # 这条断言就是为那个静默错账准备的。
+          rendered="$(format_alert_line "$(printf 'b.example.com/y:1\x1f3\x1f同步失败，详见上方日志')")"
+          [[ "$rendered" == '- b.example.com/y:1（**连续第 3 次失败**）：同步失败，详见上方日志' ]] \
+            || { echo "FAIL: 连续次数段序读错：[$rendered]"; exit 1; }
+
+          rendered="$(format_alert_line "$(printf 'a.example.com/x:1\x1f1\x1f镜像引用格式错误：缺少 tag')")"
+          [[ "$rendered" == '- a.example.com/x:1：镜像引用格式错误：缺少 tag' ]] \
+            || { echo "FAIL: 失败原因未带出：[$rendered]"; exit 1; }
+
+          # 原因为空时不追加尾巴——否则会留下一个孤零零的冒号
+          rendered="$(format_alert_line "$(printf 'a.example.com/x:1\x1f1\x1f')")"
+          [[ "$rendered" == '- a.example.com/x:1' ]] \
+            || { echo "FAIL: 原因为空时拖了尾巴：[$rendered]"; exit 1; }
+
+          rendered="$(format_alert_line "$(printf 'a.example.com/x:1\x1f3\x1f')")"
+          [[ "$rendered" == '- a.example.com/x:1（**连续第 3 次失败**）' ]] \
+            || { echo "FAIL: 原因为空时连续次数丢失：[$rendered]"; exit 1; }
+
           echo "MOCK-OK"
           SCRIPT
-          bash /tmp/test-notify.sh | grep -q 'MOCK-OK' || {
-            echo "::error::连续失败计数判定不符合预期"
+
+          # 不用管道接 grep 判成败：管道只看最后一个命令的退出码，
+          # 测试脚本的失败与它的 stderr 都可能被吞掉。分段捕获再判。
+          if ! out="$(bash /tmp/test-notify.sh 2>&1)"; then
+            printf '%s\n' "$out"
+            echo "::error::连续失败计数与失败原因渲染不符合预期"
+            exit 1
+          fi
+          grep -qF 'MOCK-OK' <<<"$out" || {
+            printf '%s\n' "$out"
+            echo "::error::连续失败计数与失败原因渲染不符合预期"
             exit 1
           }
-          echo "✓ 连续失败计数正确（累计 / 清零 / 无历史 / 阈值 1 兼容）"
 
-          # 参数校验
+          # 参数校验。这一条与失败原因无关，但它原本就在这个步骤里——本任务重构
+          # 步骤尾部时一并删掉了，等于把一条既有断言无声抹掉。恢复在这里。
           set +e
           ./scripts/sync.sh --src nginx:1.27 --dest r.example.com/x \
             --notify-after-failures 0 --dry-run >/dev/null 2>&1
@@ -1217,6 +1503,8 @@ jobs:
           set -e
           [[ "$code" -eq 1 ]] || { echo "::error::--notify-after-failures 0 应被拒绝（退出码 1），实际 ${code}"; exit 1; }
           echo "✓ 非法阈值被拒绝"
+
+          echo "NOTIFY-STEP-OK"
 
       - name: 验证报告下载失败的分类判定
         run: |

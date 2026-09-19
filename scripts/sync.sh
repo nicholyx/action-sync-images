@@ -1449,6 +1449,22 @@ short_digest() {
   printf '%s' "${d:0:19}…"
 }
 
+# 把任意文本安全地放进 Markdown 表格单元格。md 表格与 Step Summary 共用。
+#
+# 竖线会多切出一列、换行会截断整行——两者都会把表格结构弄坏，而失败原因里
+# 含动态内容（如完整性校验的 digest 比对描述），不能假定它不含这些字符。
+# 两个替换互不干涉，先后顺序无所谓；这里按「先收敛换行、再转义竖线」写，
+# 只为读起来顺。
+#
+# 不处理反斜杠：Markdown 里 `\|` 已是竖线的转义序列，再对反斜杠做一层转义
+# 会引入 `\\|` 这种语义含糊的产物，而收益只覆盖「反斜杠紧跟竖线」这一近乎
+# 不存在的场景。当前三条失败原因来源里，两条是固定文案，第三条是 digest
+# 比对描述，都不含反斜杠。
+md_cell() {
+  local s="${1//$'\n'/ }"
+  printf '%s' "${s//|/\\|}"
+}
+
 # 结果文件的分隔符。
 #
 # 这里**不能用制表符**：bash 把 IFS 中的空白字符（空格、tab、换行）视为
@@ -2858,13 +2874,18 @@ count_consecutive_failures() {
   printf '%s' "$count"
 }
 
-# 决定本次要通知哪些失败镜像。输出到 stdout，每行「镜像<FS>连续失败次数」。
+# 决定本次要通知哪些失败镜像。输出到 stdout，每行「镜像<FS>连续失败次数<FS>失败原因」。
 #
 # 阈值为 1 时就是全部失败镜像（历史行为）；大于 1 时逐个数连续次数，
 # 未达阈值的失败会被有意地沉默——这正是这个功能存在的意义：
 # 上游抖动的失败重跑就好，每次都响的通知很快就没有人看了。
 #
 # 拿不到历史时全部按「连续 1 次」处理：宁可不通知，也不基于猜测误报。
+#
+# 原因按下标直接取 R_NOTE，而不是让调用方拿镜像名反查：一次同步里同一镜像
+# 允许出现多次（例如两个不同的目标），反查会取到错的那条原因，且这种错在
+# 多数输入下看不出来。原因里不会混入 FIELD_SEP——write_result 落盘时已把
+# 它替换成空格。
 gather_alert_images() {
   local hist_file="$1"
   local i img cnt
@@ -2879,11 +2900,38 @@ gather_alert_images() {
       cnt=1
     fi
     if [[ "$cnt" -ge "$NOTIFY_AFTER_FAILURES" ]]; then
-      printf '%s%s%s\n' "$img" "$FIELD_SEP" "$cnt"
+      printf '%s%s%s%s%s\n' "$img" "$FIELD_SEP" "$cnt" "$FIELD_SEP" "${R_NOTE[$i]}"
     else
       log_info "${img} 连续失败 ${cnt} 次，未达阈值 ${NOTIFY_AFTER_FAILURES}，暂不通知"
     fi
   done
+}
+
+# 把 gather_alert_images 的一行输出渲染成「失败详情」里的一个条目。
+#
+# 单独抽成函数是为了能被 CI 整段抽取单测——这正是本任务最易改错的一处。
+#
+# 按段解析，**不能用 `##*` 取最后一段**：失败原因字段追加在末尾之后，取最后
+# 一段拿到的会是原因文本而不是次数，`[[ "$cnt" -gt 1 ]]` 随即静默走错分支
+# （报「integer expression expected」或落到 else 而不报错）。
+format_alert_line() {
+  local line="$1"
+  local img rest cnt note bullet
+  img="${line%%"${FIELD_SEP}"*}"
+  rest="${line#*"${FIELD_SEP}"}"
+  cnt="${rest%%"${FIELD_SEP}"*}"
+  note="${rest#*"${FIELD_SEP}"}"
+  if [[ "$cnt" -gt 1 ]]; then
+    bullet="- ${img}（**连续第 ${cnt} 次失败**）"
+  else
+    bullet="- ${img}"
+  fi
+  # 原因为空时不追加尾巴——否则会留下一个孤零零的冒号
+  if [[ -n "$note" ]]; then
+    printf '%s：%s' "$bullet" "$note"
+  else
+    printf '%s' "$bullet"
+  fi
 }
 
 build_notify_text() {
@@ -3035,7 +3083,7 @@ send_notification() {
   fi
 
   # 决定本次要通知哪些失败镜像（详见 gather_alert_images）。
-  local alert_detail="" line img cnt
+  local alert_detail="" line
   local -a alert_lines=()
   local hist_file="${WORK_DIR:-}/notify-history.tsv"
 
@@ -3047,15 +3095,11 @@ send_notification() {
     fi
   fi
 
+  # 每行的解析与渲染交给 format_alert_line——它有单测覆盖，段序改错会在 CI 被
+  # 当场抓住，而不是变成一条「次数被读成原因文本」的静默错账。
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
-    img="${line%%"${FIELD_SEP}"*}"
-    cnt="${line##*"${FIELD_SEP}"}"
-    if [[ "$cnt" -gt 1 ]]; then
-      alert_lines+=("- ${img}（**连续第 ${cnt} 次失败**）")
-    else
-      alert_lines+=("- ${img}")
-    fi
+    alert_lines+=("$(format_alert_line "$line")")
   done < <(gather_alert_images "$hist_file")
 
   if [[ "$fail" -gt 0 && ${#alert_lines[@]} -eq 0 ]]; then
@@ -3277,8 +3321,8 @@ emit_summary() {
     {
       echo "## 镜像同步报告"
       echo ""
-      echo "| 源镜像 | 目标镜像 | 结果 | 平台 | Digest | 耗时 |"
-      echo "| --- | --- | :---: | --- | --- | --- |"
+      echo "| 源镜像 | 目标镜像 | 结果 | 平台 | Digest | 耗时 | 说明 |"
+      echo "| --- | --- | :---: | --- | --- | --- | --- |"
       for i in "${!R_SRC[@]}"; do
         local icon="✅"
         case "${R_STATUS[$i]}" in
@@ -3287,7 +3331,10 @@ emit_summary() {
           success)  icon="✅" ;;
           *)        icon="❌" ;;
         esac
-        echo "| \`${R_SRC[$i]}\` | \`${R_DEST[$i]}\` | ${icon} | ${R_PLATFORM[$i]:-—} | \`$(short_digest "${R_SRC_DIGEST[$i]:-}")\` | ${R_SECONDS[$i]}s |"
+        local note_cell
+        note_cell="$(md_cell "${R_NOTE[$i]}")"
+        [[ -n "$note_cell" ]] || note_cell="—"
+        echo "| \`${R_SRC[$i]}\` | \`${R_DEST[$i]}\` | ${icon} | ${R_PLATFORM[$i]:-—} | \`$(short_digest "${R_SRC_DIGEST[$i]:-}")\` | ${R_SECONDS[$i]}s | ${note_cell} |"
       done
       echo ""
       echo "**合计**：${total} 个镜像 · 成功 ${ok} · 跳过 ${skipped} · 失败 ${fail}"
@@ -3362,8 +3409,8 @@ write_report() {
     fi
     echo "- 结果：${result_line}"
     echo ""
-    echo "| 源镜像 | 目标镜像 | 结果 | 平台 | 源 Digest | 目标 Digest | 耗时 |"
-    echo "| --- | --- | :---: | --- | --- | --- | --- |"
+    echo "| 源镜像 | 目标镜像 | 结果 | 平台 | 源 Digest | 目标 Digest | 耗时 | 说明 |"
+    echo "| --- | --- | :---: | --- | --- | --- | --- | --- |"
     for i in "${!R_SRC[@]}"; do
       local icon="✅"
       case "${R_STATUS[$i]}" in
@@ -3372,7 +3419,10 @@ write_report() {
         success)  icon="✅" ;;
         *)        icon="❌" ;;
       esac
-      echo "| \`${R_SRC[$i]}\` | \`${R_DEST[$i]}\` | ${icon} | ${R_PLATFORM[$i]:-—} | \`${R_SRC_DIGEST[$i]:-—}\` | \`${R_DEST_DIGEST[$i]:-—}\` | ${R_SECONDS[$i]}s |"
+      local note_cell
+      note_cell="$(md_cell "${R_NOTE[$i]}")"
+      [[ -n "$note_cell" ]] || note_cell="—"
+      echo "| \`${R_SRC[$i]}\` | \`${R_DEST[$i]}\` | ${icon} | ${R_PLATFORM[$i]:-—} | \`${R_SRC_DIGEST[$i]:-—}\` | \`${R_DEST_DIGEST[$i]:-—}\` | ${R_SECONDS[$i]}s | ${note_cell} |"
     done
 
     # 与 Step Summary 共用同一段渲染，避免两处各写一遍后悄悄漂移。
@@ -3414,8 +3464,10 @@ write_report() {
           --arg source_digest "${R_SRC_DIGEST[$i]:-}" \
           --arg dest_digest "${R_DEST_DIGEST[$i]:-}" \
           --argjson seconds "${R_SECONDS[$i]:-0}" \
+          --arg note "${R_NOTE[$i]}" \
       '{source:$source, dest:$dest, status:$status, platforms:$platforms,
-        source_digest:$source_digest, dest_digest:$dest_digest, seconds:$seconds}' \
+        source_digest:$source_digest, dest_digest:$dest_digest, seconds:$seconds,
+        note:$note}' \
       >> "$records_file"
   done
 
