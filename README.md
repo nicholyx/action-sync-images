@@ -476,7 +476,7 @@ brew install skopeo regclient   # macOS
 - [x] 检查报告的趋势聚合（`history.sh --check`：一直落后 / 一直缺失 / 一直在漂移）
 - [x] 趋势结果落盘与 Actions 页面查看（`history.sh --report-dir` 与 History-Trend 工作流）
 - [x] 失败后的可操作化：可粘贴的重跑指引，与失败原因进报告、Step Summary 与通知
-- [x] 报告可信度收尾：json 报告改由 `jq` 构造（引号不再产出坏数据）、取运行列表的失败不再冒充「没有运行记录」
+- [x] 报告可信度收尾：json 报告改由 `jq` 构造（引号不再产出坏数据）、取运行列表的失败不再冒充「没有运行记录」、坏掉的历史报告可见地跳过（不再整体崩掉或静默丢弃）
 
 ### 计划中
 
