@@ -1,0 +1,30 @@
+{
+  "id": "report-trustworthiness",
+  "name": "report-trustworthiness",
+  "title": "报告可信度收尾：报告与错误信息如实",
+  "description": "把三个同族遗留缺口收进一轮：gh run list 网络失败被吞掉（#98）、同步报告缺失败原因（#102）、sync-report.json 裸拼接可能产出非法 JSON（#103）。共同点是报告说的未必是真的。",
+  "status": "planning",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "nicholyx",
+  "assignee": "nicholyx",
+  "createdAt": "2026-09-19",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "09-19-history-runlist-retry",
+    "09-19-report-json-escape",
+    "09-19-report-failure-note"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}

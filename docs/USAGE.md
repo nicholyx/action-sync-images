@@ -853,6 +853,14 @@ jq -r '.rerun.filter'   sync-report.json     # 锚定正则
 jq    '.rerun.not_rerunnable' sync-report.json   # 重跑也无解的项数
 ```
 
+每个镜像的失败原因在 `images[].note`——报告 `.md` 与 Actions 页面 Step Summary 的「说明」列是同一份内容：
+
+```bash
+jq -r '.images[] | select(.status=="failed") | "\(.source)：\(.note)"' sync-report.json
+```
+
+`note` 字段始终存在：成功项为空串，跳过项与排除项写的是各自的原因（如「目标已存在相同镜像」「匹配 --exclude「redis」」）。
+
 ---
 
 ## 查看历史趋势
