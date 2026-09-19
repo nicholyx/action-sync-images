@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "本任务的核心就在「退出码与进程模型」一节：进程替换拿不到退出码、包装函数不得吞退出码、管道只看最后一个命令——#98 正是这三类教训的现场"}
+{"file": ".trellis/spec/guides/index.md", "reason": "设计原则第 1 条「错误的信息比没有信息更糟，因为它会被当成结论」——网络失败冒充空列表正是这条的反面"}
+{"file": ".trellis/spec/engine/index.md", "reason": "质量门与断言要求：本地复现 CI 断言、U+FFFD 扫描"}

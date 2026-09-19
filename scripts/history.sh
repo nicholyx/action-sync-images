@@ -272,11 +272,41 @@ download_reports() {
     list_args=(--workflow "$WORKFLOW_FILTER" "${list_args[@]}")
   fi
 
+  # gh run list 的退出码必须接住。进程替换 < <(...) 不传递退出码——原来那句
+  # `2>/dev/null || true` 把「请求失败」与「确实没有运行记录」彻底混成一种结果
+  # （Issue #98，2026-09-16 真实踩到）：网络 EOF 时报的是「工作流没跑过」，
+  # 把排查方向引到完全错误的地方。与 #87 同族——网络问题冒充「数据不存在」。
+  # 重试一轮的取舍与 #97 的下载重试同口径（间隔固定、不做参数化，理由见下方
+  # 批量重试处的注释）。
+  local list_out="${WORK_DIR}/run-list.txt"
+  local list_err_file="${WORK_DIR}/run-list.err"
+  local list_rc=0
+  # stdout 与 stderr 分开落文件：合到一处会让 gh 的报错混进 id 列表，
+  # 下面的 read 循环会把错误文本当成运行 id
+  gh run list "${list_args[@]}" > "$list_out" 2> "$list_err_file" || list_rc=$?
+
+  if [[ "$list_rc" -ne 0 ]]; then
+    log_warn "获取运行列表失败，重试一次（多为网络抖动）..."
+    sleep 5
+    list_rc=0
+    gh run list "${list_args[@]}" > "$list_out" 2> "$list_err_file" || list_rc=$?
+    [[ "$list_rc" -eq 0 ]] && log_info "重试成功"
+  fi
+
+  # 先看退出码、再看是否为空——反过来的话失败场景仍会掉进「空列表」分支
+  if [[ "$list_rc" -ne 0 ]]; then
+    # 注意区分：list_err_file 是文件名，list_err 是文件内容。只取 stderr 的
+    # 第一行，gh 的多行报错整段塞进 die 反而看不清重点
+    local list_err=""
+    [[ -s "$list_err_file" ]] && list_err="$(head -n1 "$list_err_file")"
+    die "获取运行列表失败（已重试一次）：${list_err:-未知错误}。多为网络原因，稍后重跑即可"
+  fi
+
   local -a run_ids=()
   local id
   while IFS= read -r id; do
     [[ -n "$id" ]] && run_ids+=("$id")
-  done < <(gh run list "${list_args[@]}" 2>/dev/null || true)
+  done < "$list_out"
 
   [[ ${#run_ids[@]} -gt 0 ]] || die "没有取到任何运行记录。请确认当前目录在一个 GitHub 仓库中，gh 已登录，且工作流「${WORKFLOW_FILTER:-}」至少跑过一次（--check 模式下这是体检工作流；也可用 --dir 指定本地报告目录）"
 

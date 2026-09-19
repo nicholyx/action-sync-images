@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/engine/index.md", "reason": "Quality Check 清单：断言可信度三条（恒假 / 弱断言 / 对正确实现假报错）"}
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "逐条核对退出码与进程模型"}
+{"file": ".trellis/spec/guides/index.md", "reason": "核对报错文案是否把「拿不到」与「不存在」如实分开"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "history.sh 的失败分类是跨层契约，不得与 #87 的既有分类口径冲突"}
