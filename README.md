@@ -475,12 +475,12 @@ brew install skopeo regclient   # macOS
 - [x] 锁文件时效性校验（`--audit-lock`）与检查报告落盘
 - [x] 检查报告的趋势聚合（`history.sh --check`：一直落后 / 一直缺失 / 一直在漂移）
 - [x] 趋势结果落盘与 Actions 页面查看（`history.sh --report-dir` 与 History-Trend 工作流）
+- [x] 失败后的可操作化：可粘贴的重跑指引，与失败原因进报告、Step Summary 与通知
+- [x] 报告可信度收尾：json 报告改由 `jq` 构造（引号不再产出坏数据）、取运行列表的失败不再冒充「没有运行记录」
 
 ### 计划中
 
 完整清单见 [路线图 Issue #4](https://github.com/nicholyx/action-sync-images/issues/4)——那里是面向贡献者的工作清单，每项都对应一个独立 Issue，包含背景、入手位置与验收标准。
-
-**v1.15.0 · 失败后的可操作化**（进行中）：同步失败后，Step Summary 与报告里直接给出可粘贴的失败项清单（`Sync-Batch` 为锚定 filter 正则），把重跑交到人手里 —— [#101](https://github.com/nicholyx/action-sync-images/issues/101)
 
 > 有想法？欢迎[提 Issue](https://github.com/nicholyx/action-sync-images/issues/new/choose) 讨论——高质量的提议最好带上真实的使用场景。
 
