@@ -16,6 +16,7 @@
 ### 修复
 
 - **`sync-report.json` 的 JSON 转义**（[#103](https://github.com/nicholyx/action-sync-images/issues/103)）：json 报告此前由裸 `printf` 逐字段拼接，镜像引用含 `"`、`\` 或控制字符（如 tab）时会**静默产出非法 JSON**——终端照常显示成功，从同步到落盘全程零报错，直到 `history.sh` 解析时才炸，排查时不会联想到「某次同步的镜像名里有引号」。现在改由 `jq` 构造，与三类只读检查报告收拢到同一条路径；字段名、层级、顺序完全不变，类型也锁死：计数类与 `seconds` / `rerun.not_rerunnable` 保持 number，`strip_attestation` 保持 boolean，无失败项时 `rerun.images` 仍是 `[]`
+- **`history.sh` 取运行列表的失败不再冒充「没有运行记录」**（[#98](https://github.com/nicholyx/action-sync-images/issues/98)）：进程替换 `< <(gh run list … || true)` 既拿不到退出码、又把失败吞掉，网络 EOF 时得到空输出，于是和「这个仓库确实没跑过」混成同一种结果，报错还引导人去查「工作流是不是没跑过」——正是 #87「下载失败冒充无附件」的同族问题。现在 stdout 与 stderr 分开落文件、接住退出码，失败先重试一轮（间隔 5 秒，与报告下载的重试同口径），仍失败则如实报「获取运行列表失败（已重试一次）：<gh 的真实错误>。多为网络原因，稍后重跑即可」；**真正空列表的文案逐字不变**，也不触发重试。退出码语义不变。
 
 ## [1.14.0] - 2026-09-16
 

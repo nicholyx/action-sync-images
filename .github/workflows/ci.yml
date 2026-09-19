@@ -1591,13 +1591,26 @@ jobs:
           # 执行，子 shell 里对全局变量的赋值传不回父进程
           sleep() { echo x >> "${WORK_BASE}/sleeps"; }
 
-          # gh mock：run list 返回 GH_RUN_IDS；download 按 GH_BEHAVIOR_<id> 表现
+          # gh mock：run list 按 GH_LIST_BEHAVIOR 表现（Issue #98：请求失败与
+          # 「确实没有运行记录」在旧代码里是同一种结果，正是要区分的东西），
+          # 调用次数计数走文件；download 按 GH_BEHAVIOR_<id> 表现
           # （fail-first=首败后成功 / always-fail=一直网络错误 / no-artifact=无附件）；
           # api 按 GH_API_FIXTURE 返回。download 计数用文件（bash 3.2 没有关联数组）
           gh() {
             if [[ "$1" == "run" && "$2" == "list" ]]; then
-              printf '%s\n' "${GH_RUN_IDS[@]}"
-              return 0
+              local cnt
+              cnt="$(cat "${WORK_BASE}/list-calls" 2>/dev/null || echo 0)"
+              cnt=$((cnt + 1))
+              echo "$cnt" > "${WORK_BASE}/list-calls"
+              case "${GH_LIST_BEHAVIOR:-ok}" in
+                ok)           printf '%s\n' "${GH_RUN_IDS[@]}"; return 0 ;;
+                empty)        return 0 ;;
+                fail-then-ok) if [[ "$cnt" -eq 1 ]]; then printf 'Get "https://api.github.com/x": EOF' >&2; return 1; fi
+                              printf '%s\n' "${GH_RUN_IDS[@]}"; return 0 ;;
+                # 真实 gh 的报错常是多行：第二行用来验证 die 只取首行
+                # （整段塞进去会把单行错误信息撑成一段，看不清重点）
+                always-fail)  printf 'Get "https://api.github.com/x": EOF\nTry again later\n' >&2; return 1 ;;
+              esac
             fi
             if [[ "$1" == "run" && "$2" == "download" ]]; then
               local id="$3" cnt behavior
@@ -1679,13 +1692,105 @@ jobs:
           [[ "$sleeps" -eq 0 ]] || { echo "FAIL: 不重试就不应等待，实际 ${sleeps}"; exit 1; }
           echo "✓ 无附件：不重试，文案不变"
 
+          # --- Issue #98：gh run list 的请求失败与「确实没有运行记录」必须区分 ---
+          # 失败仍重试一轮（与下载重试同口径），空列表保留原文案
+          GH_BEHAVIOR_100=""
+          GH_API_FIXTURE="yes"
+          GH_RUN_IDS=(100)
+
+          # 用例 D：首次即成功 → 不重试
+          GH_LIST_BEHAVIOR="ok"
+          rm -f "${WORK_BASE}/sleeps" "${WORK_BASE}/list-calls"
+          set +e
+          out="$(download_reports 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 0 ]] || { echo "FAIL: 首次成功应正常结束（退出码 0），实际 ${code}"; echo "$out"; exit 1; }
+          grep -qF '没有取到任何运行记录' <<<"$out" && { echo "FAIL: 首次成功不应报空列表"; echo "$out"; exit 1; }
+          list_calls="$(cat "${WORK_BASE}/list-calls" 2>/dev/null || echo 0)"
+          [[ "$list_calls" -eq 1 ]] || { echo "FAIL: 首次成功应只调一次 run list，实际 ${list_calls}"; exit 1; }
+          sleeps="$(grep -c . "${WORK_BASE}/sleeps" 2>/dev/null)" || sleeps=0
+          [[ "$sleeps" -eq 0 ]] || { echo "FAIL: 首次成功不应等待，实际 ${sleeps}"; exit 1; }
+          echo "✓ run list 首次成功：不重试"
+
+          # 用例 A：首次失败后成功 → 重试一轮，流程继续（使用者能看出重试过）
+          GH_LIST_BEHAVIOR="fail-then-ok"
+          rm -f "${WORK_BASE}/sleeps" "${WORK_BASE}/list-calls"
+          set +e
+          out="$(download_reports 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 0 ]] || { echo "FAIL: 重试成功应继续（退出码 0），实际 ${code}"; echo "$out"; exit 1; }
+          grep -qF '重试成功' <<<"$out" || { echo "FAIL: 重试成功应能看出重试过"; echo "$out"; exit 1; }
+          grep -qF '没有取到任何运行记录' <<<"$out" && { echo "FAIL: 重试成功不应报空列表"; echo "$out"; exit 1; }
+          list_calls="$(cat "${WORK_BASE}/list-calls" 2>/dev/null || echo 0)"
+          [[ "$list_calls" -eq 2 ]] || { echo "FAIL: 应调两次 run list，实际 ${list_calls}"; exit 1; }
+          sleeps="$(grep -c . "${WORK_BASE}/sleeps" 2>/dev/null)" || sleeps=0
+          [[ "$sleeps" -eq 1 ]] || { echo "FAIL: 应等待 1 次后重试，实际 ${sleeps}"; exit 1; }
+          echo "✓ run list 首次失败后成功：重试一轮，流程继续"
+
+          # 用例 B：两次都失败 → die，文案指向网络与重试，带出 gh 的真实错误
+          GH_LIST_BEHAVIOR="always-fail"
+          rm -f "${WORK_BASE}/sleeps" "${WORK_BASE}/list-calls"
+          set +e
+          out="$(download_reports 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 1 ]] || { echo "FAIL: run list 全败应 die（退出码 1），实际 ${code}"; exit 1; }
+          # 「获取运行列表失败」这几个字在重试前的告警里也出现，单查它会被那句
+          # 日志顺带满足——所以查的是 die 的定名（「（已重试一次）：」只在 die 里），
+          # 以及「指向网络」这句（PRD R2 的措辞此前没有任何断言钉住）
+          grep -qF '获取运行列表失败（已重试一次）：' <<<"$out" \
+            || { echo "FAIL: 文案应指出已重试一次仍失败"; echo "$out"; exit 1; }
+          grep -qF '多为网络原因，稍后重跑即可' <<<"$out" \
+            || { echo "FAIL: 文案应指向网络原因与重跑"; echo "$out"; exit 1; }
+          grep -qF 'EOF' <<<"$out" || { echo "FAIL: 应带出 gh 的真实错误文本"; echo "$out"; exit 1; }
+          # mock 的报错是两行：只应带出第一行（gh 的多行报错整段塞进 die 会
+          # 把单行信息撑成一段）
+          grep -qF 'Try again later' <<<"$out" && { echo "FAIL: die 只应取 stderr 的首行"; echo "$out"; exit 1; }
+          grep -qF 'run-list.err' <<<"$out" && { echo "FAIL: 不应把临时文件路径当成错误原因"; echo "$out"; exit 1; }
+          grep -qF '没有取到任何运行记录' <<<"$out" && { echo "FAIL: 网络失败不应落到空列表文案"; echo "$out"; exit 1; }
+          list_calls="$(cat "${WORK_BASE}/list-calls" 2>/dev/null || echo 0)"
+          [[ "$list_calls" -eq 2 ]] || { echo "FAIL: 应调两次 run list，实际 ${list_calls}"; exit 1; }
+          sleeps="$(grep -c . "${WORK_BASE}/sleeps" 2>/dev/null)" || sleeps=0
+          [[ "$sleeps" -eq 1 ]] || { echo "FAIL: 应等待 1 次后重试，实际 ${sleeps}"; exit 1; }
+          echo "✓ run list 两次都失败：退出码 1，文案指向网络与重试"
+
+          # 用例 C：空列表（退出码 0、无输出）→ 原文案逐字不变，且不重试
+          # （重试条件若写成「run_ids 为空就重试」，这里的 sleeps 会变成 1）
+          GH_LIST_BEHAVIOR="empty"
+          rm -f "${WORK_BASE}/sleeps" "${WORK_BASE}/list-calls"
+          set +e
+          out="$(download_reports 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 1 ]] || { echo "FAIL: 空列表应 die（退出码 1），实际 ${code}"; exit 1; }
+          grep -qF '没有取到任何运行记录。请确认当前目录在一个 GitHub 仓库中，gh 已登录，且工作流「」至少跑过一次（--check 模式下这是体检工作流；也可用 --dir 指定本地报告目录）' <<<"$out" \
+            || { echo "FAIL: 空列表文案应与改动前逐字相同"; echo "$out"; exit 1; }
+          grep -qF '重试' <<<"$out" && { echo "FAIL: 空列表不应触发重试"; echo "$out"; exit 1; }
+          sleeps="$(grep -c . "${WORK_BASE}/sleeps" 2>/dev/null)" || sleeps=0
+          [[ "$sleeps" -eq 0 ]] || { echo "FAIL: 空列表不应等待，实际 ${sleeps}"; exit 1; }
+          list_calls="$(cat "${WORK_BASE}/list-calls" 2>/dev/null || echo 0)"
+          [[ "$list_calls" -eq 1 ]] || { echo "FAIL: 空列表应只调一次 run list，实际 ${list_calls}"; exit 1; }
+          echo "✓ run list 空列表：原文案逐字不变，不重试"
+
           echo "MOCK-OK"
           SCRIPT
-          bash /tmp/test-retry.sh | grep -q 'MOCK-OK' || {
+          # 不用管道接 grep 判成败：内层断言的 FAIL 信息与退出码都会被管道吞掉，
+          # 失败时只剩一句笼统的「不符合预期」，得本地复现才知道红在哪条用例
+          # （与「验证连续失败计数与失败原因渲染」步骤同一理由）。分段捕获再判。
+          if ! out="$(bash /tmp/test-retry.sh 2>&1)"; then
+            printf '%s\n' "$out"
             echo "::error::报告下载的重试逻辑不符合预期"
+            exit 1
+          fi
+          grep -qF 'MOCK-OK' <<<"$out" || {
+            printf '%s\n' "$out"
+            echo "::error::报告下载的重试逻辑不符合预期（未跑到 MOCK-OK 标记）"
             exit 1
           }
           echo "✓ 下载重试正确（挽回计入 got / 全败如实报错 / 无附件与过期不重试）"
+          echo "✓ 运行列表获取正确（失败重试一轮 / 全败报网络错 / 空列表原文案不重试）"
 
       - name: 验证凭证映射文件
         run: |
