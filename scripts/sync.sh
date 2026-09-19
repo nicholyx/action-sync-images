@@ -2836,10 +2836,25 @@ fetch_sync_history() {
   fi
 
   : > "$out_file"
+  local bad=0 out
   while IFS= read -r f; do
-    jq -r 'select(.images != null) | .generated_at as $at
-           | .images[] | [$at, .source, .status] | join("\u001f")' "$f" >> "$out_file" 2>/dev/null || true
+    # 一次 jq 同时完成「解析」与「提取」：失败就是这份报告读不了。
+    # 不用「先 jq -e 预检、再 jq 提取」——那要跑两遍，且两次之间没有
+    # 新增的保证（文件不会被中途改写）。
+    # 合法但没有 images 字段的报告（检查报告混放在同一 artifact 里）
+    # 输出为空且退出码为 0——那是正常情况，不计为坏。
+    if out="$(jq -r 'select(.images != null) | .generated_at as $at
+           | .images[] | [$at, .source, .status] | join("\u001f")' "$f" 2>/dev/null)"; then
+      [[ -n "$out" ]] && printf '%s\n' "$out" >> "$out_file"
+    else
+      bad=$((bad + 1))
+      log_warn "历史报告无法解析，已跳过：$(basename "$f")"
+    fi
   done < <(find "$tmpdir" -type f -name '*.json' 2>/dev/null)
+  if [[ "$bad" -gt 0 ]]; then
+    # 说清后果，而不只是「跳过了几份」：连续失败次数少算会让该响的告警不响
+    log_warn "共 ${bad} 份历史报告无法解析，连续失败次数的判断可能偏小"
+  fi
 
   rm -rf "$tmpdir"
   sort -o "$out_file" "$out_file"
