@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "bash 3.2 空数组展开（本任务加 local -a 判断）、退出码与进程模型；含本轮前沉淀的 dry-run 铁律"}
+{"file": ".trellis/spec/engine/index.md", "reason": "质量门：断言先在本地复现（本任务的耗时缺陷是竞态，必须用 mock date 才能确定性复现）"}
+{"file": ".trellis/spec/guides/index.md", "reason": "设计原则第 1 条：错误的信息比没有信息更糟——dry-run 的耗时排行与通知正是这类"}

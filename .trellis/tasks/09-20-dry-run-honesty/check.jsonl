@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/engine/index.md", "reason": "断言可信度三条（恒真 / 弱断言 / 对正确实现假报错）——本任务的耗时断言若不带 mock date 就会恒绿"}
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "逐条核对；重点是 dry-run 铁律那条本轮才落实"}
+{"file": ".trellis/spec/guides/index.md", "reason": "核对：不生效的参数是否显式告警（默认值不打扰、显式传入必须说）"}

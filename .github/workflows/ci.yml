@@ -535,7 +535,11 @@ jobs:
           # 单元测试，而段序解析（cnt 不能再取最后一段）恰好是最容易改错的一处——
           # 这里真发一次，确认「失败详情」里带出的是原因而不是把次数读成原因文本。
           #
-          # 用非法引用造失败，dry-run 即可，不需要 registry 与网络。
+          # 用非法引用造失败，不需要 registry 与网络。
+          #
+          # 这里**不能**加 --dry-run：dry-run 不发送通知（它没真的搬过任何东西，
+          # 通知的对象不存在），加了就没有通知可断言。带协议前缀的引用在
+          # validate_ref 阶段直接失败、不联网，是「必定失败」的最明确表达。
           cat > /tmp/hook-note.py <<'PY'
           from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -562,8 +566,8 @@ jobs:
           sleep 2
 
           set +e
-          ./scripts/sync.sh --src 'nginx' --dest registry.example.com/smoke \
-            --dry-run --notify-webhook http://127.0.0.1:8898/hook --notify-type generic >/dev/null 2>&1
+          ./scripts/sync.sh --src 'https://bad.example.com/x:1' --dest registry.example.com/smoke \
+            --notify-webhook http://127.0.0.1:8898/hook --notify-type generic >/dev/null 2>&1
           set -e
 
           if [[ ! -s /tmp/hook-note-payload.json ]]; then
@@ -579,7 +583,7 @@ jobs:
             printf '%s\n' "$text"
             exit 1
           }
-          grep -qF -- '- nginx：镜像引用格式错误' <<<"$text" || {
+          grep -qF -- '- https://bad.example.com/x:1：镜像引用格式错误' <<<"$text" || {
             echo "::error::失败详情未带出真实原因（段序解析是否把次数读成了原因？）"
             printf '%s\n' "$text"
             exit 1
@@ -1383,6 +1387,10 @@ jobs:
 
           # sync.sh 一侧：dry-run 下秒数全为 0，排行应自觉隐去——
           # 全是 0s 的榜单没有信息量，只会占地方
+          #
+          # 注意：这一条本身**证明不了** dry-run 的耗时为 0——不带 mock date 时
+          # 打印一行只要微秒，秒数本来就会是 0。确定性的那条在「验证 dry-run
+          # 不留做过的痕迹」步骤里（用 mock date 强制跨秒）。
           rm -rf /tmp/rank && mkdir -p /tmp/rank
           ./scripts/sync.sh --src "nginx:1.27,redis:7.4,alpine:3.20" --dest r.example.com/x \
             --dry-run --report-dir /tmp/rank >/dev/null 2>&1
@@ -1391,6 +1399,162 @@ jobs:
             exit 1
           fi
           echo "✓ 无有效耗时数据时排行自动隐去"
+
+      - name: 验证 dry-run 不留做过的痕迹
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # dry-run 没有真的搬过任何东西，所以任何描述「搬了什么、花了多久、
+          # 搬完了」的输出都必须是空或零：耗时为 0、不写锁文件、不发通知、
+          # 不记录目标 digest。判据是「有没有真的搬过」，不是「这段代码跑了多久」。
+          #
+          # 四个落点都在这里用 mock 造出**确定性**：不带 mock 的话，其中三个
+          # （耗时、目标 digest、通知）在「改动前」也几乎总是绿的，断言就只是摆设。
+          fail() { echo "::error::$1"; exit 1; }
+
+          # ---- ① 耗时如实为 0 ----
+          # 计时区包住的是 sync_to_dest，而 dry-run 下它只打印一行命令就返回——
+          # 测到的是「打印一行花了多久」。微秒级够快，只有在负载高的 runner 上
+          # 才会跨过 1 秒边界，表现为偶发 flaky（2026-09-19 在 #103 的 PR 上
+          # 把整个 smoke-test job 带崩过一次，重跑即绿）。mock date 让跨秒必然
+          # 发生，这条断言才有确定性。
+          mock_bin="$(mktemp -d)"
+          cat > "${mock_bin}/date" <<'MOCK'
+          #!/usr/bin/env bash
+          if [[ "$1" == "+%s" ]]; then
+            n="$(cat /tmp/dry-mock-counter 2>/dev/null || echo 100)"
+            n=$((n + 1)); printf '%s\n' "$n" > /tmp/dry-mock-counter; printf '%s\n' "$n"
+          else
+            exec /bin/date "$@"
+          fi
+          MOCK
+          chmod +x "${mock_bin}/date"
+          rm -f /tmp/dry-mock-counter
+
+          dry_dir="$(mktemp -d)"
+          # 三个镜像是必要的：duration_ranking_rows 要求 >= 3 条记录才输出榜单
+          PATH="${mock_bin}:$PATH" ./scripts/sync.sh \
+            --src 'nginx:1.27,redis:7.2,alpine:3.20' --dest r.example.com/x \
+            --dry-run --report-dir "$dry_dir" >/dev/null 2>&1
+
+          # 用 all(...) 逐个判：`jq -e '.images[].seconds == 0'` 的退出码只看
+          # **最后一个**输出值，末条为 0 时首条非 0 也照样返回 0
+          if ! jq -e 'all(.images[]; .seconds == 0)' "${dry_dir}/sync-report.json" >/dev/null; then
+            jq -r '.images[].seconds' "${dry_dir}/sync-report.json"
+            fail "dry-run 的 seconds 应恒为 0（非 0 说明仍在按「这段代码跑了多久」计时）"
+          fi
+          if grep -qF '最慢的同步记录' "${dry_dir}/sync-report.md"; then
+            fail "dry-run 秒数全为 0，不应输出耗时排行"
+          fi
+          echo "✓ dry-run 耗时如实为 0，排行随之隐去"
+
+          # ---- ② 通知：先证明假 webhook 是活的，再证明 dry-run 不碰它 ----
+          # 不做正向对照的话，「捕获文件不存在」也可能只是因为服务没起来——
+          # 断言会变成恒真。
+          cat > /tmp/dry-hook.py <<'PY'
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+          class H(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  n = int(self.headers.get('Content-Length', 0))
+                  with open('/tmp/dry-hook-payload.json', 'wb') as f:
+                      f.write(self.rfile.read(n))
+                  self.send_response(200)
+                  self.end_headers()
+                  self.wfile.write(b'ok')
+
+              def log_message(self, *a):
+                  pass
+
+
+          HTTPServer(('127.0.0.1', 8899), H).serve_forever()
+          PY
+          rm -f /tmp/dry-hook-payload.json
+          python3 /tmp/dry-hook.py &
+          hook_pid=$!
+          trap 'kill "$hook_pid" 2>/dev/null || true' EXIT
+          sleep 2
+
+          set +e
+          # 非法引用（缺 tag）必定失败，不需要 registry 与网络；不带 --dry-run
+          # 才会发通知，这正是要证明的对照面
+          ./scripts/sync.sh --src 'nginx' --dest registry.example.com/smoke \
+            --notify-webhook http://127.0.0.1:8899/hook --notify-type generic >/dev/null 2>&1
+          set -e
+          if [[ ! -s /tmp/dry-hook-payload.json ]]; then
+            fail "正向对照失败：真实运行（无 --dry-run）都没有发出通知，假 webhook 没起来"
+          fi
+          rm -f /tmp/dry-hook-payload.json
+
+          # ---- ③ 锁文件与通知：dry-run 下都不该发生，且要有告警 ----
+          # 锁文件头部写着「可直接用 --file 读取本文件实现精确复现」，通知正文
+          # 写着「镜像同步完成……失败 N 个」——两者都在描述一次**没有发生**的同步。
+          # 通知尤其严重：它是唯一主动推送给其他人的出口。
+          lock_file="${dry_dir}/dry.lock"
+          set +e
+          dry_out="$(./scripts/sync.sh --src 'nginx:1.27' --dest r.example.com/x \
+            --dry-run --write-lock "$lock_file" \
+            --notify-webhook http://127.0.0.1:8899/hook --notify-type generic 2>&1)"
+          set -e
+
+          if [[ -f "$lock_file" ]]; then
+            fail "dry-run 不应写出锁文件（它记录的是「这次推上去的是哪一份」）"
+          fi
+          if [[ -s /tmp/dry-hook-payload.json ]]; then
+            fail "dry-run 不应发送通知（它通报的是「这次搬得怎么样」）"
+          fi
+
+          # 两个参数合并成**一条**告警、一次列全——与 --audit-lock 的处理方式一致，
+          # 所以这里断言的是「同一行里同时出现两个参数名」，不是分别出现过
+          grep -qF -- '本次不生效' <<<"$dry_out" || fail "dry-run 忽略 --write-lock / --notify-webhook 时未告警"
+          merged=""
+          while IFS= read -r line; do
+            if [[ "$line" == *"--write-lock"* && "$line" == *"--notify-webhook"* ]]; then
+              merged="$line"
+            fi
+          done <<<"$dry_out"
+          if [[ -z "$merged" ]]; then
+            printf '%s\n' "$dry_out"
+            fail "两个不生效的参数应出现在同一条告警里（一次列全）"
+          fi
+          grep -qF -- '去掉 --dry-run' <<<"$merged" || fail "告警未说明怎么办（去掉 --dry-run）"
+          echo "✓ dry-run 不写锁文件、不发通知，且一条告警列全两个参数"
+
+          # ---- ④ 目标 digest 留空，源 digest 保留 ----
+          # dry-run 查目标 digest 时，那个 tag 上若已有镜像（上一次真实同步留下的），
+          # 查到的会是它，写进「目标 Digest」列会被读成本次同步的产物。
+          # mock skopeo 让 inspect 必定成功——否则「为空」只是因为查不动，断言恒绿。
+          mock_skopeo_bin="$(mktemp -d)"
+          cat > "${mock_skopeo_bin}/skopeo" <<'MOCK'
+          #!/usr/bin/env bash
+          cmd="$1"; shift
+          case "$cmd" in
+            inspect)
+              printf '%s' '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}'
+              exit 0 ;;
+            *)
+              exit 0 ;;
+          esac
+          MOCK
+          chmod +x "${mock_skopeo_bin}/skopeo"
+
+          digest_dir="$(mktemp -d)"
+          PATH="${mock_skopeo_bin}:$PATH" ./scripts/sync.sh \
+            --src 'nginx:1.27' --dest r.example.com/x \
+            --dry-run --report-dir "$digest_dir" >/dev/null 2>&1
+
+          # source_digest 是源镜像自身的属性，与本次是否推送无关，必须照常记录
+          if [[ "$(jq -r '.images[0].source_digest' "${digest_dir}/sync-report.json")" != sha256:* ]]; then
+            fail "dry-run 下 source_digest 应照常记录（它描述的是源镜像，不是本次产物）"
+          fi
+          if [[ -n "$(jq -r '.images[0].dest_digest' "${digest_dir}/sync-report.json")" ]]; then
+            fail "dry-run 不应记录目标 digest（那是上一次同步留在该 tag 上的镜像）"
+          fi
+          echo "✓ dry-run 不记录目标 digest，源 digest 不受影响"
+
+          echo "DRY-HONESTY-OK"
 
       - name: 验证重跑指引
         run: |
@@ -1416,6 +1580,7 @@ jobs:
           # mock 掉外部依赖，只留被测逻辑
           log_info() { :; }
           log_dim() { :; }
+          log_warn() { :; }
           write_lockfile() { :; }
           send_notification() { :; }
           C_GREEN=""; C_RESET=""; C_DIM=""; C_RED=""; C_YELLOW=""
@@ -1429,7 +1594,7 @@ jobs:
             DEST_EXACT="r.example.com/x"
             DEST_REGISTRIES=()
             STRIP_ATTESTATION=false
-            FILTER_REGEX=""; EXCLUDE_REGEX=""; WRITE_LOCK=""
+            FILTER_REGEX=""; EXCLUDE_REGEX=""; WRITE_LOCK=""; NOTIFY_WEBHOOK=""
             GITHUB_STEP_SUMMARY="$(mktemp)"
             R_SRC=('nginx:1.27' 'redis:7.2' 'bad::ref')
             R_DEST=('r/x/nginx:1.27' 'r/x/redis:7.2' '—')

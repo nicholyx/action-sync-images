@@ -339,7 +339,9 @@ sync.sh —— 容器镜像同步引擎
 
 输出与通知：
       --dry-run            输出同步计划与将要执行的命令，不实际推送。
-                           计划不预测跳过结果，也不虚构未显式指定的平台
+                           计划不预测跳过结果，也不虚构未显式指定的平台；
+                           没有实际同步就谈不上锁文件与通知，因此
+                           --write-lock / --notify-webhook 本次不生效（会告警）
       --report-dir <目录>  把报告写入该目录（同时生成 .md 与 .json）。
                            同步与三种检查（--audit / --check-updates /
                            --audit-lock）均支持，文件名可区分
@@ -1760,6 +1762,14 @@ process_one() {
     fi
     end="$(date +%s)"
     elapsed=$((end - start))
+    # dry-run 没有真的搬过任何东西，耗时如实为 0。判据是「有没有真的搬过」，
+    # 不是「这段代码跑了多久」——干跑只打印一行命令，但在负载高的 runner 上
+    # 仍可能跨过 1 秒边界。那个 1s 会进报告、进耗时排行，并让「耗时全为 0 时
+    # 排行应隐去」的断言偶发误报（2026-09-19 在 #103 的 PR 上带崩过整个
+    # smoke-test job，重跑即绿）。
+    if [[ "$DRY_RUN" == "true" ]]; then
+      elapsed=0
+    fi
 
     # 拉取耗时计入第一个待推送目标，并在备注里注明——
     # 总耗时几乎总是由它主导，藏进日志会让耗时排行看起来不合理
@@ -1796,7 +1806,12 @@ process_one() {
     # 取不到就留空，只影响审计信息的完整度，不影响同步本身的成败。
     if [[ "$status" == "success" ]]; then
       src_digest="$(compute_digest "$src" || true)"
-      dest_digest="$(compute_digest "$dest" || true)"
+      # dry-run 不查目标 digest：那个 tag 上若已有镜像（上一次真实同步留下的），
+      # 查到的会是它，写进报告的「目标 Digest」列会被读成本次同步的产物。
+      # source_digest 不受影响——它是源镜像自身的属性，与本次是否推送无关。
+      if [[ "$DRY_RUN" != "true" ]]; then
+        dest_digest="$(compute_digest "$dest" || true)"
+      fi
       if [[ -n "$src_digest" ]]; then
         log_info "  源 digest：${src_digest}"
       fi
@@ -3391,13 +3406,29 @@ emit_summary() {
     write_report "$total" "$ok" "$skipped" "$fail" "$excluded"
   fi
 
+  # ---- dry-run 下失去对象的两个参数 ----
+  # dry-run 没有实际同步任何镜像，锁文件与通知都失去了对象：锁文件记录的是
+  # 「这次推上去的是哪一份」，通知通报的是「这次搬得怎么样」。两者的告警
+  # 合并成一条、一次列全——与 --audit-lock 的处理方式一致。
+  # 只在参数真被传入时告警：默认值不生效不打扰，显式传入必须说。
+  if [[ "$DRY_RUN" == "true" ]]; then
+    local -a dry_noop=()
+    if [[ -n "$WRITE_LOCK" ]]; then dry_noop+=("--write-lock"); fi
+    if [[ -n "$NOTIFY_WEBHOOK" ]]; then dry_noop+=("--notify-webhook"); fi
+    if [[ ${#dry_noop[@]} -gt 0 ]]; then
+      log_warn "--dry-run 没有实际同步任何镜像，以下参数本次不生效：${dry_noop[*]}（要生成锁文件或发送通知，请去掉 --dry-run）"
+    fi
+  fi
+
   # ---- 锁文件 ----
-  if [[ -n "$WRITE_LOCK" ]]; then
+  if [[ -n "$WRITE_LOCK" && "$DRY_RUN" != "true" ]]; then
     write_lockfile "$WRITE_LOCK"
   fi
 
   # ---- 结果通知 ----
-  send_notification "$total" "$ok" "$skipped" "$fail" "$excluded"
+  if [[ "$DRY_RUN" != "true" ]]; then
+    send_notification "$total" "$ok" "$skipped" "$fail" "$excluded"
+  fi
 
   [[ "$fail" -eq 0 ]] || return 2
   return 0
