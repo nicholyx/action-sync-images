@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/guides/index.md", "reason": "核对补记的论断是否与既有设计原则一致、有无相互矛盾"}
+{"file": ".trellis/spec/maintenance/index.md", "reason": "核对是否满足维护闭环对文档同步的要求"}
