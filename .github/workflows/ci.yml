@@ -316,8 +316,18 @@ jobs:
               exit 1
             fi
           done
-          if [[ "$(jq -r '.strip_attestation | type' "$json")" != "boolean" ]]; then
-            echo "::error::strip_attestation 不是 boolean"
+          # dry_run 与 strip_attestation 都是布尔顶层字段，必须同样用 --argjson
+          # 传（--arg 会退化成字符串 "false"，在 jq 里为真——消费方的
+          # `.dry_run != true` 判据会因此恒真，过滤彻底失效）
+          if [[ "$(jq -r '.strip_attestation | type' "$json")" != "boolean" ]] \
+            || [[ "$(jq -r '.dry_run | type' "$json")" != "boolean" ]]; then
+            echo "::error::strip_attestation / dry_run 不是 boolean"
+            exit 1
+          fi
+          # 这个 job 全程用 --dry-run 造报告，所以值必须是 true——写死 false
+          # （或漏传字段）时上面那条类型断言照样通过，只有值能抓住
+          if [[ "$(jq -r '.dry_run' "$json")" != "true" ]]; then
+            echo "::error::--dry-run 产出的报告里 dry_run 不为 true"
             exit 1
           fi
           if [[ "$(jq -r '.images[0].seconds | type' "$json")" != "number" ]] \
@@ -347,9 +357,14 @@ jobs:
           done
           echo "✓ 报告 JSON 转义与字段类型正确"
 
-          # 下游必须能消费新报告（趋势 / 聚合都读同一份 schema）
+          # 下游必须能消费新报告（趋势 / 聚合都读同一份 schema）。
+          #
+          # 上面这份报告是 --dry-run 产出的（本 step 不真的搬运任何东西），而
+          # history.sh 现在会正确地跳过干跑报告——那与「schema 能不能消费」无关，
+          # 所以这里把唯一决定「真实运行 vs 计划」的那个字段翻成 false 再喂下去。
+          # 干跑报告被跳过这件事由「验证 dry-run 不留做过的痕迹」的第 ⑤ 节断言。
           hist_dir="$(mktemp -d)"
-          cp "$json" "$hist_dir/"
+          jq '.dry_run = false' "$json" > "${hist_dir}/sync-report.json"
           if ! ./scripts/history.sh --dir "$hist_dir" >/dev/null 2>&1; then
             echo "::error::history.sh 无法消费新的 sync-report.json"
             exit 1
@@ -918,19 +933,45 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
 
+          # 夹具是**手写**的 JSON，不是 sync.sh --dry-run 的产物。
+          # 本步要断言的是「history.sh 能聚合多份报告」——与报告是不是干跑产出的
+          # 无关；继续拿 dry-run 报告当夹具，会让这条测试的成立与否取决于
+          # dry-run 的语义（它是会变的，v1.16.0 就改过一次），而不是聚合本身。
+          # 与「--check 聚合检查报告趋势」那几条测试同法。
           work="$(mktemp -d)"
+          mkdir -p "${work}/run1" "${work}/run2"
 
-          # 造两份报告：一份全成功，一份含一个非法镜像（会被记为失败）
-          ./scripts/sync.sh --src "nginx:1.27,redis:7.4" --dest r.example.com/x \
-            --dry-run --report-dir "${work}/run1" >/dev/null 2>&1
+          cat > "${work}/run1/sync-report.json" <<'JSON'
+          {"generated_at": "2026-09-01T01:00:00Z", "dry_run": false,
+           "dest_registry": "r.example.com/x", "strip_attestation": false,
+           "total": 2, "success": 2, "skipped": 0, "failed": 0, "excluded": 0,
+           "filter": "", "exclude": "",
+           "rerun": {"images": [], "filter": "", "not_rerunnable": 0},
+           "images": [
+            {"source": "nginx:1.27", "dest": "r.example.com/x/nginx:1.27", "status": "success",
+             "platforms": "linux/amd64", "source_digest": "sha256:aaa", "dest_digest": "sha256:aaa",
+             "seconds": 3, "note": ""},
+            {"source": "redis:7.4", "dest": "r.example.com/x/redis:7.4", "status": "success",
+             "platforms": "linux/amd64", "source_digest": "sha256:bbb", "dest_digest": "sha256:bbb",
+             "seconds": 5, "note": ""}
+           ]}
+          JSON
 
-          # 这一条**故意**要失败（那份报告里得有一条 failed 记录），
-          # 所以它返回 2 是预期内的。不关掉 errexit 的话，下面所有断言都不会执行——
-          # 而失败信息只会是一句没头没尾的「exit code 2」。
-          set +e
-          ./scripts/sync.sh --src "nginx:1.27,https://bad.example.com/x:1" --dest r.example.com/x \
-            --dry-run --report-dir "${work}/run2" >/dev/null 2>&1
-          set -e
+          cat > "${work}/run2/sync-report.json" <<'JSON'
+          {"generated_at": "2026-09-02T01:00:00Z", "dry_run": false,
+           "dest_registry": "r.example.com/x", "strip_attestation": false,
+           "total": 2, "success": 1, "skipped": 0, "failed": 1, "excluded": 0,
+           "filter": "", "exclude": "",
+           "rerun": {"images": ["https://bad.example.com/x:1"], "filter": "", "not_rerunnable": 0},
+           "images": [
+            {"source": "nginx:1.27", "dest": "r.example.com/x/nginx:1.27", "status": "success",
+             "platforms": "linux/amd64", "source_digest": "sha256:aaa", "dest_digest": "sha256:aaa",
+             "seconds": 2, "note": ""},
+            {"source": "https://bad.example.com/x:1", "dest": "r.example.com/x/x:1", "status": "failed",
+             "platforms": "", "source_digest": "", "dest_digest": "",
+             "seconds": 1, "note": "镜像引用格式错误"}
+           ]}
+          JSON
 
           set +e
           out="$(./scripts/history.sh --dir "$work" 2>/dev/null)"
@@ -939,14 +980,20 @@ jobs:
 
           echo "$out"
 
-          # 累计应为 4 个镜像次（2 + 2）
-          if ! grep -q '累计同步 \*\*4\*\* 个镜像次' <<<"$out"; then
+          # 两份报告都进了聚合——「能从多份报告中聚合」是本步的原目的
+          if ! grep -qF '共 **2** 次运行' <<<"$out"; then
+            echo "::error::history.sh 未把两份报告都纳入聚合"
+            exit 1
+          fi
+
+          # 累计应为 4 个镜像次（2 + 2），且成功/失败的拆分正确
+          if ! grep -qF '累计同步 **4** 个镜像次：成功 3 ｜ 跳过 0 ｜ 失败 1' <<<"$out"; then
             echo "::error::history.sh 的累计统计不正确"
             exit 1
           fi
 
           # 失败过的镜像必须出现在表里——聚合的意义正在于此
-          if ! grep -q 'bad.example.com' <<<"$out"; then
+          if ! grep -qF 'bad.example.com' <<<"$out"; then
             echo "::error::history.sh 未列出失败过的镜像"
             exit 1
           fi
@@ -1195,6 +1242,16 @@ jobs:
           # 坏报告：模拟 v1.15.0 之前产出的那种（镜像名含引号，裸 printf 拼接的产物）
           printf '{\n "generated_at": "2026-09-02T00:00:00Z",\n "total": 1, "success": 0, "skipped": 0, "failed": 1,\n "images": [\n  {"source": "a"b:1", "dest": "d", "status": "failed", "seconds": 1}\n ]\n}\n' \
             > "${work}/bad/sync-report.json"
+          # 合法 JSON 但不是对象（误放进 --dir 的其它 JSON）：既不是报告，也不该
+          # 让聚合在渲染时炸掉——它此前能过「是不是合法 JSON」这一关
+          printf '[1, 2]\n' > "${work}/stray.json"
+          # 这两个是同一类里最阴的两种，各有一条 jq 语义在背后：
+          #   `null`  —— `null.foo` 在 jq 里是 **null 而不是错误**，所以判据若只写
+          #              `.dry_run`，它会走到 else 被当成真实报告，把运行次数算多一次
+          #  空文件   —— jq 对它**不产出任何值、退出码为 0**，没有 `-e` 时同样被误收
+          # 两者都是「不报错但也不是报告」，靠断言「运行次数只算真正的那一份」抓住
+          printf 'null\n' > "${work}/null.json"
+          : > "${work}/empty.json"
 
           echo "=== 一份好 + 一份坏 ==="
           set +e
@@ -1211,6 +1268,29 @@ jobs:
           # 跳过必须可见，且能定位到具体文件
           if ! grep -qF "${work}/bad/sync-report.json" <<<"$out"; then
             echo "::error::坏报告被跳过却没有指明是哪个文件"
+            exit 1
+          fi
+          # 合法 JSON 但不是对象的文件同样被跳过并指明（它此前会一路走到聚合里，
+          # 让 jq 报错并把它的退出码泄漏成脚本的退出码）
+          if ! grep -qF "${work}/stray.json" <<<"$out"; then
+            echo "::error::非对象的 JSON 文件未被可见地跳过"
+            exit 1
+          fi
+          for stray in "${work}/null.json" "${work}/empty.json"; do
+            if ! grep -qF "$stray" <<<"$out"; then
+              echo "::error::${stray} 未被可见地跳过"
+              exit 1
+            fi
+          done
+          # 运行次数只算真正的那一份。这一条是上面那几个「不是报告」的文件的
+          # **后果**断言：它们不只该被告知跳过，更不该被算进趋势——`null` 曾
+          # 让这里显示 `共 2 次运行`，时间范围里还多一个 `—`
+          if ! grep -qF '共 **1** 次运行' <<<"$out"; then
+            echo "::error::非对象 / 空 JSON 文件被算成了运行次数（趋势虚高）"
+            exit 1
+          fi
+          if grep -qF 'jq:' <<<"$out"; then
+            echo "::error::不应把 jq 自己的报错抛给使用者"
             exit 1
           fi
           # 坏文件属「无法判定」，不触发退出码 2——网络抖动和匿名访问不该让
@@ -1278,7 +1358,11 @@ jobs:
           echo "=== fetch_sync_history：坏报告不再静默 ==="
           # 与「报告下载失败的分类判定」同思路：坏文件的组合只能 mock。
           # 生产函数整段抽出，只补它引用的全局与日志函数——它必须自包含
-          sed -n '/^fetch_sync_history()/,/^}/p' scripts/sync.sh > /tmp/fetch-sync-history-fn.sh
+          {
+            sed -n '/^readonly FIELD_SEP=/p' scripts/sync.sh
+            sed -n '/^fetch_sync_history()/,/^}/p' scripts/sync.sh
+            sed -n '/^count_consecutive_failures()/,/^}/p' scripts/sync.sh
+          } > /tmp/fetch-sync-history-fn.sh
 
           cat > /tmp/test-fetch-history.sh <<'SCRIPT'
           #!/usr/bin/env bash
@@ -1299,7 +1383,14 @@ jobs:
           JSON
           printf '{\n "generated_at": "2026-09-03T00:00:00Z",\n "total": 1, "success": 0, "skipped": 0, "failed": 1,\n "images": [\n  {"source": "a"b:1", "dest": "d", "status": "failed", "seconds": 1}\n ]\n}\n' \
             > "${fix}/broken.json"
+          # 干跑的报告：镜像都在，但一条命令都没真的执行，status 却是 success
+          cat > "${fix}/dry.json" <<'JSON'
+          {"generated_at": "2026-09-04T00:00:00Z", "dry_run": true, "total": 1, "success": 1, "skipped": 0, "failed": 0,
+           "images": [{"source": "dryonly.example.com/z:1", "dest": "d/z:1", "status": "success", "seconds": 0}]}
+          JSON
 
+          # mock 从 $src_dir 取文件，好让下面换个目录再跑一次（不用改 mock 本身）
+          src_dir="$fix"
           gh() {
             if [[ "$1" == "run" && "$2" == "list" ]]; then
               printf '111\n'
@@ -1312,7 +1403,7 @@ jobs:
                 shift
               done
               mkdir -p "$dir"
-              cp "${fix}/good.json" "${fix}/check.json" "${fix}/broken.json" "$dir/"
+              cp "${src_dir}"/*.json "$dir/"
               return 0
             fi
             return 127
@@ -1334,6 +1425,46 @@ jobs:
           # 合法但无 images 的报告是正常的，不该被计为坏
           if grep -qF 'check.json' "$warn_file"; then
             echo "FAIL: 合法但无 images 的报告被误判为坏"
+            exit 1
+          fi
+          # 干跑的报告不进历史：它是「计划」不是「已发生的事」，混进来会把
+          # 连续失败计数清零（那正是这条提取路径存在的意义）。
+          # 只断言「没提取到」不够——它还必须**不被当成坏报告**，否则使用者会
+          # 收到一句误导的告警，以为该去删文件
+          if grep -qF 'dryonly.example.com' "$out_file"; then
+            echo "FAIL: 干跑的报告被提取进了历史（连续失败计数会被它清零）"
+            exit 1
+          fi
+          if grep -qF 'dry.json' "$warn_file"; then
+            echo "FAIL: 干跑的报告被误判为坏报告"
+            exit 1
+          fi
+          # 坏报告与干跑报告都不产出记录，而缺 dry_run 字段的旧报告照常产出
+          # （good.json 里没有该字段：升级不该让历史数据失效）
+          [[ "$(wc -l < "$out_file" | tr -d ' ')" == "1" ]] || { echo "FAIL: 记录数不正确"; exit 1; }
+
+          # ---- 后果：连续失败计数不被一次干跑清零 ----
+          # count_consecutive_failures 从最新往回数，遇到任何非 failed 记录即清零，
+          # 所以干跑那份 success 足够压掉一个真实存在了 3 次的失败序列本该触发的
+          # 告警。这里断言的是**后果**本身，而不是「记录里没有它」——后者只是手段。
+          fix2="$(mktemp -d)"
+          for i in 1 2 3; do
+            cat > "${fix2}/fail${i}.json" <<JSON
+          {"generated_at": "2026-09-0${i}T00:00:00Z", "total": 1, "success": 0, "skipped": 0, "failed": 1,
+           "images": [{"source": "a.example.com/x:1", "dest": "d", "status": "failed", "seconds": 1}]}
+          JSON
+          done
+          cat > "${fix2}/dry.json" <<'JSON'
+          {"generated_at": "2026-09-04T00:00:00Z", "dry_run": true, "total": 1, "success": 1, "skipped": 0, "failed": 0,
+           "images": [{"source": "a.example.com/x:1", "dest": "d", "status": "success", "seconds": 0}]}
+          JSON
+
+          src_dir="$fix2"
+          out2="$(mktemp)"
+          fetch_sync_history "$out2" 2>/dev/null
+          consecutive="$(count_consecutive_failures 'a.example.com/x:1' "$out2")"
+          if [[ "$consecutive" != "3" ]]; then
+            echo "FAIL: 连续失败次数应为 3（一次干跑不该清零真实存在过的失败序列），实际 ${consecutive}"
             exit 1
           fi
           echo "MOCK-OK"
@@ -1553,6 +1684,92 @@ jobs:
             fail "dry-run 不应记录目标 digest（那是上一次同步留在该 tag 上的镜像）"
           fi
           echo "✓ dry-run 不记录目标 digest，源 digest 不受影响"
+
+          # ---- ⑤ 干跑的报告不进历史聚合 ----
+          # 报告里每条镜像都是 success（sync_to_dest 直接返回），但它描述的是
+          # 「计划」而不是「已发生的事」。判据同样不是「这段代码跑了多久」，而是
+          # 「有没有真的搬过」。混进趋势会让「累计同步 N 个镜像次」虚高；更严重的
+          # 是清零连续失败计数——一次没搬过任何东西的干跑足以压掉一个真实存在过
+          # 的失败序列本该触发的告警（另一条消费路径见 sync.sh 的 fetch_sync_history，
+          # 由「验证坏掉的历史报告被可见地跳过」那一步的 mock 覆盖）。
+          hist_work="$(mktemp -d)"
+          # 用上面 ④ 造的干跑报告（3 个镜像），它是真的由 --dry-run 产出的
+          mkdir -p "${hist_work}/dry"
+          cp "${dry_dir}/sync-report.json" "${hist_work}/dry/"
+          if [[ "$(jq -r '.dry_run' "${hist_work}/dry/sync-report.json")" != "true" ]]; then
+            fail "报告里没有 dry_run=true，后面的断言会变成恒真"
+          fi
+
+          set +e
+          only_dry="$(./scripts/history.sh --dir "${hist_work}/dry" 2>&1)"
+          only_dry_code=$?
+          set -e
+          echo "$only_dry"
+
+          # 没有可聚合的报告 → 退出码 1，与「目录里没有 JSON 报告」同口径
+          if [[ "$only_dry_code" -ne 1 ]]; then
+            fail "只有干跑报告时应以 1 退出（没有可聚合的报告），实际 ${only_dry_code}"
+          fi
+          # 跳过必须可见，且说清是哪种「空」
+          grep -qF '跳过 1 份 --dry-run 产出的报告' <<<"$only_dry" \
+            || fail "干跑报告被跳过却没有告知"
+          grep -qF '1 份是 --dry-run 产出的' <<<"$only_dry" \
+            || fail "「没有可聚合的报告」未说明原因是干跑"
+          # 一次都没搬过，绝不能聚合出「成功 3 个镜像次」
+          if grep -qF '累计同步' <<<"$only_dry"; then
+            fail "干跑的报告被当成真实运行聚合了（它描述的是计划）"
+          fi
+          echo "✓ 只有干跑报告时不被聚合，且明确告知"
+
+          # 兼容性回归 + 混放：旧报告（**没有** dry_run 字段）必须照常参与聚合。
+          # 升级不该让历史数据失效，所以缺字段视为真实运行——两处都手写夹具，
+          # 不依赖 sync.sh 当前的产出（将来的 dry-run 语义变化不该破这条测试）
+          cat > "${hist_work}/legacy.json" <<'JSON'
+          {"generated_at": "2026-09-01T00:00:00Z", "total": 2, "success": 2, "skipped": 0, "failed": 0,
+           "images": [
+            {"source": "legacy.example.com/a:1", "dest": "d/a:1", "status": "success", "seconds": 1},
+            {"source": "legacy.example.com/b:1", "dest": "d/b:1", "status": "success", "seconds": 2}
+           ]}
+          JSON
+          mkdir -p "${hist_work}/legacy-only" "${hist_work}/mixed"
+          cp "${hist_work}/legacy.json" "${hist_work}/legacy-only/"
+          cp "${hist_work}/legacy.json" "${hist_work}/mixed/"
+          cp "${dry_dir}/sync-report.json" "${hist_work}/mixed/dry-run.json"
+
+          set +e
+          legacy_out="$(./scripts/history.sh --dir "${hist_work}/legacy-only" 2>&1)"
+          legacy_code=$?
+          mixed_out="$(./scripts/history.sh --dir "${hist_work}/mixed" 2>&1)"
+          mixed_code=$?
+          set -e
+          echo "--- 只有旧报告 ---"; echo "$legacy_out"
+          echo "--- 旧报告 + 干跑报告 ---"; echo "$mixed_out"
+
+          if [[ "$legacy_code" -ne 0 ]]; then
+            fail "旧报告（无 dry_run 字段）应照常聚合，实际退出码 ${legacy_code}"
+          fi
+          # 用 grep -qF 匹配固定字符串（裸 grep 按 BRE 解释，正则字面量会恒假）
+          grep -qF '累计同步 **2** 个镜像次：成功 2 ｜ 跳过 0 ｜ 失败 0' <<<"$legacy_out" \
+            || fail "旧报告（无 dry_run 字段）未被正常聚合——升级让历史数据失效了"
+          if grep -qF -- '--dry-run' <<<"$legacy_out"; then
+            fail "没有干跑报告时不该出现跳过干跑的提示"
+          fi
+
+          # 混放：只有真实的那份被聚合，结果与单独存放时**逐字一致**——把多出来的
+          # 那句跳过提示去掉后，两份输出必须分毫不差（只看某一个数字的话，别的行
+          # 悄悄变了也照样绿）
+          if [[ "$mixed_code" -ne 0 ]]; then
+            fail "混放时真实报告应照常聚合，实际退出码 ${mixed_code}"
+          fi
+          grep -qF '跳过 1 份 --dry-run 产出的报告' <<<"$mixed_out" \
+            || fail "混放时未告知跳过了几份干跑报告"
+          grep -qF '共 **1** 次运行' <<<"$mixed_out" \
+            || fail "混放时干跑报告仍被算成一次运行"
+          if ! diff <(printf '%s\n' "$legacy_out") \
+                    <(printf '%s\n' "$mixed_out" | grep -v -- '--dry-run 产出的报告') >/dev/null; then
+            fail "混放时的聚合结果与只有真实报告时不一致（干跑的影响没有完全排除）"
+          fi
+          echo "✓ 混放时只聚合真实报告，旧报告（无 dry_run 字段）兼容不变"
 
           echo "DRY-HONESTY-OK"
 

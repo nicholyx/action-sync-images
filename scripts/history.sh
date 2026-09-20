@@ -578,24 +578,59 @@ print_slowest() {
 # 检查报告趋势（--check audit / --check lock-audit）
 # ---------------------------------------------------------------------------
 
-# 把报告文件分成「能解析」与「不能解析」两组，结果经全局变量传出。
+# 把报告文件分成三类，结果经全局变量传出：
+#   PARSABLE_REPORTS   —— 能解析、且是真实运行（参与聚合）
+#   DRY_RUN_REPORTS    —— 能解析、但由 --dry-run 产出（不参与聚合，但要告知）
+#   UNPARSABLE_REPORTS —— 解析不了（不参与聚合，且要告警）
 #
-# 为什么需要：一份坏文件不该让全部趋势失效（jq -s 是一次读整批，一个坏则全废），
+# 为什么需要分类：一份坏文件不该让全部趋势失效（jq -s 是一次读整批，一个坏则全废），
 # 也不该被静默丢掉（少算的历史会让「连续失败次数」偏小、该响的告警不响）。
 #
-# 判据只到「是不是合法 JSON」为止，**不做结构校验**：报告 schema 会演进
-# （v1.14 加了 rerun、v1.15 加了 note），旧报告缺新字段是正常的，判成「坏」
-# 会让升级本身变成一次数据失效。
+# 为什么干跑的报告不能参与聚合：它描述的是「计划」，不是「已发生的事」。
+# 混进趋势会让「累计同步 N 个镜像次」虚高；更严重的是清零连续失败计数——
+# count_consecutive_failures 遇到任何非 failed 记录即清零，一次干跑的 success
+# 足以压掉一个真实存在过的失败序列本该触发的告警。
+#
+# 判据只到「能不能当一份报告读」为止——合法 JSON 且是个对象，再看顶层 dry_run。
+# **不做更多结构校验**：报告 schema 会演进（v1.14 加了 rerun、v1.15 加了 note），
+# 旧报告缺新字段是正常的，判成「坏」会让升级本身变成一次数据失效。同理 .dry_run
+# 缺失（v1.16.0 之前的报告）走 else 分支视为真实运行。
+#
+# 非对象（数组、标量、`null`）与空文件也落进「无法解析」：它们本来就不是报告，
+# 而旧实现里数组/标量能过预检、被当成报告送进聚合，让 jq 在渲染时直接报错
+# （#108 那类「第三方退出码泄漏成脚本退出码」的又一入口）。当作「读不出报告」
+# 跳过并告警，比让它炸在聚合里诚实。
+#
+# `type != "object"` 必须显式写出来，不能指望 `.dry_run` 自己报错：jq 里
+# `null.foo` 是 **null 而不是错误**，所以 `null` 文件会一路走到 else 被判成
+# 「真实报告」，把运行次数算多一次（`共 2 次运行`，时间范围还出现 `—`）——
+# 这正是本任务要消灭的「虚高」。`-e` 同样是必须的：空文件/纯空白让 jq 不产出
+# 任何值、**退出码为 0**，没有 `-e` 时它同样会被当成真实报告（旧判据 `jq -e .`
+# 恰好因为 `-e` 对「结果是 null」与「没有结果」都返回非零而拒掉了这两类）。
+# 两者都不是新问题的引入，而是**别把它改回去**：v1.16.0 加 dry_run 分类时
+# 实测踩到过，CI 的「验证坏掉的历史报告被可见地跳过」里有对应断言。
+#
+# 一次 jq 同时回答两个问题，仍是每个文件一次调用——不是「先预检再判定」的两遍。
 #
 # 结果走全局变量：本文件对「命令替换是子 shell、赋值传不回父进程」有过多轮教训。
-split_parsable_reports() {
+classify_reports() {
   PARSABLE_REPORTS=()
+  DRY_RUN_REPORTS=()
   UNPARSABLE_REPORTS=()
 
-  local f
+  local f verdict
   for f in "$@"; do
-    if jq -e . "$f" >/dev/null 2>&1; then
-      PARSABLE_REPORTS+=("$f")
+    # if 判的是 jq 的退出码（命令替换的退出码就是命令的），解析不了时非零
+    # 落进 else——与 v1.15.1 的判据一致。`type != "object"` 走 error 而非
+    # 另设一个返回值：非对象与「读不出报告」在本函数里是同一件事（都是「无法
+    # 解析」），多设一个哨兵值只会多一条分支、多一处漏判。
+    if verdict="$(jq -e -r 'if type != "object" then error("顶层不是 JSON 对象")
+                    elif .dry_run == true then "dry" else "real" end' "$f" 2>/dev/null)"; then
+      if [[ "$verdict" == "dry" ]]; then
+        DRY_RUN_REPORTS+=("$f")
+      else
+        PARSABLE_REPORTS+=("$f")
+      fi
     else
       UNPARSABLE_REPORTS+=("$f")
     fi
@@ -606,7 +641,7 @@ split_parsable_reports() {
 #
 # 按 JSON 字段过滤而不是文件名：--dir 目录下可能混放同步报告与
 # 各种检查报告，文件名只是约定，字段才是事实。
-# 无法解析的文件已由 split_parsable_reports 在预检阶段拦下并告警，
+# 无法解析的文件已由 classify_reports 在预检阶段拦下并告警，
 # 走到这里 else 分支只剩「能解析、但 check 字段不是我要的那个」一种含义。
 filter_by_check() {
   local check_type="$1"
@@ -620,7 +655,7 @@ filter_by_check() {
     if [[ -n "$match" ]]; then
       FILTERED_FILES+=("$f")
     else
-      # 解析失败的已在 split_parsable_reports 里被拦下并告警，走到这里的
+      # 解析失败的已在 classify_reports 里被拦下并告警，走到这里的
       # 是「能解析、但 check 字段不是我要的那个」——两种跳过原因必须分得开，
       # 否则使用者不知道该删文件还是该换 --check
       log_warn "跳过非 ${check_type} 的报告：${f}"
@@ -975,14 +1010,41 @@ main() {
 
   # 必须先于 filter_by_check：它同样要读这些文件，坏文件在那里会被它的
   # `2>/dev/null || true` 静默吞掉——那是第二处静默，且文案与「类型不匹配」混在一起
-  split_parsable_reports "${files[@]}"
+  classify_reports "${files[@]}"
   files=()
   if [[ ${#PARSABLE_REPORTS[@]} -gt 0 ]]; then
     files=("${PARSABLE_REPORTS[@]}")
   fi
 
+  # 干跑的报告被跳过了要说一声——它们不是「坏」，只是不属于真实历史。
+  # 不说的话使用者会对不上数（本仓库的既有原则：排除的东西必须可见）。
+  # 与坏报告的告警分开两句：两者的处置方式不同，混在一起说会让人以为该删文件。
+  if [[ ${#DRY_RUN_REPORTS[@]} -gt 0 ]]; then
+    log_info "跳过 ${#DRY_RUN_REPORTS[@]} 份 --dry-run 产出的报告（它们描述的是计划，不是已发生的同步）"
+  fi
+
   if [[ ${#files[@]} -eq 0 ]]; then
-    die "共 ${#UNPARSABLE_REPORTS[@]} 份 JSON 报告，没有一份能解析。首个无法解析的是 ${UNPARSABLE_REPORTS[0]}"
+    # 全是坏文件时沿用 v1.15.1 的文案：这种「空」的原因与本改动无关，
+    # 不该顺带改掉（改文案会连带让已有断言失去意义，而它仍在准确描述事实）
+    if [[ ${#DRY_RUN_REPORTS[@]} -eq 0 ]]; then
+      die "共 ${#UNPARSABLE_REPORTS[@]} 份 JSON 报告，没有一份能解析。首个无法解析的是 ${UNPARSABLE_REPORTS[0]}"
+    fi
+    # 有干跑报告参与时，三种「空」的原因不同，必须说清楚是哪种：
+    # 「能解析但都是干跑」与「没有一份能解析」是完全不同的两回事，
+    # 混成一句话会让使用者去删根本没坏的文件
+    local empty_detail="${#DRY_RUN_REPORTS[@]} 份是 --dry-run 产出的"
+    if [[ ${#UNPARSABLE_REPORTS[@]} -gt 0 ]]; then
+      empty_detail+="，${#UNPARSABLE_REPORTS[@]} 份无法解析（首个：${UNPARSABLE_REPORTS[0]}）"
+    fi
+    # --check 模式下还有一条约束上面没说到：这些报告即便不是干跑，也得是
+    # check=<类型> 的检查报告才会被聚合。不说这一句，使用者会以为「不跑
+    # dry-run 就好了」——而真实运行的同名同步报告在这里照样会被过滤掉，
+    # 那是一次朝错误方向的排查。检查报告从哪来，与 filter_by_check 的
+    # 报错保持同一套指引。
+    if [[ -n "$CHECK_MODE" ]]; then
+      empty_detail+="；且本次要的是 check=${CHECK_MODE} 的检查报告（由 sync.sh --report-dir 产出），其它类型的报告不参与"
+    fi
+    die "没有可聚合的报告：${empty_detail}"
   fi
   if [[ ${#UNPARSABLE_REPORTS[@]} -gt 0 ]]; then
     # 逐个拼接，不用 `printf '%s、' "${arr[@]}"`——那样末尾会多一个顿号，
