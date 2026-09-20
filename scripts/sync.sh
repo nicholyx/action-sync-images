@@ -2858,7 +2858,13 @@ fetch_sync_history() {
     # 新增的保证（文件不会被中途改写）。
     # 合法但没有 images 字段的报告（检查报告混放在同一 artifact 里）
     # 输出为空且退出码为 0——那是正常情况，不计为坏。
-    if out="$(jq -r 'select(.images != null) | .generated_at as $at
+    #
+    # .dry_run == true 的报告同样不提取：它描述的是计划，不是已发生的事。
+    # 这一处漏了的话，前面几处过滤做得再好也白搭——历史里的干跑 success
+    # 会把连续失败计数清零，该响的告警仍被静默压掉。
+    # 缺失字段（v1.16.0 之前的报告）不等于 true，视为真实运行：升级不该
+    # 让历史数据失效。
+    if out="$(jq -r 'select(.images != null and .dry_run != true) | .generated_at as $at
            | .images[] | [$at, .source, .status] | join("\u001f")' "$f" 2>/dev/null)"; then
       [[ -n "$out" ]] && printf '%s\n' "$out" >> "$out_file"
     else
@@ -3536,10 +3542,21 @@ write_report() {
       '{images:[], filter:$filter, not_rerunnable:$not_rerunnable}')"
   fi
 
+  # dry_run 是关于「这份报告本身」的元信息——它描述的是计划还是已发生的事。
+  # 必须落进报告：消费方（history.sh 的趋势聚合、本脚本的 fetch_sync_history）
+  # 只看文件内容，无从知道它是怎么跑出来的。dry-run 的报告里每条镜像都是
+  # status=success（sync_to_dest 直接返回），当成真实运行聚合会让「累计同步
+  # N 个镜像次」虚高，更严重的是把连续失败计数清零——一次没搬过任何东西的
+  # 干跑足以压掉一个真实失败序列本该触发的告警。
+  #
+  # 用 --argjson 而不是 --arg：$DRY_RUN 的字面量就是 true / false，前者产出
+  # boolean，后者会退化成字符串 "false"（在 jq 里为真）。
+  #
   # --argjson 把上一步的 JSON 文本嵌回来，jq 原样保留其结构而不会二次转义成
   # 字符串；--slurpfile 对空文件产出 [] 而不是 null。
   jq -n --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
     --arg dest "${DEST_EXACT:-${DEST_REGISTRIES[*]}}" \
+    --argjson dry "$DRY_RUN" \
     --argjson strip "$STRIP_ATTESTATION" \
     --argjson total "$total" --argjson success "$ok" \
     --argjson skipped "$skipped" --argjson failed "$fail" \
@@ -3547,7 +3564,7 @@ write_report() {
     --arg filter "$FILTER_REGEX" --arg exclude "$EXCLUDE_REGEX" \
     --argjson rerun "$rerun_json" \
     --slurpfile images "$records_file" \
-    '{generated_at:$at, dest_registry:$dest, strip_attestation:$strip,
+    '{generated_at:$at, dry_run:$dry, dest_registry:$dest, strip_attestation:$strip,
       total:$total, success:$success, skipped:$skipped, failed:$failed,
       excluded:$excluded, filter:$filter, exclude:$exclude,
       rerun:$rerun, images:$images}' > "$json"

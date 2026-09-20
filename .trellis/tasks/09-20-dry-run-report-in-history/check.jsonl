@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/engine/index.md", "reason": "断言可信度三条——被改的那条既有断言必须仍覆盖原目的"}
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "逐条核对；兼容性回归（无 dry_run 字段的旧报告）是重点"}
+{"file": ".trellis/spec/guides/index.md", "reason": "核对：跳过的份数是否可见、原因是否说清"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "报告 schema 是跨层契约（两个消费方），改动不得破坏旧报告"}
