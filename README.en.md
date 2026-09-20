@@ -451,6 +451,14 @@ Recent highlights:
 - ✅ v1.6: manifest audit, upstream release detection, per-destination naming rules
 - ✅ v1.7: audit notifications, `Check-Registry` workflow for running checks from the web UI
 - ✅ v1.8: lockfile drift detection (`--audit-lock`), report files for all checks, macOS timeout fallback
+- ✅ v1.9: check-report trend aggregation (`history.sh --check`: persistently stale / missing / drifting)
+- ✅ v1.10: trend results written to disk (`--report-dir`) and the `History-Trend` workflow
+- ✅ v1.11: "no artifact" vs "download failed" — network flakiness is no longer reported as missing data
+- ✅ v1.12: architecture docs catch up on the design rationales behind v1.8–v1.11
+- ✅ v1.13: dry-run sync plan preview (the project's first external contribution)
+- ✅ v1.14: batch retry for report downloads — transient failures are recovered without rerunning the whole command
+- ✅ v1.15: actionable failures — paste-ready rerun hints, failure reasons in reports / Step Summary / notifications; `gh run list` failures no longer masquerade as "no runs"
+- ✅ v1.16: dry-run honesty — a dry run reports no elapsed time, writes no lockfile, sends no notification and records no destination digest; its reports are no longer counted as real runs
 
 Ideas welcome — [open an issue](https://github.com/nicholyx/action-sync-images/issues/new/choose).
 
