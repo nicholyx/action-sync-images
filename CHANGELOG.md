@@ -9,6 +9,13 @@
 
 ## [Unreleased]
 
+### 变更
+
+- **regctl 路径（`--strip-attestation`）的真实推送进了 CI**：`sync_via_regctl` 是与默认 skopeo 路径**完全不同的实现**（`regctl index create` 重建索引、逐平台复制），但集成测试 job 里此前一次都没走过——它只被 dry-run 与参数层面的用例覆盖，而真实推送恰恰是 dry-run 到不了的地方。新用例在本地 `registry:2` 上真推送，断言「产物的平台集合**恰好**等于 `--platforms` 指定的那个」与「产物摘要与源不同（即真的重建了索引，而非原样搬运）」。第二条是关键：只断言「推送成功」是不够的——skopeo 路径同样会成功
+  - **源换成多平台索引**：原计划复用既有的 `source/hello:latest`，但它是用 `skopeo copy` 准备的，而后者默认 `--multi-arch system`——落到 registry 里其实是**单平台 manifest**。拿单平台源测「只保留指定平台」等于什么都没测（regclient 对非索引的 `--ref` 本来就忽略平台过滤），用例因此自备一份 `--all` 的索引——顺带带上上游的 attestation manifest，正是这个选项现实中的用武之地。另加一条前置断言，把「源退化成单平台」挡在断言恒真之前
+  - **不预装 regctl**：脚本的 `ensure_regctl` 本就会从 GitHub release 下载到 `$HOME/.regclient/bin`，用例走的就是这条真实路径，顺带覆盖它本身；预装反而绕开了被测代码
+  - **本地测试仓库要告诉 regctl 它是 HTTP**：regctl 默认走 HTTPS，且不像 skopeo 那样「TLS 失败就退回 HTTP」，而 `sync.sh` 目前没有把 `--tls-verify` 的值传给 regctl，因此用例按 regclient 文档把这台本地 registry 标成 `tls: disabled`。这是环境准备而非被测行为的替代，但它同时暴露了一个真实缺口：**`--tls-verify false` 在 `--strip-attestation` 模式下被静默忽略**，自签 HTTPS 仓库的使用者会撞上。**源凭证也一样**——`--src-username` / `--src-password` / `--src-credentials` 同样到不了 regctl（regclient 的入口是 docker config 或它自己的 host 配置），用这些参数配私有上游的人会拿到一个 `no credentials available: unauthorized`，而日志里还写着「源仓库凭证已装载」。按本项目「显式传入却不生效必须告警」的既有规矩（`--retries` / `--retry-delay` 已有先例），这两条至少都该有告警——另开任务处理
+
 ## [1.19.0] - 2026-09-22
 
 这一轮做的是**对账**：文档说的与实现是否还一致。「改了行为要同步文档」是既有规范，但反方向的漂移不会自己暴露——文档停在旧版本，而使用者照抄就会撞上。

@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/engine/index.md", "reason": "核对断言可信度三条（恒真 / 弱断言 / 对正确实现假报错）"}
+{"file": ".trellis/spec/workflows/index.md", "reason": "核对工作流改动是否守住既有风格与门禁"}
