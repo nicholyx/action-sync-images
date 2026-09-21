@@ -86,7 +86,19 @@
 
 > 用 Harbor 的话改配 `HARBOR_REGISTRY` / `HARBOR_USERNAME` / `HARBOR_PASSWORD`，详见 [使用文档](docs/USAGE.md#第一步准备凭证)。
 
-### 2. 触发同步
+### 2. 设置目标仓库
+
+默认值是 `registry.cn-shenzhen.aliyuncs.com/nicholyx`——**这是项目作者示例用的命名空间**，你要同步到自己的仓库就把它换掉：
+
+`Settings` → `Secrets and variables` → `Actions` → **Variables** 标签页 → `New repository variable`：
+
+| 名称 | 值示例 |
+| --- | --- |
+| `ALIYUNCS_REGISTRY` | `registry.cn-shenzhen.aliyuncs.com/your-namespace` |
+
+> 不设置也能跑，但会推到作者的命名空间——除非你的阿里云账号下恰好建了同名的 `nicholyx` 命名空间，否则会 `denied` 失败。
+
+### 3. 触发同步
 
 打开 **Actions** → 左侧选 `Sync-Images-to-AliYuncs` → **Run workflow** → 填入源镜像：
 
@@ -94,7 +106,9 @@
 registry.k8s.io/pause:3.9
 ```
 
-### 3. 拉取验证
+### 4. 拉取验证
+
+把下面的 `nicholyx` 换成第 2 步设置的命名空间：
 
 ```bash
 docker pull registry.cn-shenzhen.aliyuncs.com/nicholyx/registry.k8s.io_pause:3.9

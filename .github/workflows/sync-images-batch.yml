@@ -13,7 +13,7 @@ on:
         required: true
         default: 'images.lock.txt'
       dest_registry:
-        description: '目标仓库前缀（留空则使用 ALIYUNCS_REGISTRY 或内置默认值）'
+        description: '目标仓库前缀（留空则用 ALIYUNCS_REGISTRY 变量；都没有则用内置默认值——那是项目作者示例用的命名空间，同步到自己的仓库请设置该变量）'
         required: false
         default: ''
       concurrency:
@@ -69,7 +69,17 @@ jobs:
     name: 批量同步清单中的镜像
     runs-on: ubuntu-latest
     env:
+      # 目标仓库前缀，优先级：工作流输入 > ALIYUNCS_REGISTRY 变量 > 内置默认值。
+      # 注意：最后的默认值是**项目作者示例用的命名空间**，不是你的——登录步骤里会提示。
       DEST_REGISTRY: ${{ inputs.dest_registry || vars.ALIYUNCS_REGISTRY || 'registry.cn-shenzhen.aliyuncs.com/nicholyx' }}
+      # 上面那个内置默认值的字面量，供登录步骤里做「是否仍在用示例默认值」的判断。
+      # 单独写一份而不是从 DEST_REGISTRY 反推：判据是「目标是否**等于**内置默认值」，
+      # 与「值里恰好含作者的命名空间名」是两回事——后者会误伤把区域换到杭州、
+      # 却保留了同名命名空间的使用者。
+      DEFAULT_DEST: 'registry.cn-shenzhen.aliyuncs.com/nicholyx'
+      # 仓库 owner，用来判断这是不是作者自己的仓库（见登录步骤）。
+      # 用 owner 判断而不是猜字符串，作者自己的运行不受打扰。
+      REPO_OWNER: ${{ github.repository_owner }}
     steps:
       - name: Checkout Repos
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -85,6 +95,16 @@ jobs:
         run: |
           #!/usr/bin/env bash
           set -euo pipefail
+          # 默认目标是**项目作者示例用的命名空间**。使用者 fork 后如果不设
+          # ALIYUNCS_REGISTRY（也没在这次运行里填 dest_registry），就会往那里推——
+          # 阿里云的命名空间是**账号内唯一**而非全局唯一，所以如果他恰好建了同名的
+          # 能成功（只是推到了自己账号下），否则就是 denied。两种情况下他都不知道
+          # 自己在用谁的默认值，所以提示一句。
+          #
+          # 只提示、不阻断：默认值可能是使用者的合法选择（见上）。
+          if [[ "$DEST_REGISTRY" == "$DEFAULT_DEST" && "$REPO_OWNER" != "nicholyx" ]]; then
+            echo "::warning::目标仓库是内置的示例默认值（${DEFAULT_DEST}，项目作者的命名空间）。要同步到你自己的仓库，请在 Settings → Secrets and variables → Actions → Variables 里设置 ALIYUNCS_REGISTRY；若你确实在用这个命名空间，可忽略本条。"
+          fi
           registry_host="${DEST_REGISTRY%%/*}"
           echo "登录仓库：${registry_host}"
           printf '%s' "${REGISTRY_PASSWORD}" | docker login "${registry_host}" \

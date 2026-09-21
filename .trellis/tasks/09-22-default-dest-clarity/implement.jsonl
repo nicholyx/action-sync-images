@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/workflows/index.md", "reason": "工作流层的规范：本任务改两个工作流 YAML，须守住既有的表达式注入防护与门禁（actionlint/yamllint）"}
+{"file": ".trellis/spec/guides/index.md", "reason": "设计原则第 1 条「错误的信息比没有信息更糟」——文档把必填说成可选正是这类"}

@@ -50,6 +50,20 @@
 
 > 💡 建议在 Harbor 里创建一个**机器人账号**，只授予目标项目的推送权限，而不是用管理员账号。这样万一凭证泄露，影响面可控。
 
+### 目标仓库（`ALIYUNCS_REGISTRY`）
+
+默认值是 `registry.cn-shenzhen.aliyuncs.com/nicholyx`——**项目作者示例用的命名空间**。同步到你自己的仓库需要覆盖它，不必改代码：
+
+`Settings` → `Secrets and variables` → `Actions` → **Variables** 标签页 → `New repository variable`：
+
+| 名称 | 值示例 |
+| --- | --- |
+| `ALIYUNCS_REGISTRY` | `registry.cn-hangzhou.aliyuncs.com/your-namespace` |
+
+设置后工作流会自动使用它；登录地址会从该变量的第一段自动推导，所以换区域（比如从深圳换到杭州）也只需要改这一个地方。`Sync-Batch` 同样认这个变量——它的 `dest_registry` 输入留空时就走这里。
+
+> 不设置也能跑，但会推到作者的命名空间。阿里云的命名空间是**账号内唯一**而非全局唯一，所以除非你的账号下恰好建了同名的 `nicholyx` 命名空间，否则推送会被 `denied` 拒绝。工作流在运行时也会就此提示一句（该提示不阻断同步）。
+
 ### 可选：配置同步结果通知
 
 同步往往是无人值守的——定时跑，或者随手点一下就走开了。**失败了没人知道**，等集群拉不到镜像才发现，中间可能已经隔了好几天。
@@ -104,18 +118,6 @@
 在检查模式下，`--notify-on failure` 的含义是「有需要关注的项」——存在落后 / 缺失 / 无法判定，或有仓库没查成；**全绿时不会打扰**。通知里只列需要处理的条目（最多 20 条，完整结果看运行页面），不会把整张表推过去把重点淹没。
 
 > `--notify-after-failures` 只在同步模式下有意义——检查没有「连续失败」这个概念，在检查模式下显式传入会告警。
-
-### 可选：更换目标仓库
-
-默认目标仓库是 `registry.cn-shenzhen.aliyuncs.com/nicholyx`。想换成别的，不必改代码：
-
-`Settings` → `Secrets and variables` → `Actions` → **Variables** 标签页 → `New repository variable`：
-
-| 名称 | 值示例 |
-| --- | --- |
-| `ALIYUNCS_REGISTRY` | `registry.cn-hangzhou.aliyuncs.com/your-namespace` |
-
-设置后工作流会自动使用它；不设置则使用内置默认值。登录地址会从该变量的第一段自动推导，所以换区域（比如从深圳换到杭州）也只需要改这一个地方。
 
 ### 可选：同步私有仓库的镜像
 
