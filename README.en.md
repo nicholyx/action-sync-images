@@ -160,7 +160,9 @@ Edit [`images.lock.txt`](images.lock.txt) at the repo root, then trigger the `Sy
 | `platforms` | | auto-detect | Platforms to keep, e.g. `linux/amd64,linux/arm64`. Only applies when the previous option is checked |
 | `concurrency` | | `4` | How many images to sync in parallel |
 | `skip_existing` | | `true` | Skip images the destination already has |
+| `verify` | | `false` | Compare per-platform digests after syncing, catching pushes that completed but came through incomplete |
 | `dry_run` | | `false` | Show a sync plan before printing commands, without pushing; use it to verify filtering and destination names |
+| `notify_after_failures` | | `1` | Only notify after N consecutive failures of the same image; a success resets the count |
 
 ### Sync-Images-to-Harbor
 
@@ -170,7 +172,9 @@ Edit [`images.lock.txt`](images.lock.txt) at the repo root, then trigger the `Sy
 | `images_dest` | ✅ | — | Destination path appended after `HARBOR_REGISTRY`, e.g. `library/nginx:1.27` |
 | `concurrency` | | `4` | Parallel image count |
 | `skip_existing` | | `true` | Skip identical existing images |
+| `verify` | | `false` | Compare per-platform digests after syncing, catching pushes that completed but came through incomplete |
 | `dry_run` | | `false` | Same as above |
+| `notify_after_failures` | | `1` | Only notify after N consecutive failures of the same image; a success resets the count |
 
 ### Sync-Batch
 
@@ -180,7 +184,9 @@ Edit [`images.lock.txt`](images.lock.txt) at the repo root, then trigger the `Sy
 | `dest_registry` | | see below | Destination prefix. Empty falls back to the `ALIYUNCS_REGISTRY` variable, then the built-in default |
 | `concurrency` | | `6` | Parallel image count |
 | `skip_existing` | | `true` | Skip identical existing images |
+| `verify` | | `false` | Compare per-platform digests after syncing, catching pushes that completed but came through incomplete |
 | `dry_run` | | `false` | Same as above |
+| `notify_after_failures` | | `1` | Only notify after N consecutive failures of the same image; a success resets the count |
 | `filter` | | empty | Only sync images matching this regex, e.g. `kube-` |
 | `exclude` | | empty | Skip images matching this regex, e.g. `apiserver` |
 
