@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/engine/index.md", "reason": "Quality Check：真实路径的行为必须进 CI 集成测试——本任务补的正是这条；含「断言不要恒真」的要求"}
+{"file": ".trellis/spec/workflows/index.md", "reason": "工作流层规范：本任务改 ci.yml，须守住既有门禁与风格"}

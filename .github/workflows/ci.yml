@@ -2503,6 +2503,84 @@ jobs:
           fi
           echo "✓ 单目标保持常规路径"
 
+      - name: regctl 路径（--strip-attestation）的真实推送
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 这条路径此前只在 dry-run 与参数层面被测过。它与默认的 skopeo 路径是
+          # 完全不同的实现（regctl index create 重建索引、逐平台复制），而项目自己
+          # 记过：dry-run 覆盖不到真实推送，v1.1.0 的三个缺陷全部发生在那里。
+          #
+          # 源必须是**多平台索引**，否则「只保留指定平台」这条语义无从体现：
+          # 上面那个 localhost:5000/source/hello:latest 由 `skopeo copy` 准备，
+          # 而它的默认是 --multi-arch system——落到 registry 里是**单平台 manifest**，
+          # 拿它测等于什么都没测。所以这里另备一份 --all 的索引。
+          skopeo copy --all --dest-tls-verify=false \
+            docker://docker.io/library/hello-world:latest \
+            docker://localhost:5000/source/hello-multi:latest
+
+          src_index="$(skopeo inspect --raw --tls-verify=false docker://localhost:5000/source/hello-multi:latest)"
+          # 前置断言：源确实多平台。少了它，一旦源准备退化成单平台，下面两条断言
+          # 会变成恒真——「验证过了」比「没验证」更容易让人放心地犯错。
+          # 源若不是索引（单平台 manifest），这里数出来就是 0 个条目。
+          src_platform_count="$(jq -r '[.manifests[]?.platform | "\(.os)/\(.architecture)"] | unique | length' <<<"$src_index")"
+          if [[ "$src_platform_count" -lt 2 ]]; then
+            echo "::error::源不是多平台索引（只识别到 ${src_platform_count} 个平台条目），本用例无法区分「过滤平台」与「原样搬运」"
+            exit 1
+          fi
+          echo "✓ 源是多平台索引（${src_platform_count} 个平台）"
+
+          # 不预装 regctl：脚本的 ensure_regctl 会自己从 GitHub release 下载到
+          # $HOME/.regclient/bin——那本身也是被测代码，预装反而绕开了它。
+          #
+          # 但要给 regctl 交代清楚这台本地 registry 是纯 HTTP：regctl 默认走
+          # HTTPS（与 skopeo 不同，它不会「TLS 失败就退回 HTTP」），而 sync.sh 目前
+          # 没有把 --tls-verify 传给 regctl（regclient 的入口是 host 配置）。
+          # 这是让本地测试仓库可达的环境准备，按 regclient 文档的写法等价于
+          # `regctl registry set --tls disabled localhost:5000`。
+          mkdir -p "${HOME}/.regctl"
+          printf '{"hosts":{"localhost:5000":{"tls":"disabled"}}}\n' > "${HOME}/.regctl/config.json"
+
+          # 失败时必须把 sync.sh 的输出打出来。它被 $() 捕获，若只靠 set -e 退出，
+          # CI 日志里只会剩一个退出码——连失败在「regctl 下载」「自签 TLS」
+          # 还是「平台不符」上都看不出来，而这条路径恰恰是最容易出环境问题的一条。
+          if ! output="$(./scripts/sync.sh \
+            --src localhost:5000/source/hello-multi:latest \
+            --dest localhost:5000/dest-regctl \
+            --strip-attestation --platforms linux/amd64 \
+            --tls-verify false --concurrency 1 2>&1)"; then
+            echo "$output"
+            echo "::error::regctl 路径同步失败，详见上方输出"
+            exit 1
+          fi
+          echo "$output"
+
+          dest="localhost:5000/dest-regctl/localhost_5000_source_hello-multi:latest"
+          raw="$(skopeo inspect --raw --tls-verify=false "docker://${dest}")" || {
+            echo "::error::regctl 路径的目标镜像不存在：${dest}"; exit 1; }
+
+          # 断言一：产物是**索引**，且平台集合**恰好**是指定的那个。
+          # 这是 regctl 路径区别于 skopeo 路径的核心语义——同一个多平台的源，
+          # skopeo 会原样搬运整个索引，regctl 只保留列出的平台。
+          platforms="$(jq -r '.manifests[]?.platform | "\(.os)/\(.architecture)"' <<<"$raw" | sort | tr '\n' ' ')"
+          if [[ "$platforms" != "linux/amd64 " ]]; then
+            echo "::error::regctl 路径的平台集合应为「linux/amd64」，实际为「${platforms}」"
+            exit 1
+          fi
+
+          # 断言二：产物与源**必然不同**。重建索引意味着 digest 不会与源相同——
+          # 若相同，说明它其实走的是原样搬运（skopeo）那条路。
+          # 只断言「推送成功」是不够的：skopeo 路径同样会成功。
+          src_sum="$(openssl dgst -sha256 <<<"$src_index" | awk '{print $NF}')"
+          dest_sum="$(openssl dgst -sha256 <<<"$raw" | awk '{print $NF}')"
+          if [[ "$src_sum" == "$dest_sum" ]]; then
+            echo "::error::目标与源摘要相同——说明没有重建索引，走的不是 regctl 路径"
+            exit 1
+          fi
+
+          echo "✓ regctl 路径真实推送成功：索引只含指定的平台，且与源摘要不同"
+
       - name: 断言目标存在且内容与源一致
         run: |
           #!/usr/bin/env bash
