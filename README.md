@@ -159,7 +159,9 @@ registry.k8s.io/kube-scheduler:v1.31.0
 | `platforms` | | 自动探测 | 保留的平台，如 `linux/amd64,linux/arm64`。仅在上项勾选时生效 |
 | `concurrency` | | `4` | 并发同步的镜像数量，批量时提速明显 |
 | `skip_existing` | | `true` | 跳过目标仓库中已存在且完全相同的镜像 |
+| `verify` | | `false` | 同步后逐平台比对源与目标的 digest，抓「推送完成了但内容不完整」 |
 | `dry_run` | | `false` | 先输出同步计划，再打印命令；不实际推送。用于确认筛选结果与目标地址 |
+| `notify_after_failures` | | `1` | 同一镜像连续失败 N 次才通知；中间成功过一次就重新计数 |
 
 ### Sync-Images-to-Harbor
 
@@ -169,7 +171,9 @@ registry.k8s.io/kube-scheduler:v1.31.0
 | `images_dest` | ✅ | — | 目标路径，拼在 `HARBOR_REGISTRY` 之后，如 `library/nginx:1.27` |
 | `concurrency` | | `4` | 并发同步的镜像数量 |
 | `skip_existing` | | `true` | 跳过已存在的相同镜像 |
+| `verify` | | `false` | 同步后逐平台比对源与目标的 digest，抓「推送完成了但内容不完整」 |
 | `dry_run` | | `false` | 同上 |
+| `notify_after_failures` | | `1` | 同一镜像连续失败 N 次才通知；中间成功过一次就重新计数 |
 
 ### Sync-Batch
 
@@ -179,7 +183,9 @@ registry.k8s.io/kube-scheduler:v1.31.0
 | `dest_registry` | | 见说明 | 目标仓库前缀，留空则用 `ALIYUNCS_REGISTRY` 变量或内置默认值 |
 | `concurrency` | | `6` | 并发同步的镜像数量 |
 | `skip_existing` | | `true` | 跳过已存在的相同镜像 |
+| `verify` | | `false` | 同步后逐平台比对源与目标的 digest，抓「推送完成了但内容不完整」 |
 | `dry_run` | | `false` | 同上 |
+| `notify_after_failures` | | `1` | 同一镜像连续失败 N 次才通知；中间成功过一次就重新计数 |
 | `filter` | | 空 | 只同步匹配该正则的镜像，如 `kube-` |
 | `exclude` | | 空 | 跳过匹配该正则的镜像，如 `apiserver` |
 

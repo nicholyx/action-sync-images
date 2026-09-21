@@ -260,7 +260,9 @@ registry.k8s.io/pause:3.9, nginx:1.27, redis:7.4
 | `platforms` | | 自动探测 | 保留哪些平台，如 `linux/amd64,linux/arm64`。**仅在勾选上一项时生效** |
 | `concurrency` | | `4` | 并发同步的镜像数量。填 `1` 即回到串行 |
 | `skip_existing` | | `true` | 跳过目标仓库中已存在且完全相同的镜像 |
+| `verify` | | `false` | 同步后逐平台比对源与目标的 digest，抓「推送完成了但内容不完整」。详见[完整性校验](#关于-digest) |
 | `dry_run` | | `false` | 先输出同步计划，再打印命令；不实际推送。用于确认筛选结果与目标地址 |
+| `notify_after_failures` | | `1` | 同一镜像连续失败 N 次才通知，中间成功过一次即重新计数。详见上方「降低通知噪音」 |
 
 > 每次同步都会自动记录源与目标的 digest（详见[关于 digest](#关于-digest)），无需额外配置。
 
@@ -296,7 +298,9 @@ registry.k8s.io/pause:3.9, nginx:1.27, redis:7.4
 | `images_dest` | ✅ | — | 目标路径，会拼在 `HARBOR_REGISTRY` 之后，例如 `library/nginx:1.27` |
 | `concurrency` | | `4` | 并发同步的镜像数量 |
 | `skip_existing` | | `true` | 跳过已存在的相同镜像 |
+| `verify` | | `false` | 同步后逐平台比对源与目标的 digest，抓「推送完成了但内容不完整」。详见[完整性校验](#关于-digest) |
 | `dry_run` | | `false` | 同上 |
+| `notify_after_failures` | | `1` | 同一镜像连续失败 N 次才通知，中间成功过一次即重新计数。详见上方「降低通知噪音」 |
 
 > ⚠️ Harbor 路径是**精确匹配**，不会做「把 `/` 换成 `_`」的压平处理。请确保 Harbor 中已经存在对应的项目（如 `library`），否则会推送失败。
 
@@ -308,7 +312,9 @@ registry.k8s.io/pause:3.9, nginx:1.27, redis:7.4
 | `dest_registry` | | 见说明 | 目标仓库前缀。留空则依次取 `ALIYUNCS_REGISTRY` 变量、内置默认值 |
 | `concurrency` | | `6` | 并发同步的镜像数量 |
 | `skip_existing` | | `true` | 跳过已存在的相同镜像 |
+| `verify` | | `false` | 同步后逐平台比对源与目标的 digest，抓「推送完成了但内容不完整」。详见[完整性校验](#关于-digest) |
 | `dry_run` | | `false` | 同上 |
+| `notify_after_failures` | | `1` | 同一镜像连续失败 N 次才通知，中间成功过一次即重新计数。详见上方「降低通知噪音」 |
 | `filter` | | 空 | 只同步匹配该正则的镜像（ERE）。详见[场景九](#场景九只同步清单里的一部分镜像) |
 | `exclude` | | 空 | 跳过匹配该正则的镜像（ERE） |
 
