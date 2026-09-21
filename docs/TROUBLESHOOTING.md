@@ -17,7 +17,7 @@
 | `unauthorized` / `authentication required` | [认证失败](#错误unauthorized-authentication-required) |
 | `denied` / `forbidden` | [权限不足](#错误denied-requested-access-to-the-resource-is-denied) |
 | `manifest unknown` / `not found` | [镜像不存在](#错误manifest-unknown) |
-| `platform ... not found` | [平台不匹配](#错误platform-not-found) |
+| `platform ... not found` | [平台不匹配](#错误platform--not-found) |
 | `toomanyrequests` / `pull rate limit` | [Docker Hub 限流](#错误toomanyrequests-you-have-reached-your-pull-rate-limit) |
 | `context deadline exceeded` / `timeout` | [网络问题](#错误context-deadline-exceeded--timeout) |
 | `skopeo: command not found` | [缺少依赖](#错误skopeo-command-not-found) |
@@ -56,7 +56,7 @@ Error: creating an index: ... unknown manifest class
 
 ### 如果勾选后仍然失败
 
-继续往下看[错误：platform not found](#错误platform-not-found)。
+继续往下看[错误：platform not found](#错误platform--not-found)。
 
 ---
 
@@ -174,10 +174,11 @@ SYNC_SRC_USERNAME=alice SYNC_SRC_PASSWORD='…' \
 
 ### 排查步骤
 
-1. **确认目标命名空间/项目存在**
+1. **确认目标仓库是你的**
 
-   - 阿里云：需要先在控制台创建命名空间（如 `nicholyx`）
-   - Harbor：需要先创建项目（如 `library`）
+   工作流默认推到 `registry.cn-shenzhen.aliyuncs.com/nicholyx`——**项目作者的命名空间**。没设 `ALIYUNCS_REGISTRY` 就会往那里推：除非你的阿里云账号下恰好有同名的 `nicholyx` 命名空间（命名空间是**账号内唯一**，不是全局唯一），否则会被拒。设置方式见[使用文档](USAGE.md#目标仓库aliyuncs_registry)。
+
+   如果你**确实**想用某个命名空间，确认它在你的账号下已创建（阿里云：控制台创建命名空间；Harbor：创建项目）。
 
 2. **确认账号有推送权限**
 

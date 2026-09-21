@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/workflows/index.md", "reason": "核对工作流改动是否守住既有防护（env 中转、门禁）"}
+{"file": ".trellis/spec/guides/index.md", "reason": "核对三处文档口径是否一致、有无把「可能失败」说成「必定失败」"}

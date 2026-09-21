@@ -29,7 +29,7 @@ on:
         required: false
         default: 'images.lock.resolved.txt'
       dest_registry:
-        description: '目标仓库前缀（仅 audit 需要；留空则用 ALIYUNCS_REGISTRY 或内置默认值）'
+        description: '体检的目标仓库前缀（仅 audit 需要；留空则用 ALIYUNCS_REGISTRY 变量，都没有则用内置默认值——那是项目作者示例用的命名空间，体检自己的仓库请设置该变量）'
         required: false
         default: ''
       updates_limit:
@@ -66,6 +66,12 @@ jobs:
       LOCKFILE: ${{ inputs.lockfile }}
       LOCK_FILE: ${{ inputs.lock_file }}
       DEST_REGISTRY: ${{ inputs.dest_registry || vars.ALIYUNCS_REGISTRY || 'registry.cn-shenzhen.aliyuncs.com/nicholyx' }}
+      # 内置默认值的字面量副本，与两个同步工作流保持同一份。
+      # 单独放着是为了让判据能写成「目标是否**等于**默认值」，而不是「值里含
+      # nicholyx」——后者会误伤把区域换到杭州、却保留了同名命名空间的使用者。
+      DEFAULT_DEST: 'registry.cn-shenzhen.aliyuncs.com/nicholyx'
+      # 用来判断「这是不是作者自己的仓库」——作者的仓库不该被打扰
+      REPO_OWNER: ${{ github.repository_owner }}
       UPDATES_LIMIT: ${{ inputs.updates_limit }}
       FILTER_REGEX: ${{ inputs.filter }}
       EXCLUDE_REGEX: ${{ inputs.exclude }}
@@ -93,6 +99,18 @@ jobs:
         run: |
           #!/usr/bin/env bash
           set -euo pipefail
+
+          # 体检对象就是 DEST_REGISTRY。默认值仍是作者示例用的命名空间——fork 后
+          # 不设 ALIYUNCS_REGISTRY 的话，**体检的是作者的仓库**：那边镜像齐全时
+          # 报告会显示「全部最新」，而你自己的仓库其实是空的。
+          #
+          # 这比同步路径上的同一问题更严重：同步会推送失败（能看见），体检却给出
+          # 一个假绿的结论。所以先提示一句。
+          #
+          # 放在凭证检查之前——有没有凭证，与「目标是不是作者的」是两回事。
+          if [[ "$DEST_REGISTRY" == "$DEFAULT_DEST" && "$REPO_OWNER" != "nicholyx" ]]; then
+            echo "::warning::体检的目标仓库是内置的示例默认值（${DEFAULT_DEST}，项目作者的命名空间）——本次结果描述的是那个仓库，不是你的。要体检自己的仓库，请在 Settings → Secrets and variables → Actions → Variables 里设置 ALIYUNCS_REGISTRY；若你确实在用这个命名空间，可忽略本条。"
+          fi
 
           # 凭证是可选的：公开仓库匿名就能读，没配凭证不该让整个体检失败，
           # 只是私有仓库会被报成「无法判定」——这比报错更贴近实际状态

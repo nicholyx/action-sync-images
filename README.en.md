@@ -87,7 +87,19 @@ Go to `Settings` → `Secrets and variables` → `Actions` and add your Aliyun C
 
 > Using a self-hosted Harbor instead? Configure `HARBOR_REGISTRY` / `HARBOR_USERNAME` / `HARBOR_PASSWORD`. See the [usage guide](docs/USAGE.md) for details.
 
-### 2. Trigger a sync
+### 2. Set the destination registry
+
+The default is `registry.cn-shenzhen.aliyuncs.com/nicholyx` — **the project author's namespace, used as an example**. To sync into your own registry, override it:
+
+Go to `Settings` → `Secrets and variables` → `Actions` → **Variables** tab → `New repository variable`:
+
+| Name | Example value |
+| --- | --- |
+| `ALIYUNCS_REGISTRY` | `registry.cn-shenzhen.aliyuncs.com/your-namespace` |
+
+> It works without this, but pushes go to the author's namespace — unless your Aliyun account happens to have a namespace named `nicholyx`, the push will be rejected with `denied`.
+
+### 3. Trigger a sync
 
 Open **Actions** → pick `Sync-Images-to-AliYuncs` → **Run workflow** → enter a source image:
 
@@ -95,7 +107,9 @@ Open **Actions** → pick `Sync-Images-to-AliYuncs` → **Run workflow** → ent
 registry.k8s.io/pause:3.9
 ```
 
-### 3. Pull and verify
+### 4. Pull and verify
+
+Replace `nicholyx` with the namespace you set in step 2:
 
 ```bash
 docker pull registry.cn-shenzhen.aliyuncs.com/nicholyx/registry.k8s.io_pause:3.9
