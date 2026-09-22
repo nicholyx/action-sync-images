@@ -1292,7 +1292,16 @@ collect_images() {
       if [[ ! -f "$item" ]]; then
         die "镜像清单文件不存在：${item}"
       fi
-      while IFS= read -r line; do
+      # `|| [[ -n "$line" ]]` 不是装饰：read 读到**没有换行符收尾的最后一段**时返回
+      # 非零（表示遇到 EOF 而非完整行），循环体一次都不执行。清单末尾少一个换行就
+      # 会静默丢掉最后一行——两行的清单只同步一个、单行的清单报「没有提供任何源镜像」，
+      # 而前者退出码是 0、日志写着「同步完成」（Issue #143）。同一文件里的
+      # parse_src_credentials / parse_lockfile 早就是这个写法，本条规则见
+      # .trellis/spec/engine/bash-rules.md 的 printf 那节（regctl 路径曾因它静默丢平台）。
+      #
+      # 结尾换行**不是**清单格式的要求：三种形态（有 / 无结尾换行、单行无结尾换行）
+      # 必须解析出同样的结果，CI 的「验证 --file 清单解析」逐步锁住这三条。
+      while IFS= read -r line || [[ -n "$line" ]]; do
         # 去掉行内注释与首尾空白
         line="${line%%#*}"
         line="${line#"${line%%[![:space:]]*}"}"
