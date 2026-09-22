@@ -637,7 +637,7 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
           set +e
-          ./scripts/sync.sh --src "nginx:1.27" >/dev/null 2>&1
+          out="$(./scripts/sync.sh --src "nginx:1.27" 2>&1)"
           code=$?
           set -e
           if [[ "$code" -ne 1 ]]; then
@@ -645,6 +645,26 @@ jobs:
             exit 1
           fi
           echo "✓ 缺少必填参数时正确报错"
+
+          # 报错文案要把**三种**目标模式列全（--dest / --dest-keep-path / --dest-exact）。
+          # 漏掉 --dest-keep-path 会把「想保留路径」的人引向 --dest（压平，正是他不想要的）
+          # 或 --dest-exact（只接受单个源镜像）——他最容易撞上这条报错，也最需要它说对。
+          #
+          # **只查报错那一行，不查完整输出**：log_error 之后紧跟着打印 usage，而 usage
+          # 本来就列出了全部参数，拿完整输出 grep 无论文案写得多烂都会命中——那是恒真的
+          # 断言。这个缺陷此前正是这样长期存在的：原断言只看退出码，不看文案。
+          err_line="$(grep -m1 '缺少必填参数' <<<"$out")"
+          if [[ -z "$err_line" ]]; then
+            echo "::error::输出里没有「缺少必填参数」的报错行"
+            exit 1
+          fi
+          for flag in --dest --dest-keep-path --dest-exact; do
+            if ! grep -qF -- "$flag" <<<"$err_line"; then
+              echo "::error::报错文案漏了 ${flag}：${err_line}"
+              exit 1
+            fi
+          done
+          echo "✓ 报错文案把三种目标模式都列了出来"
 
       - name: 验证并发、超时与增量跳过参数
         run: |

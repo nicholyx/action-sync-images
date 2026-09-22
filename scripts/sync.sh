@@ -3778,7 +3778,10 @@ main() {
 
   # --check-updates / --audit-lock 不碰目标仓库，因此不需要目标地址
   if [[ ${#DEST_REGISTRIES[@]} -eq 0 && -z "$DEST_EXACT" && "$CHECK_UPDATES" != "true" && -z "$AUDIT_LOCK_FILE" ]]; then
-    log_error "缺少必填参数：--dest 或 --dest-exact"
+    # 三种模式都要列全：漏掉 --dest-keep-path 会把「想保留路径」的人引向
+    # --dest（压平，正是他不想要的）或 --dest-exact（只接受单个源镜像）。
+    # 措辞与下面 --dest-exact 互斥那条保持一致
+    log_error "缺少必填参数：--dest / --dest-keep-path 或 --dest-exact"
     echo "" >&2
     usage >&2
     exit 1
