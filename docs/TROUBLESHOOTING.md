@@ -164,6 +164,12 @@ SYNC_SRC_USERNAME=alice SYNC_SRC_PASSWORD='…' \
 
 > 💡 凭证**不会进日志**。脚本把它写进 600 权限的临时文件，用 `--src-authfile` 交给 skopeo；CI 里则走环境变量而非命令行参数——命令行参数对同机进程可见（`ps aux`），也容易被日志语句原样打印出去。
 
+> ⚠️ **用了 `--strip-attestation` 时另有一种传递方式。** 那条路径的底层是 `regctl`，它不认 `--src-authfile`，凭证改经临时的 `DOCKER_CONFIG` 目录传递——内容是你的 `~/.docker/config.json` 与本次源凭证的**合并**（目录 0700、文件 0600，退出时清理，你的原文件不会被改动）。
+>
+> **这一点在 2026-09-23 之前是坏的**（[#120](https://github.com/nicholyx/action-sync-images/issues/120)）：凭证根本没有传给 regctl，私有源 + `--strip-attestation` 必然以 `no credentials available: unauthorized` 失败，**而上面那行「已装载」照样会打印**——也就是说，看到它并不证明凭证送到了该去的地方。仍在撞这个报错的话，先确认脚本版本。
+
+> ⚠️ **自签 HTTPS 证书的仓库在 `--strip-attestation` 下不适用 `--tls-verify false`。** regctl 的 TLS 是按仓库的单值（`disabled` = 明文 HTTP，`insecure` = 自签证书），一个值照顾不了两种场景，脚本选了前者。这种情况请改在 `~/.regctl/config.json` 里为该仓库配 `cacert`。详见 `USAGE.md` 的「与 `--strip-attestation` 的一处差异」。
+
 ---
 
 ## 错误：`denied: requested access to the resource is denied`

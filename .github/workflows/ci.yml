@@ -2534,13 +2534,19 @@ jobs:
           # 不预装 regctl：脚本的 ensure_regctl 会自己从 GitHub release 下载到
           # $HOME/.regclient/bin——那本身也是被测代码，预装反而绕开了它。
           #
-          # 但要给 regctl 交代清楚这台本地 registry 是纯 HTTP：regctl 默认走
-          # HTTPS（与 skopeo 不同，它不会「TLS 失败就退回 HTTP」），而 sync.sh 目前
-          # 没有把 --tls-verify 传给 regctl（regclient 的入口是 host 配置）。
-          # 这是让本地测试仓库可达的环境准备，按 regclient 文档的写法等价于
-          # `regctl registry set --tls disabled localhost:5000`。
-          mkdir -p "${HOME}/.regctl"
-          printf '{"hosts":{"localhost:5000":{"tls":"disabled"}}}\n' > "${HOME}/.regctl/config.json"
+          # 这台本地 registry 是纯 HTTP，而 regctl 默认走 HTTPS（与 skopeo 不同，
+          # 它不会「TLS 失败就退回 HTTP」）。此处原先要手工写一份
+          # `~/.regctl/config.json` 把 host 标成 `tls: disabled`——**那一步之所以
+          # 存在，正是 Issue #120 的证据**：sync.sh 当时没把 --tls-verify 传给 regctl。
+          # 现在由脚本自己注入 `--host reg=…,tls=disabled`，所以这里不再需要它。
+          #
+          # 反过来断言它不存在：一旦有人（或某段遗留代码）又放一份这样的配置，
+          # 它就会替脚本兜底，让本用例即使把 --tls-verify 传丢了也照样通过。
+          # 缺了这条断言，「测试通过」反而会掩盖缺陷——比没有测试更糟。
+          if [[ -f "${HOME}/.regctl/config.json" ]]; then
+            echo "::error::存在 ~/.regctl/config.json，它会替脚本兜底，使本用例无法证明 --tls-verify 真的传到了 regctl"
+            exit 1
+          fi
 
           # 失败时必须把 sync.sh 的输出打出来。它被 $() 捕获，若只靠 set -e 退出，
           # CI 日志里只会剩一个退出码——连失败在「regctl 下载」「自签 TLS」
@@ -3096,6 +3102,67 @@ jobs:
             exit 1
           fi
           echo "✓ 目标镜像已真实存在于 registry 中"
+
+      - name: regctl 路径的私有源凭证
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 上面几条私有源用例走的都是默认的 skopeo 路径。这条补上 regctl 路径
+          # ——Issue #120 之前，那里的源凭证根本没传到 regctl（它不认
+          # --src-authfile，而脚本也没有别的入口给它）。
+          #
+          # 复用上面那个需要认证的 registry，**不另起容器**：另起会与它抢同一个
+          # 容器名与 5001 端口（真撞过一次，两条用例都红）。
+          #
+          # 源换成多平台索引：上面的 private/hello 是 skopeo 单平台副本，拿它测
+          # 「只保留指定平台」等于什么都没测。
+          skopeo copy --all --src-tls-verify=false \
+            --dest-tls-verify=false --dest-creds='testuser:s3cr3t-pass' \
+            docker://localhost:5000/source/hello-multi:latest \
+            docker://localhost:5001/private/hello-multi:latest
+
+          # 前置断言：不带凭证必须失败。少了它，「带凭证成功」在源恰好匿名可读时
+          # 同样会通过——恒真的断言比没有断言更糟，它让人以为验过了。
+          if output="$(./scripts/sync.sh \
+            --src localhost:5001/private/hello-multi:latest \
+            --dest localhost:5000/dest-nocred \
+            --strip-attestation --platforms linux/amd64 \
+            --tls-verify false --concurrency 1 2>&1)"; then
+            echo "$output"
+            echo "::error::regctl 路径下私有源不带凭证竟然同步成功——源不是私有的，或凭证没有被校验"
+            exit 1
+          fi
+          echo "✓ 不带凭证时按预期失败（源确实是私有的，下面那条才成立）"
+
+          # 正题：带上源凭证应当成功。修复前这条必然失败——regctl 拿不到
+          # SRC_AUTHFILE，会以 no credentials available: unauthorized 收场。
+          if ! output="$(./scripts/sync.sh \
+            --src localhost:5001/private/hello-multi:latest \
+            --dest localhost:5000/dest-cred \
+            --strip-attestation --platforms linux/amd64 \
+            --src-username testuser --src-password 's3cr3t-pass' \
+            --tls-verify false --concurrency 1 2>&1)"; then
+            echo "$output"
+            echo "::error::regctl 路径下私有源带凭证仍然失败——源凭证没有传到 regctl"
+            exit 1
+          fi
+          echo "$output"
+
+          # 凭证同样不得进日志。这条要单独确认：regctl 路径经的是临时
+          # DOCKER_CONFIG 目录，与 skopeo 的 --src-authfile 不是同一条通路。
+          if grep -q 's3cr3t-pass' <<<"$output"; then
+            echo "::error::密码出现在了日志中（regctl 路径）"
+            exit 1
+          fi
+          echo "✓ 日志中不含凭证"
+
+          dest="localhost:5000/dest-cred/localhost_5001_private_hello-multi:latest"
+          if ! skopeo inspect --tls-verify=false "docker://${dest}" >/dev/null 2>&1; then
+            echo "::error::regctl 路径私有源用例的目标镜像不存在：${dest}"
+            exit 1
+          fi
+          echo "✓ 私有源凭证在 regctl 路径生效"
 
   # ---------------------------------------------------------------------------
   # 提交信息规范

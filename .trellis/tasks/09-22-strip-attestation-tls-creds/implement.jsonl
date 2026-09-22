@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "本改动全部落在 bash 上：bash 3.2 兼容（空数组 + set -u）、dry-run 铁律（复述真正会执行的参数）、函数被 sed 抽取执行时必须自包含、第三方工具退出码不得冒成脚本退出码——每一条都直接约束这次实现"}
+{"file": ".trellis/spec/guides/index.md", "reason": "「错误的信息比没有信息更糟」正是本缺陷的定性：参数被接受却不生效、日志还谎报凭证已装载；同时提供「排除/筛掉的东西必须可见」与「只报告、不替使用者做判断」两条取舍依据"}
+{"file": ".trellis/spec/maintenance/index.md", "reason": "收尾阶段的文档同步清单（USAGE / TROUBLESHOOTING / ARCHITECTURE / CHANGELOG），以及 CHANGELOG 插入锚点必须校验归属那条已有教训"}
+{"file": ".trellis/tasks/09-22-strip-attestation-tls-creds/research/regctl-tls-credential-mechanism.md", "reason": "全部方案取舍的实证依据：--host 的叠加语义与 TLS/凭证效果、DOCKER_CONFIG 被尊重、REGCTL_CONFIG 是替代语义（否掉该方案的直接证据）、tls 只有三个取值。实现时按它复现，不要重新推演"}

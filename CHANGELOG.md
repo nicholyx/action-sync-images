@@ -9,6 +9,15 @@
 
 ## [Unreleased]
 
+### 修复
+
+- **`--strip-attestation` 下 `--tls-verify false` 与源仓库凭证不再被静默忽略**（[#120](https://github.com/nicholyx/action-sync-images/issues/120)）。regctl 路径（`sync_via_regctl`）此前只构造 `regctl index create <dest> --ref <src> --platform …`，既不传 TLS 也不传凭证——而这两样在 skopeo 路径上都有。后果分两类：自建 HTTP / 自签仓库的使用者**根本用不了**这个模式（报 `server gave HTTP response to HTTPS client`，尽管参数已显式传了）；配了 `--src-username` / `--src-password` / `--src-credentials` 的私有上游会拿到 `no credentials available: unauthorized`，**而日志里还照常写着「源仓库凭证已装载」**——把排查引向完全错误的方向。两者都属于「显式传入却不生效」，正是本项目明确定为比直接报错更危险的那种失败
+  - **TLS 走 `--host reg=<host>,tls=disabled` 逐命令注入**，不写配置文件：`--host` 是**叠加**语义，使用者在 `~/.regctl/config.json` 里给别的 host 配的 `cacert` 与凭证原样保留；`REGCTL_CONFIG` 则是**替代**语义（实测：指向另一份配置后原 host 全部消失），用它等于为一个参数把使用者的全部 registry 配置作废
+  - **凭证走临时 `DOCKER_CONFIG` 目录**，其中的 `config.json` 是使用者的 docker 配置与 `SRC_AUTHFILE` 的**递归合并**。必须合并而不是直接指向源凭证所在目录：`DOCKER_CONFIG` 同样是替代语义，只放源凭证会让使用者**目标仓库**的 `docker login` 凭证消失——「修好了源、弄坏了目标」，比原缺陷更隐蔽（原缺陷至少在日志里留下一个 401）。目录 0700、文件 0600，退出时清理
+  - **凭证不进命令行**，沿用项目在源凭证构造处的既有原则（命令行参数对 `ps aux` 可见，且 `--dry-run` 会原样打印命令）；dry-run 如实复述新增参数，只报凭证目录位置、不报内容
+  - **`--tls-verify false` 在这条路径上映射为明文 HTTP**。regctl 的 `tls` 是单值（`disabled` 管明文 HTTP，`insecure` 管自签证书，二者不可兼得），而 skopeo 的 `--tls-verify=false` 同时覆盖两种场景。选 `disabled` 是因为 regclient 对「连不上」给出的官方建议就是 `--tls disabled`；代价是**自签 HTTPS 仓库在这条路径下不适用**，显式使用该组合时会打印一条说明并指向 `~/.regctl/config.json` 的 `cacert` 用法。Docker Hub 的三个别名（`docker.io` / `index.docker.io` / `registry-1.docker.io`）不注入——regclient **认**这个名字，会把 `tls=disabled` 套到映射后的 `registry-1.docker.io` 上。这不会直接失败（实测明文请求拿到 301、跟到 HTTPS 后照常完成），但会多一次明文请求，并把「出站 80 端口可用」变成 Docker Hub 源的前提；修复前它走的是默认 HTTPS，所以这里保持原状
+  - 集成测试补上私有源用例：`registry:2` + htpasswd 起一个要求认证的仓库，**同时**断言「不带凭证必须失败」与「带凭证必须成功」——只测后者的话，源恰好匿名可读时断言会恒真。原来那段手工写 `~/.regctl/config.json` 的环境准备据此删除，并反过来**断言它不存在**：留着它就会替脚本兜底，让用例即使把 `--tls-verify` 传丢了也照样通过
+
 ## [1.19.1] - 2026-09-22
 
 这一轮补的是**覆盖**：regctl 路径的真实推送此前从未进过 CI——而项目自己记过，v1.1.0 的三个缺陷全部发生在 dry-run 覆盖不到的真实推送路径上。补上之后它立刻暴露了两个被静默忽略的参数与一处不一致的重试口径。

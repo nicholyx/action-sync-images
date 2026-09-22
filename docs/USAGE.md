@@ -1023,6 +1023,31 @@ docker run -d -p 5000:5000 --name registry registry:2
 
 > ⚠️ **只在可信网络中对自建仓库使用 `--tls-verify false`。** 对公网仓库关闭证书校验会让中间人攻击成为可能。
 
+#### 与 `--strip-attestation` 的一处差异
+
+那条路径用 `regctl`，它的 TLS 是**按仓库的单值**，不像 skopeo 那样能同时覆盖两种场景：
+
+| 仓库类型 | 默认路径（skopeo） | `--strip-attestation`（regctl） |
+| --- | --- | --- |
+| 明文 HTTP | ✅ | ✅ 映射为 `tls=disabled` |
+| 自签 HTTPS 证书 | ✅ | ❌ 不适用——请改在 `~/.regctl/config.json` 里为该仓库配 `cacert` |
+
+选 `disabled` 是因为 regclient 对「连不上」给出的建议就是 `--tls disabled`，而明文 HTTP 是更常见的动机。显式使用该组合时会打印一条同样的说明。Docker Hub 不受影响：它永远走 HTTPS，脚本不会对它注入这条设置。
+
+#### 私有上游
+
+两条路径对使用者是同一套参数：
+
+```bash
+./scripts/sync.sh \
+  --src harbor.internal.example.com/library/nginx:1.27 \
+  --dest registry.cn-shenzhen.aliyuncs.com/nicholyx \
+  --src-username alice --src-password '…' \
+  --strip-attestation --platforms linux/amd64
+```
+
+默认路径把凭证写成临时文件交给 `skopeo --src-authfile`；`--strip-attestation` 路径把它们与你的 `~/.docker/config.json` **合并**后，以临时 `DOCKER_CONFIG` 目录交给 regctl。合并是必须的——`DOCKER_CONFIG` 是**替代**语义，只放源凭证会让你在目标仓库的 `docker login` 失效。两条路径都不会修改 `~/.regctl/config.json` 或 `~/.docker/config.json`。
+
 另外注意：目标仓库名由源镜像推导，其中**端口号里的冒号也会被替换掉**（仓库名不允许含冒号），所以上面的例子会同步到 `localhost:5000/mirror/docker.io_library_nginx:1.27`。
 
 完整参数见 `./scripts/sync.sh --help`。

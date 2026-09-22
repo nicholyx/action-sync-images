@@ -207,6 +207,16 @@ regctl index create <目标> \
 
 它会把源索引里指定平台的子镜像逐个复制到目标仓库，然后重新组装一个新的 manifest 索引。因为只复制了列出来的平台，`platform` 为 `unknown` 的 attestation manifest 自然就不会被包含进去。
 
+实际执行时前面还会多两样东西（`--tls-verify false` 与源凭证各带来一个，见下文「关键设计决策」）：
+
+```bash
+env DOCKER_CONFIG=<临时目录> \
+regctl --host reg=<源仓库>,tls=disabled --host reg=<目标仓库>,tls=disabled \
+  index create <目标> --ref <源镜像> --platform linux/amd64 …
+```
+
+两者都**不写任何配置文件**，跑完即弃。
+
 ### 怎么选
 
 | 情况 | 用哪条 |
@@ -385,6 +395,27 @@ unknown manifest class for ...
 **因为可复现性。**
 
 原先用的是 `releases/latest/download`，意味着同一条工作流今天跑和明天跑可能用的是不同版本的工具。一旦新版本改了行为，你会看到一个「什么都没改但突然失败了」的工作流。现在固定为明确版本，升级是显式的、可追溯的（Dependabot 会提 PR）。
+
+### 为什么 regctl 路径的 TLS 走 `--host`、凭证走临时 `DOCKER_CONFIG`
+
+**因为这两样在 regctl 上根本没有同一个入口，而两个入口各带一个陷阱。**
+
+默认路径（skopeo）有 `--src-tls-verify=false` 与 `--src-authfile` 两个现成参数，regctl 却把两件事都收在 registry 配置里：
+
+- **TLS** 用 `--host reg=<host>,tls=disabled` 逐命令注入。它是**叠加**语义——注入的值不写进任何文件，使用者在 `~/.regctl/config.json` 里给别的仓库配的 `cacert` 与凭证原样保留
+- **凭证**用临时 `DOCKER_CONFIG` 目录。regctl 没有 `--src-authfile` 这样的入口，它按 Docker 的规矩读 `$DOCKER_CONFIG/config.json`；目录里的 `config.json` 是使用者的 docker 配置与 `SRC_AUTHFILE` 的**递归合并**
+
+被否掉的方案有三个，理由各不同：
+
+1. **`REGCTL_CONFIG` 指向临时配置**——它是**替代**语义。实测把该变量指向另一份配置后，使用者原有的 host 配置**全部消失**。要用它就得自己读并合并用户的配置，那还不如 `--host` 叠加干净
+2. **`--host reg=…,user=…,pass=…` 传凭证**——regctl 确实支持，实测也真的生效。但这违反项目在源凭证构造处定下的原则：凭证不进命令行（`ps aux` 可见），而 `--dry-run` 还要原样打印命令。硬走这条路，dry-run 就只能在「如实打印」与「打码」之间二选一——前者泄漏，后者违反 dry-run 铁律
+3. **直接写使用者的 `~/.regctl/config.json` 或 `~/.docker/config.json`**——既污染全局配置，并发运行时还会互相覆盖
+
+凭证那块**必须合并**、不能只放源凭证：`DOCKER_CONFIG` 与 `REGCTL_CONFIG` 一样是替代语义，只放源凭证会让使用者在**目标仓库**的 `docker login` 凭证消失——「修好了源、弄坏了目标」，比原来那个缺陷更隐蔽。
+
+最后，`--tls-verify false` 在这条路径上映射为**明文 HTTP**（`tls=disabled`）：regctl 的 `tls` 是单值，`disabled` 管明文 HTTP、`insecure` 管自签证书，一个值照顾不了 skopeo 同时覆盖的两种场景。选前者是因为 regclient 对「连不上」给出的建议就是 `--tls disabled`，而明文 HTTP 是更常见的动机；自签证书的使用者会被一条告警指引到 `~/.regctl/config.json`。
+
+Docker Hub 的三个别名（`docker.io` / `index.docker.io` / `registry-1.docker.io`）**不注入**。regclient **认**这个名字——`--host reg=docker.io,tls=disabled` 会以 `hostname=registry-1.docker.io`、`tls=disabled` 发请求，于是本该走 HTTPS 的 Docker Hub 被改成明文。它不会直接失败（实测：明文请求拿到 `301 Moved Permanently`，regclient 跟着重定向回 HTTPS，最终照常 200，只多出一次明文请求与一次重定向），所以这不是「不跳就会坏」。真正的理由是这笔代价**没有任何收益**——Docker Hub 的证书本就正常——却把「出站 80 端口可用」变成了 Docker Hub 源的前提，端口被挡的环境里就会真的连不上。代价是 Docker Hub 源拿不到「不校验证书」，而它在修复前也拿不到，不构成回归。
 
 ### 为什么 `--dest-exact` 不允许多镜像
 
