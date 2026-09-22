@@ -9,6 +9,8 @@
 
 ## [Unreleased]
 
+## [1.19.3] - 2026-09-23
+
 ### 修复
 
 - **regctl 下载失败不再一次就放弃**（[#122](https://github.com/nicholyx/action-sync-images/issues/122)）。`ensure_regctl` 从 GitHub release 取 regctl，此前一次失败就 `die`——而同一份代码里其他网络操作都遵循「重试一轮、固定间隔、不做参数化」的口径（`history.sh` 的报告下载与 `gh run list`）。问题在集成测试补上 regctl 路径之后被放大：CI 的 runner 环境是干净的，每次运行都要下载一次，脚本没有第二次机会，一次网络抖动就整条流水线红。现在失败会重试一轮（间隔 5 秒），重试成功后打印「重试成功」，仍失败则报「已重试一次」并保留下载 URL
