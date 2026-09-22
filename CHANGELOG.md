@@ -19,6 +19,11 @@
   - **提交信息规范不接，改文档说清为什么不接**。CI 的 `commit-messages` job 校的是 PR 里的提交与 **PR 标题**，而标题在 PR 建立之前根本不存在，本地任何入口都验不了它——接上 `--last` 只能关掉一半，而「一半」支撑不起「已在本地验过」这句话。更要紧的是它会引入一个**假绿来源**（实测：`--range nonsense..HEAD` 得到「全部合规（共检查 0 条）」且 exit 0，`--last` 的 `HEAD~1..HEAD` 在仓库首个提交上同理）。在「宁可不给结论、也不给错结论」的项目里，拿更贵的东西换一句更响亮的承诺并不划算，所以这里是**让承诺缩小到真话**：覆盖项与不覆盖项都写进文档，脚本结尾也明说「本地绿不等于 `commit-messages` 会绿」
   - 抽取版本号失败（`ci.yml` 里没有 pin 的镜像引用）同样**报失败并说明原因**，不静默跳过；顺带补全 `docs/MAINTAINER_GUIDE.md` 里 `ci-summary` 的覆盖清单（漏了 zizmor 与集成测试）
 
+- **`--file` 清单末尾没有换行时最后一行被静默丢弃**（[#143](https://github.com/nicholyx/action-sync-images/issues/143)）。`collect_images` 读清单用的是 `while IFS= read -r line`，而 `read` 读到**没有换行符收尾的最后一段**时返回非零（表示遇到 EOF 而非完整行），循环体一次都不执行。后果有两种形态，**两行的那种最坏**：清单只同步第一行、退出码 0、日志照旧打印「同步完成」，使用者以为两个都同步了；单行的清单则整段读不到，落到「没有提供任何源镜像」并以 1 退出——明明提供了。修法照仓库既有范本加 `|| [[ -n "$line" ]]`（`parse_src_credentials`、`parse_lockfile` 早就是这个写法，本条规则见 `.trellis/spec/engine/bash-rules.md` 的 printf 那节，regctl 路径曾因它静默丢平台）
+  - **同族位置逐个核对了**：`scripts/` 下 21 处 `while IFS= read`（清单里列的 18 处，另加 `scripts/lint.sh` 2 处、`scripts/check-commit-msg.sh` 1 处）里只有这一处有风险；`.github/workflows/ci.yml` 另有 2 处（CI 断言自身的 `<<<"$out"` 读取），同样安全。全仓 23 处里就这一处有风险——它读的是使用者手写的清单，是唯一可能不带结尾换行的一类。其余各处的写入方都保证换行收尾，逐处有据：`printf '%s\n'`（`split_images`、`--platforms` 拆分、去重与 host 去重、耗时排行）、`sort`（文件名收集）、`git log --format`（不带 `format:` 前缀时按 `tformat:` 处理，每条之后都补换行——git 文档明写，不是实测碰巧）、`gh run list --json --jq`（实测输出以 `0x0a` 结尾）。`--src` 路径经 `split_images` 的 `printf '%s\n'`，同样不受影响。全仓 `done < 文件` 的读取只有 5 处，无一处遗漏：清单（本次修）、凭证文件与锁文件（早已带同一保护）、`notify-history.tsv`（由本脚本的 `printf '%s\n'` + `sort -o` 写出，见 `fetch_sync_history`）、`history.sh` 的 `run-list.txt`（由 `gh run list` 写出）。**没有为了凑数去改其余各处**——加保护会掩盖「输入本该合规」这个事实
+  - 断言写进 CI 的「验证 --file 清单解析」：三种形态（有结尾换行 / 无结尾换行 / 单行无结尾换行）必须解析出**同样的结果**。这是刻意的表述——写成「无结尾换行时同步 N-1 个」等于把缺陷固化成契约。**变异验证**：单独去掉这一处保护（不连带删掉配套语句），后两条断言当场变红、第一条照旧绿，正好说明带结尾换行的那条单独存在时等于没测
+  - `docs/USAGE.md` 的清单格式说明点明「末尾的换行不是必须的」——免得有人以为必须
+
 ## [1.19.3] - 2026-09-23
 
 ### 修复

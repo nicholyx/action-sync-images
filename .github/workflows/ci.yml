@@ -415,6 +415,28 @@ jobs:
           done
           echo "✓ 空文件 / 纯空白 / 纯注释都报「没有提供任何源镜像」"
 
+          # ⑧ 清单末尾的换行可有可无。三种形态必须解析出**同样的结果**——这才是要锁的
+          # 不变量；写成「无结尾换行时同步 N-1 个」就等于把缺陷固化成契约。而这条缺陷
+          # 的形态正是最坏的一种：少读一行、退出码仍是 0、日志照旧打印「同步完成」，
+          # 使用者以为全同步了（Issue #143）。单行那条尤其要断——修复前它整段读不到，
+          # 落到「没有提供任何源镜像」并以 1 退出，报的还是「你明明提供了」的那句话。
+          # 根因是 `read` 读到没有换行符收尾的最后一段时返回非零（EOF 而非完整行），
+          # 循环体便不执行。这三条不是恒真的：实测把这处 `|| [[ -n "$line" ]]` 单独
+          # 去掉后，**后两条**变红；第一条照样绿——带结尾换行的清单本来就不依赖这个
+          # 保护，所以只写它等于没测（这正是「恒真断言比没有断言更糟」的又一形态）。
+          printf 'nginx:1.27\nredis:7.4\n' > "${work}/ends-with-nl.txt"
+          run_sync --file "${work}/ends-with-nl.txt" --dest r.example.com/x --dry-run
+          assert_parsed "清单末尾有换行" 2 seq nginx:1.27 redis:7.4
+
+          printf 'nginx:1.27\nredis:7.4' > "${work}/no-final-nl.txt"
+          run_sync --file "${work}/no-final-nl.txt" --dest r.example.com/x --dry-run
+          assert_parsed "清单末尾无换行" 2 seq nginx:1.27 redis:7.4
+
+          printf 'nginx:1.27' > "${work}/single-no-final-nl.txt"
+          run_sync --file "${work}/single-no-final-nl.txt" --dest r.example.com/x --dry-run
+          assert_parsed "单行清单末尾无换行" 1 seq nginx:1.27
+          echo "✓ 清单末尾的换行可有可无（有 / 无 / 单行无）"
+
           # ---- 合并语义：--src 与 --file 是**合并**，不是替换 ----
           # ARCHITECTURE 把这条当作一个必须解释的坑记着，此前没有任何测试保护。
           # 断言必须**分别**看到 --src 的镜像与清单里的镜像：只断总数（2 个）的话，
