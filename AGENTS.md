@@ -29,4 +29,6 @@ Managed by Trellis. Edits outside this block are preserved; edits inside may be 
   改工作流前必读 `.trellis/spec/workflows/`（供应链基线与红线）
 - **GitHub 侧闭环**（Issue / PR / 里程碑 / 发布）的流程规范在 `.trellis/spec/maintenance/index.md`，
   Roadmap 的单一事实来源是 Issue #4
-- **本地检查**：`./scripts/lint.sh` 一键跑完 CI 的全部静态检查，任何提交前先跑
+- **本地检查**：`./scripts/lint.sh` 一键跑完 CI 的静态检查
+  （actionlint / yamllint / shellcheck / bash -n / zizmor），任何提交前先跑。
+  它**不验提交信息规范**——CI 校的是 PR 标题，本地无从验证

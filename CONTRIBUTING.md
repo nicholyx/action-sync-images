@@ -198,14 +198,21 @@ cd action-sync-images
 
 ### 一键自查（推荐）
 
-仓库提供了统一入口，跑一次等同 CI 的全部静态检查：
+仓库提供了统一入口，跑一次覆盖 CI 里的**静态检查**（`smoke-test` / `integration-test`
+要起容器、连网络，不是静态检查；提交信息规范不在其中，原因见下面的提示）：
 
 ```bash
 ./scripts/lint.sh
 ```
 
-它会依次执行 `actionlint`、`yamllint`、`shellcheck`，任何一项失败都会以非零码退出，
-并告诉你具体是哪个文件哪一行。**提交前跑一次，能省掉一轮 CI 返工。**
+它会依次执行 `actionlint`、`yamllint`、`shellcheck`、`bash -n` 与 `zizmor`
+（工作流安全扫描：用 docker 跑 `ci.yml` 里 pin 的同一个镜像，版本从那里取，不另写一份）。
+任何一项失败都会以非零码退出，并告诉你具体是哪个文件哪一行。**提交前跑一次，
+能省掉一轮 CI 返工**——提交信息那一项除外，见下。
+
+> ⚠️ **它验不了提交信息规范。** CI 的 `commit-messages` job 校验的是 PR 里的提交
+> 与 **PR 标题**，而标题在 PR 建立之前根本不存在——本地任何入口都验不了它。
+> 所以「本地全绿」不等于 `commit-messages` 会绿，PR 标题请照下面的规范自己写。
 
 ### 只想跑单项
 

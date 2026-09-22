@@ -46,8 +46,10 @@ description: 把一个新项目（或只有代码的裸仓库）快速落实为�
      同时校验区间内的提交与 PR 标题（squash 后标题即提交信息）
    - **ci-summary 汇总 job**：`needs: [全部检查]` + `if: always()`，把所有检查汇总成一个
      结果——分支保护规则只需要盯这一个 check，增删检查项不用改保护规则
-2. **本地统一入口** `scripts/lint.sh`（参考 `scripts/lint.sh`）：一条命令跑完 CI 的全部
-   静态检查。CI 与本地跑的是同一套，避免「本地能过 CI 不过」。
+2. **本地统一入口** `scripts/lint.sh`（参考 `scripts/lint.sh`）：一条命令跑完 CI 里
+   **本地能跑**的那些静态检查，CI 与本地跑的是同一套，避免「本地能过 CI 不过」。
+   本地根本验不了的（如 PR 标题——它在 PR 建立前不存在）就如实写「不在其中」，
+   别为了凑齐清单硬接一个假绿进来。
 3. **最小权限**：CI 声明 `permissions: contents: read`；需要写权限的工作流在各自文件里
    单独声明。所有 `run:` 块开头 `set -euo pipefail` + `#!/usr/bin/env bash`。
 

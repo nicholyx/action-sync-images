@@ -337,7 +337,7 @@ unknown manifest class for ...
 ├── scripts/
 │   ├── sync.sh                        ★ 同步引擎，全项目唯一的逻辑实现（含只读检查）
 │   ├── history.sh                     汇总历次运行报告，回答「哪个镜像总在失败」
-│   ├── lint.sh                        本地统一校验入口（等同 CI 的静态检查）
+│   ├── lint.sh                        本地统一校验入口（CI 的静态检查，提交信息规范除外）
 │   └── check-commit-msg.sh            约定式提交信息校验
 │
 ├── docs/

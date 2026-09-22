@@ -14,6 +14,11 @@
 - **缺少目标参数时的报错文案漏了 `--dest-keep-path`**（[#129](https://github.com/nicholyx/action-sync-images/issues/129)）。`--dest-keep-path` 是与 `--dest` 并列的第三种目标模式，但那条报错只说了「`--dest` 或 `--dest-exact`」——**同一份文件里另外两条同类文案都是对的**，只有这一处漏了。撞上它的人恰恰是最需要它说对的那一类：想把路径结构保留到 Harbor 类仓库、又忘了带前缀参数的，会被告知去用 `--dest`（压平，正是他不想要的）或 `--dest-exact`（只接受单个源镜像）。文案现已与同文件既有写法一致，`docs/ARCHITECTURE.md` 里照抄该文案的流程图一并修正
   - 这条文案此前**没有任何测试覆盖**：原断言只查退出码，不看文案。现已补上，且**只查报错那一行**——`log_error` 之后紧跟着打印 `usage`，而 `usage` 本来就列出了全部参数，拿完整输出去 grep 无论文案写得多烂都会命中（实测对照：三条 flag 在完整输出里全部命中）。这是「恒真断言」的又一具体形态
 
+- **`./scripts/lint.sh` 补上 zizmor，并如实划出它覆盖不到的那半**（[#130](https://github.com/nicholyx/action-sync-images/issues/130)）。五处文档（两个 README、`AGENTS.md`、`CONTRIBUTING.md`、脚本自述）都写着它「一键跑完 CI 的全部静态检查」，而它实际缺少 **zizmor** 与**提交信息规范**——`CONTRIBUTING.md` 据此写「提交前跑一次，能省掉一轮 CI 返工」，**省不掉**：使用者按文档认为提交信息已验过，用一个不合 Conventional Commits 的标题开 PR，`commit-messages` job 当场红。现在两半分开处理：**能 100% 本地复现的补上，复现不了的写清为什么**
+  - **zizmor 按 CI 的同一条命令接进来**：`docker run --rm -v "$PWD":/repo:ro <镜像> /repo --no-online-audits`。镜像引用从 `ci.yml` 抽，不写第二份——写死会在 CI 升级时静默漂移，而漂移正是这个 issue 本身要消除的那类问题。本机没有 docker 时退化为本机 zizmor（版本未必与 CI 对齐，打印提示），两者都没有才跳过；**镜像拉取失败则报失败**，那是「工具在但没跑成」，与「工具不在」不是一类
+  - **提交信息规范不接，改文档说清为什么不接**。CI 的 `commit-messages` job 校的是 PR 里的提交与 **PR 标题**，而标题在 PR 建立之前根本不存在，本地任何入口都验不了它——接上 `--last` 只能关掉一半，而「一半」支撑不起「已在本地验过」这句话。更要紧的是它会引入一个**假绿来源**（实测：`--range nonsense..HEAD` 得到「全部合规（共检查 0 条）」且 exit 0，`--last` 的 `HEAD~1..HEAD` 在仓库首个提交上同理）。在「宁可不给结论、也不给错结论」的项目里，拿更贵的东西换一句更响亮的承诺并不划算，所以这里是**让承诺缩小到真话**：覆盖项与不覆盖项都写进文档，脚本结尾也明说「本地绿不等于 `commit-messages` 会绿」
+  - 抽取版本号失败（`ci.yml` 里没有 pin 的镜像引用）同样**报失败并说明原因**，不静默跳过；顺带补全 `docs/MAINTAINER_GUIDE.md` 里 `ci-summary` 的覆盖清单（漏了 zizmor 与集成测试）
+
 ## [1.19.3] - 2026-09-23
 
 ### 修复

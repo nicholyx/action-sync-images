@@ -136,10 +136,11 @@ bash 里「值」和「状态」跨过进程边界时的流向，必须与进程
 - **涉及缩进/块结构的插入**（如给 step 加 `with:`）→ **逐个手工 Edit**。
   批量脚本曾连续三次算错 `with:` 与 `uses:` 的层级关系弄坏 YAML，恢复后
   手工才稳定。判断依据：修改对象是「字符」还是「结构」。
-- 每次改完工作流，跑 `./scripts/lint.sh` 之外还要跑 **zizmor**（基线 0 findings，
-  豁免集中在 `.github/zizmor.yml`，每条有可验证的安全依据）；新增 `uses:` 引用
-  必须 pin 到 commit SHA（注释保留版本号），所有 checkout 保持
-  `persist-credentials: false`——这两条是供应链基线，别在后续改动中回退。
+- 每次改完工作流，跑 `./scripts/lint.sh`（**zizmor 已在其中**，用 docker 跑 `ci.yml`
+  里 pin 的那个版本）；zizmor 基线 0 findings，豁免集中在 `.github/zizmor.yml`，
+  每条有可验证的安全依据。新增 `uses:` 引用必须 pin 到 commit SHA（注释保留版本号），
+  所有 checkout 保持 `persist-credentials: false`——这两条是供应链基线，
+  别在后续改动中回退。
 
 ### 中文内容质量（本项目高频踩坑）
 
@@ -166,7 +167,8 @@ bash 里「值」和「状态」跨过进程边界时的流向，必须与进程
 
 - 提交信息遵循 Conventional Commits（校验脚本 `scripts/check-commit-msg.sh`，CI 会查）。
   正文写**为什么**，不只是改了什么。
-- 提交前本地跑 `./scripts/lint.sh`（actionlint + yamllint + shellcheck + bash -n）。
+- 提交前本地跑 `./scripts/lint.sh`（actionlint + yamllint + shellcheck + bash -n + zizmor）。
+  它**不验提交信息规范**——CI 校的是 PR 标题，本地无从验证，标题仍要自己按规范写。
 - PR 正文结构：为什么 → 做了什么 → 关键取舍（含被否掉的方案）→ 测试策略。
 - **CHANGELOG**：每个用户可感知的改动都要记入 `[Unreleased]`，分类固定为
   新增/变更/弃用/移除/修复/安全，不自创分类。修复类条目写清「此前错在哪、有什么后果」。

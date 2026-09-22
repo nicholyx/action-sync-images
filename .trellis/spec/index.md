@@ -28,7 +28,7 @@
 
 ## Quality Check（任何任务收尾前）
 
-- [ ] `./scripts/lint.sh` 全绿（actionlint + yamllint + shellcheck + bash -n）
+- [ ] `./scripts/lint.sh` 全绿（actionlint + yamllint + shellcheck + bash -n + zizmor）
 - [ ] 改了行为 → `docs/`（USAGE / TROUBLESHOOTING / ARCHITECTURE）与两个 README 同步更新
 - [ ] 用户可感知的改动 → 记入 `CHANGELOG.md` 的 `[Unreleased]`（分类固定，见 maintenance）
 - [ ] 全仓无 U+FFFD 乱码（扫描命令见 engine/index.md 的 Quality Check）
