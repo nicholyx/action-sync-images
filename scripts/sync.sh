@@ -105,6 +105,11 @@ SRC_CRED_ENTRIES=""
 # 环境变量 SYNC_SRC_CREDENTIALS（文件内容）落盘产生的临时文件路径。
 # cleanup 只删这个，绝不动使用者通过 --src-credentials 指定的自有文件
 SRC_CREDENTIALS_TMPFILE=""
+# regctl 路径的临时凭证目录（内含 600 权限的 config.json，由
+# prepare_regctl_cred_dir 生成，经 DOCKER_CONFIG 传给 regctl）。为空表示
+# 本次不需要——只有 --strip-attestation 且配了源凭证时才有内容。
+# 空时 sync_via_regctl 不加 env 前缀，命令与修复前逐字节一致。
+REGCTL_CRED_DIR=""
 # 多目标中转：prepare_oci_staging 的传出变量（不能用命令替换传——
 # 那是子 shell，赋值传不回父进程，set -u 下读会炸）
 OCI_STAGING_DIR=""
@@ -260,7 +265,9 @@ sync.sh —— 容器镜像同步引擎
                            默认的 skopeo 路径支持此优化；--strip-attestation
                            会重建索引，目标 digest 必然不同，因此不做跳过
       --tls-verify <bool>  是否校验 registry 的 TLS 证书，默认 true。
-                           自建 HTTP 仓库（如本地 registry:2）填 false
+                           自建 HTTP 仓库（如本地 registry:2）填 false。
+                           --strip-attestation 下映射为明文 HTTP；自签证书的
+                           仓库请改在 ~/.regctl/config.json 里配 cacert
       --verify             同步后逐平台比对源与目标的子 manifest digest，
                            不一致时该镜像判定为失败。要为每个镜像多做两次
                            inspect，大清单下会明显变慢，默认关闭。
@@ -705,6 +712,27 @@ registry_host_of() {
   fi
 }
 
+# Docker Hub 的别名判定（同一个仓库的三个名字）。
+#
+# regctl 路径下给某个 host 注入 tls=disabled 前先过这一关：regclient **认**
+# docker.io 这个名（实测 `--host reg=docker.io,tls=disabled` 会以
+# hostname=registry-1.docker.io、tls=disabled 发请求），于是本该是 HTTPS 的
+# Docker Hub 会被改走明文。
+#
+# 跳过它不是因为「不跳就会硬失败」——实测（v0.11.6，`-v trace`）明文请求会拿到
+# 301 重定向到 HTTPS，regclient 跟着重定向走，最终仍能取到 manifest，只多出
+# 一次明文请求、一次重定向，外加偶发的 502 与 `Sleeping for backoff` 重试。
+# 真正的理由是：这些代价没有任何收益（Docker Hub 的证书本就正常），却把
+# 「出站 80 端口可用」变成了 Docker Hub 源的前提——端口被挡的环境里就会真的
+# 连不上。
+# 代价是 Docker Hub 源拿不到「不校验证书」——它在修复前也拿不到，不是回归。
+is_docker_hub_host() {
+  case "$1" in
+    docker.io|index.docker.io|registry-1.docker.io) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # 探测源镜像包含哪些平台。
 # 仅当源是 manifest list / OCI index 时才有意义；单平台镜像返回空。
 # 依赖 skopeo 与 jq。
@@ -868,18 +896,62 @@ sync_via_regctl() {
 
   [[ ${#platform_args[@]} -gt 0 ]] || die "平台列表解析结果为空：${platforms}"
 
+  local src_host dest_host
+  src_host="$(registry_host_of "$src")"
+  dest_host="$(registry_host_of "$dest")"
+
+  local -a cmd=(regctl)
+
+  # regctl 不认识 skopeo 的 --tls-verify=false，它的入口是 host 配置。
+  # 用 --host 逐命令注入而不是写配置文件：`--host` 是**叠加**（regclient 文档明确
+  # 说明注入值不进 `registry config`），使用者在 ~/.regctl/config.json 里给别的
+  # host 配的 cacert / 凭证原样保留。REGCTL_CONFIG 则是**替代**语义——设上它，
+  # 使用者原有的全部 registry 配置都会失效（实测：指向另一份配置后原 host 全部消失）。
+  if [[ "$TLS_VERIFY" == "false" ]]; then
+    if ! is_docker_hub_host "$src_host"; then
+      cmd+=(--host "reg=${src_host},tls=disabled")
+    fi
+    # 同 host 不重复注入：源与目标常常是同一个 registry（本地测试、单仓库中转），
+    # 重复本身没有意义，而 regclient 对同一 reg 给两次会取哪一条未经验证。
+    if ! is_docker_hub_host "$dest_host" && [[ "$dest_host" != "$src_host" ]]; then
+      cmd+=(--host "reg=${dest_host},tls=disabled")
+    fi
+  fi
+
+  cmd+=(index create "$dest" --ref "$src")
+  cmd+=("${platform_args[@]}")
+
+  # 源凭证经临时 DOCKER_CONFIG 目录传给 regctl（regctl 没有 --src-authfile）。
+  # 用 env 而不是 `VAR=x cmd`：后者对 run_with_timeout 这层包装不可见，
+  # 而 export 会污染同进程后续的 skopeo 调用。为空时不加前缀——
+  # 没配凭证时命令必须与修复前逐字节一致。
+  #
+  # 注意这里必须先判长度：bash 3.2 下空数组的 "${arr[@]}" 在 set -u 时会抛
+  # unbound variable（见 .trellis/spec/engine/bash-rules.md）。
+  local -a env_prefix=()
+  local prefix_str=""
+  if [[ -n "$REGCTL_CRED_DIR" ]]; then
+    env_prefix=(env "DOCKER_CONFIG=${REGCTL_CRED_DIR}")
+    prefix_str="${env_prefix[*]} "
+  fi
+
   if [[ "$DRY_RUN" == "true" ]]; then
     # 这里打印 platform_args 本身，而不是把 ${platforms} 的逗号换成 --platform。
     # 两者看起来一样，但来源不同：后者是「按输入的想当然」，前者才是真正会执行的参数。
     # 上面那个丢平台的缺陷之所以长期没被发现，正是因为 dry-run 一直在按输入复述，
     # 而不是复述实际参数——dry-run 一旦与实际行为脱节，就失去了它全部的意义。
-    log_dim "  [dry-run] regctl index create ${dest} --ref ${src} ${platform_args[*]}"
+    #
+    # 凭证同理：DOCKER_CONFIG 只报**目录位置**，目录里的 config.json 含明文凭证，
+    # 内容不出现在输出里（它也确实不在参数表上）。
+    log_dim "  [dry-run] ${prefix_str}${cmd[*]}"
     return 0
   fi
 
-  run_with_timeout regctl index create "$dest" \
-    --ref "$src" \
-    "${platform_args[@]}"
+  if [[ ${#env_prefix[@]} -gt 0 ]]; then
+    run_with_timeout "${env_prefix[@]}" "${cmd[@]}"
+  else
+    run_with_timeout "${cmd[@]}"
+  fi
 }
 
 # 同步单个镜像，返回 0 表示成功
@@ -1415,6 +1487,49 @@ setup_src_auth() {
   fi
 }
 
+# regctl 没有 --src-authfile，它按 Docker 的规矩读 $DOCKER_CONFIG/config.json。
+# 这里把使用者的 docker 配置与源凭证**合并**后放进一个只属于本次运行的临时目录。
+#
+# 为什么必须合并、不能直接指向 SRC_AUTHFILE 所在目录：DOCKER_CONFIG 与
+# REGCTL_CONFIG 一样是**替代**语义。指向一个只含源凭证的目录，使用者在
+# ~/.docker/config.json 里的**目标仓库**登录信息就消失了——而目标凭证在 CI 与
+# 本地都来自 docker login，于是「修好了源、弄坏了目标」。那比原来的缺陷更隐蔽：
+# 原来的缺陷至少在日志里留了个 HTTP 401。
+#
+# jq 的 `*` 对对象是**递归**合并，auths 里的条目逐条并集，正是所需。
+prepare_regctl_cred_dir() {
+  REGCTL_CRED_DIR=""
+
+  # 不满足条件时什么都不建：普通用户（没有 --strip-attestation，或没配源凭证）
+  # 的运行里不该多出一个临时目录。
+  if [[ "$STRIP_ATTESTATION" != "true" || -z "$SRC_AUTHFILE" ]]; then
+    return 0
+  fi
+
+  local dir
+  dir="$(mktemp -d)" || die "无法创建 regctl 凭证目录"
+  # 700：目录里放的是明文凭证，别让同机其他用户列目录
+  chmod 700 "$dir"
+  # 先赋值再写文件：中途失败时 cleanup 仍能删掉这个半成品目录
+  REGCTL_CRED_DIR="$dir"
+
+  # 尊重使用者既有的 DOCKER_CONFIG（CI 与本地都可能设），否则用默认位置。
+  # 这里要判的是「是不是一个 JSON **对象**」，不是「能不能解析」：`jq -e .` 对
+  # 数组 / 字符串 / 数字同样返回 0，而 `*` 拿它们与对象相乘会以 rc=5 失败，
+  # 于是下面那个 `die` 会把整次同步带走——正是这条分支想避免的结果。
+  local base_docker="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
+  if [[ -f "$base_docker" ]] && jq -e 'type == "object"' "$base_docker" >/dev/null 2>&1; then
+    jq -s '.[0] * .[1]' "$base_docker" "$SRC_AUTHFILE" > "${REGCTL_CRED_DIR}/config.json" \
+      || die "合并 regctl 凭证配置失败"
+  else
+    # 使用者没有 docker 配置（或它不是合法 JSON——坏文件不该让整次同步失败，
+    # 因为修复前的行为就是「忽略它」）时从空开始，只放源凭证
+    jq -e . "$SRC_AUTHFILE" > "${REGCTL_CRED_DIR}/config.json" \
+      || die "生成 regctl 凭证配置失败"
+  fi
+  chmod 600 "${REGCTL_CRED_DIR}/config.json"
+}
+
 # 退出时清理临时文件。
 # 用函数而不是把命令内联进 trap，是为了让以后新增的清理项只改这一处，
 # 不必再去核对 trap 那行字符串的展开时机。
@@ -1422,6 +1537,7 @@ cleanup() {
   [[ -n "${SRC_AUTHFILE:-}" ]] && rm -f "$SRC_AUTHFILE"
   [[ -n "${SRC_CRED_ENTRIES:-}" ]] && rm -f "$SRC_CRED_ENTRIES"
   [[ -n "${SRC_CREDENTIALS_TMPFILE:-}" ]] && rm -f "$SRC_CREDENTIALS_TMPFILE"
+  [[ -n "${REGCTL_CRED_DIR:-}" ]] && rm -rf "$REGCTL_CRED_DIR"
   [[ -n "${WORK_DIR:-}" ]] && rm -rf "$WORK_DIR"
   return 0
 }
@@ -3780,6 +3896,25 @@ main() {
   # 凭证依赖最终的镜像列表（未指定 --src-registry 时要从里面推导 host），
   # 因此放在筛选之后——被筛掉的镜像不该影响凭证要发给谁
   setup_src_auth
+  # 本次运行会不会**真的走** regctl 路径：--check-updates 与 --audit-lock 都只读
+  # 上游 / 锁文件，各自的不生效列表里已经列出 --strip-attestation，它们根本不经过
+  # sync_via_regctl（--audit 与 --strip-attestation 互斥，上面已 die，不在此列）。
+  # 下面几处 regctl 专属的输出都挂在这个条件上：先说「--strip-attestation 本次
+  # 不生效」、紧接着又说「regctl 路径下……映射为明文 HTTP」，等于自相矛盾——
+  # 错误的信息比没有信息更糟。
+  local regctl_path_active="false"
+  if [[ "$STRIP_ATTESTATION" == "true" && "$CHECK_UPDATES" != "true" && -z "$AUDIT_LOCK_FILE" ]]; then
+    regctl_path_active="true"
+  fi
+
+  # regctl 读不了 SRC_AUTHFILE 的格式，把源凭证与使用者的 docker 配置合并成
+  # 它认的那份临时 DOCKER_CONFIG 目录。凭证在启动时即固定，只准备一次。
+  # 同样只在真会走这条路径时才建：检查模式下没有任何人读它，明文凭证不该为了
+  # 「先准备好」而在磁盘上多存在一次（实测 --check-updates 下原本会多出一个
+  # 装着凭证的临时目录）。
+  if [[ "$regctl_path_active" == "true" ]]; then
+    prepare_regctl_cred_dir
+  fi
 
   # 这里看的是「筛选之后」的数量：--dest-exact 的约束来自多个镜像会撞到
   # 同一个目标地址，而筛掉之后只剩一个就不会撞
@@ -3798,10 +3933,19 @@ main() {
     log_warn "--skip-existing 在 --strip-attestation 模式下不可用（索引会被重建，digest 必然不同），本次将忽略"
   fi
 
+  # regctl 的 tls 是**单值**（enabled / insecure / disabled），skopeo 的
+  # --tls-verify=false 却同时覆盖「明文 HTTP」与「自签 HTTPS」两种场景，
+  # 一个值映射不了两个语义。这里选 disabled（regclient 自己对「连不上」给的
+  # 建议就是 --tls disabled），代价是自签证书在这条路径下走不通——取舍而非疏漏，
+  # 必须在使用者显式要求时说出来，否则他会以为是证书配错了。
+  if [[ "$regctl_path_active" == "true" && "$TLS_VERIFY" == "false" ]]; then
+    log_warn "regctl 路径下 --tls-verify false 映射为明文 HTTP（tls=disabled），与 skopeo 的「HTTPS 但跳过证书校验」不等价：自签证书的 HTTPS 仓库请改在 ~/.regctl/config.json 里为它配 cacert；Docker Hub 源仍走 HTTPS"
+  fi
+
   # regctl 路径用的是 regclient 自己的重试策略，脚本层面的这两个参数到不了它那里。
   # 默认值被忽略不值得打扰，但使用者**显式传入**却没生效必须说出来——
   # 「参数被接受却不起作用」比直接报错更危险：它让人对系统行为产生错误认知。
-  if [[ "$STRIP_ATTESTATION" == "true" ]]; then
+  if [[ "$regctl_path_active" == "true" ]]; then
     if [[ "$RETRIES_EXPLICIT" == "true" ]]; then
       log_warn "--retries ${MAX_RETRIES} 在 regctl 路径下不生效：regclient 有自己的重试策略（默认 5 次），本次将忽略"
     fi

@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/engine/index.md", "reason": "断言可信度：弱断言（jq -e 只检查最后一个值）、对正确实现假报错、以及「恒真的断言比没有断言更糟」。本任务有三条断言（AC2/AC4/AC7）必须做变异验证才算数"}
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "核对实现是否踩了已知的 bash 坑：管道接 tail 后 if 判断错退出码、进程替换不传退出码、printf '%s' 丢最后一段、空数组 + set -u"}
+{"file": ".trellis/spec/guides/index.md", "reason": "「检查与搬运分开」——检查阶段要独立验证，不照搬实现者的结论；「只报告、不替使用者做判断」用于判断告警措辞是否越界"}
+{"file": ".trellis/tasks/09-22-strip-attestation-tls-creds/research/regctl-tls-credential-mechanism.md", "reason": "检查阶段要独立复现这些实验，而不是相信实现者的转述；尤其是 DOCKER_CONFIG 是替代语义、REGCTL_CONFIG 是替代语义这两条，直接决定 AC7 的判定"}
