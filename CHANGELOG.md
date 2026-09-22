@@ -19,6 +19,12 @@
   - **变异验证**：三个变异体都先过 `bash -n`，且各自被对应的断言当场抓住——整段还原成 `done < <(git log … 2>/dev/null)` → 退出码断言红；只在 `git log` 后插 `|| true`（单点变异）→ 退出码断言红；把自己报错文案里的区间插值去掉 → 自造文案断言红
   - `--last` 的 `HEAD~1..HEAD` 在仓库首个提交上本就无从比较，如今报错而非静默放行——这是期望行为，没有为它加特例。「要不要把本脚本接进 `lint.sh`」仍留给 #130 重新评估，本 PR 不动
 
+- **`./scripts/lint.sh` 的 actionlint 改为显式传工作流文件列表，并去掉 `-ignore 'SC2086'`**（[#138](https://github.com/nicholyx/action-sync-images/issues/138)、[#133](https://github.com/nicholyx/action-sync-images/issues/133)）。这一项上有两个方向相反的口子，各自破坏「本地过 = CI 过」：**非 git 目录下它根本跑不起来**——actionlint 靠 `.git` 定位项目根，报 `no project was found in any parent directories of "…"`，从 GitHub 的 source tarball 解压出来的人什么都没改，第一项就红；**而跑得起来时它又比 CI 宽松**——本地多一个 `-ignore 'SC2086'`，改工作流时引入的 SC2086 本地绿、CI 红
+  - 修法不是「非 git 就跳过」，而是**显式传文件让它真跑**——actionlint 拿到文件参数就不必再依赖 git。目标集**单独收集** `.github/workflows/` 下的文件，不复用 `YAML_TARGETS`：那个收的是 `.github` 下全部 YAML（yamllint 需要那些），而 `.github/dependabot.yml` / `.github/labeler.yml` / `.github/ISSUE_TEMPLATE/*.yml` 喂给 actionlint 会报「"jobs" section is missing in workflow」（实测这些非工作流文件全部 rc=1）。两个目标集不同，不能合并
+  - **变异验证（两次，各自独立）**：把 `history-trend.yml` 里的 `cat "$out_file"` 改成 `cat $out_file` —— 旧版 `lint.sh` 在带 `.git` 的目录里 **exit 0**（假绿，这正是 #133 的形态），新版 exit 1；再把 `${{ secrets.GITHUB_TOKEN }}` 拼成 `${{ secret.GITHUB_TOKEN }}` 放进**不含 `.git`** 的副本 —— 新版 exit 1 并报 `undefined variable "secret"`。后者证明非 git 目录下的「通过」不是假绿，而是真在检查
+  - 工作流列表为空时走 `fail_check` 而不静默跳过：空列表意味着这一项**什么都没检查**，却和「通过」长得一样（照同文件 zizmor「取不到镜像版本」的既有处理）。实测把 `.github/workflows/` 整个移走，actionlint 与 zizmor 两项都如实报失败
+  - `docs/MAINTAINER_GUIDE.md` 的第 3 步改为**按分歧源逐项排查**而不是先猜版本：#133 的真实来源是调用参数与目标集，照旧文案去比版本会一无所获（两边都是 1.7.12）；`CONTRIBUTING.md` 的单项命令改写成 `actionlint .github/workflows/*.yml`（裸跑在无 `.git` 目录下必红）
+
 ## [1.19.4] - 2026-09-23
 
 ### 修复

@@ -335,9 +335,17 @@ gh release create v1.1.0 --title v1.1.0 --notes-file <(sed -n '/## \[1.1.0\]/,/#
 
 1. 先看是不是 `ci-summary` 汇总失败但各子任务通过 —— 那是汇总逻辑的问题
 2. 看 actionlint / yamllint / shellcheck 各自报什么
-3. 如果本地 `./scripts/lint.sh` 是绿的而 CI 是红的，多半是**工具版本差异**：
-   - CI 里 actionlint 版本固定在 `ci.yml` 的 `env.ACTIONLINT_VERSION`
-   - 本地版本可能更新，报的规则也不同
+3. 如果本地 `./scripts/lint.sh` 是绿的而 CI 是红的，**按分歧源逐项排查**，不要先猜版本：
+   - **调用参数与目标集是否一致**。`lint.sh` 的 actionlint 自 2026-09-23 起显式传
+     `.github/workflows/` 下的文件，与 CI 的 `./actionlint -color` 规则集、目标文件集一致
+     （CI 不传文件，靠项目根自动发现同一批文件）。
+     在它之前本地多一个 `-ignore 'SC2086'`——那才是「本地不报、CI 报」的真实来源，
+     照旧版这句去比版本会一无所获（两边都是 1.7.12）
+   - **工具版本**。actionlint 在 CI 里固定在 `ci.yml` 的 `env.ACTIONLINT_VERSION`，本地可能更新；
+     **yamllint 与 shellcheck 两边都不 pin**；zizmor 在本地没有 docker 时会退回本机二进制，
+     而 CI 用 pin 的镜像——只有它会把两边的版本打出来（退回本机二进制的那条路径上）。
+     其余几项 `lint.sh` 不打版本，要比对得自己跑
+     `actionlint --version` / `yamllint --version` / `shellcheck --version`
 4. 如果所有 PR 都红，可能是 GitHub 改了运行器镜像，检查运行日志里的环境信息
 
 ### 同步工作流突然失败
