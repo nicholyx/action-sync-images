@@ -102,9 +102,37 @@ printf '%s' "$C_RESET"
 # ---------------------------------------------------------------------------
 # 1. actionlint —— 工作流语法与常见陷阱
 #    它同时会调用 shellcheck 检查 run: 里的 Shell 片段
+#
+#    **显式传工作流文件列表，不裸跑。** 裸跑时 actionlint 要靠 .git 定位项目根，
+#    而在不含 .git 的目录（典型场景：GitHub 的 source tarball 解压出来）里会直接
+#    报「no project was found in any parent directories of …」——使用者什么都没改，
+#    第一项就红。显式给文件则不必依赖 git，两种目录下都真跑。
+#
+#    目标集**不能**复用 YAML_TARGETS：那个收的是 .github 下全部 yml/yaml
+#    （yamllint 需要那些），而 dependabot.yml / labeler.yml / ISSUE_TEMPLATE/*.yml
+#    都不是工作流，喂给 actionlint 会报「"jobs" section is missing in workflow」。
+#    这里说的 labeler.yml 是 .github/ 下那个；.github/workflows/labeler.yml 是工作流，要收。
+#    这里只收 .github/workflows/ 下的——两个目标集不同，别合并。
+#
+#    目标文件集与规则集都同 CI 的 `./actionlint -color` 一致（CI 那边不传文件，
+#    靠项目根自动发现同一批文件——实测含子目录也一致）：
+#    本地过要真的等于 CI 过，所以不再屏蔽任何规则——此前被屏蔽的 SC2086
+#    正是「本地不报、CI 报」的来源（#133）。
 # ---------------------------------------------------------------------------
+WORKFLOW_TARGETS=()
+while IFS= read -r f; do
+  WORKFLOW_TARGETS+=("$f")
+done < <(find .github/workflows -name '*.yml' -o -name '*.yaml' 2>/dev/null | sort)
+
 if command -v actionlint >/dev/null 2>&1; then
-  run_check "actionlint（工作流静态检查）" actionlint -color -ignore 'SC2086'
+  if [[ ${#WORKFLOW_TARGETS[@]} -gt 0 ]]; then
+    run_check "actionlint（工作流静态检查）" actionlint -color "${WORKFLOW_TARGETS[@]}"
+  else
+    # 列表为空意味着这一项根本没跑成。不能悄悄放过：它会和「检查通过」长得一样，
+    # 而使用者以为 CI 里那一项已经在本地说过了（照同文件 zizmor 的既有处理）。
+    fail_check "actionlint（工作流静态检查）" "没有找到任何工作流文件（.github/workflows/*.yml）" \
+      "actionlint 拿不到文件就不会检查任何东西——这一项此时与跳过无异，但读者会以为它跑过了。"
+  fi
 else
   skip_check "actionlint（工作流静态检查）" "未安装对应工具" \
     "brew install actionlint  或  go install github.com/rhysd/actionlint/cmd/actionlint@latest"

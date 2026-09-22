@@ -217,7 +217,7 @@ cd action-sync-images
 ### 只想跑单项
 
 ```bash
-actionlint                                    # 校验工作流语法与常见陷阱
+actionlint .github/workflows/*.yml            # 校验工作流语法与常见陷阱
 yamllint -c .yamllint .github/workflows/      # 校验 YAML 风格
 shellcheck scripts/*.sh                       # 校验 Shell 脚本
 ```

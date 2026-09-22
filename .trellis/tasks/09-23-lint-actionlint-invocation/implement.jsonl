@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/engine/index.md", "reason": "断言可信度（变异要精确到单点、恒真断言）；本任务的 AC5 要求「故意引入一个真实告警确认 lint.sh 会红」——那是「本地过 = CI 过」的实际检验，不是文本比对"}
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "空数组 + set -u 在 bash 3.2 下抛 unbound variable（R3 要处理空列表）；lint.sh 里 yamllint/shellcheck 两处已有先例可照"}
+{"file": ".trellis/spec/maintenance/index.md", "reason": "收尾的文档同步与 CHANGELOG 锚点校验；以及「本地入口与 CI 是否等价」这条判据属于维护闭环的一部分"}
