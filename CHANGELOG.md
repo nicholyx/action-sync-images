@@ -9,6 +9,8 @@
 
 ## [Unreleased]
 
+## [1.19.4] - 2026-09-23
+
 ### 修复
 
 - **缺少目标参数时的报错文案漏了 `--dest-keep-path`**（[#129](https://github.com/nicholyx/action-sync-images/issues/129)）。`--dest-keep-path` 是与 `--dest` 并列的第三种目标模式，但那条报错只说了「`--dest` 或 `--dest-exact`」——**同一份文件里另外两条同类文案都是对的**，只有这一处漏了。撞上它的人恰恰是最需要它说对的那一类：想把路径结构保留到 Harbor 类仓库、又忘了带前缀参数的，会被告知去用 `--dest`（压平，正是他不想要的）或 `--dest-exact`（只接受单个源镜像）。文案现已与同文件既有写法一致，`docs/ARCHITECTURE.md` 里照抄该文案的流程图一并修正
