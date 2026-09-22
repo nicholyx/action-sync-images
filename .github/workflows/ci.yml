@@ -741,24 +741,242 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
 
-          # 这些都应该以退出码 1（参数错误）结束，而不是跑到一半才炸
+          # 这些都应该以退出码 1（参数错误）结束，而不是跑到一半才炸。
+          #
+          # 光断退出码是不够的：启动校验区里有将近二十条 die，退出码 1 可能来自
+          # 任何一条，「这条被拒绝」与「别的 die 先炸了」区分不开。所以必须再断
+          # **报错文案**——一条断言的可信度取决于它能不能指出是哪条 die 触发的。
           check_reject() {
-            local desc="$1"; shift
+            local desc="$1" expect="$2"; shift 2
+            local out code
             set +e
-            "$@" >/dev/null 2>&1
-            local code=$?
+            out="$("$@" 2>&1)"
+            code=$?
             set -e
             if [[ "$code" -ne 1 ]]; then
+              printf '%s\n' "$out"
               echo "::error::${desc}：期望退出码 1，实际 ${code}"
+              exit 1
+            fi
+            if [[ "$out" != *"$expect"* ]]; then
+              printf '%s\n' "$out"
+              echo "::error::${desc}：报错文案里没有「${expect}」——退出码对，但炸的不是这条"
               exit 1
             fi
             echo "✓ 已拒绝：${desc}"
           }
 
-          check_reject "并发度非数字" ./scripts/sync.sh --src "nginx:1.27" --dest r.example.com/x --concurrency abc
-          check_reject "并发度为 0"   ./scripts/sync.sh --src "nginx:1.27" --dest r.example.com/x --concurrency 0
-          check_reject "超时为非数字" ./scripts/sync.sh --src "nginx:1.27" --dest r.example.com/x --timeout soon
-          check_reject "精确目标配多个镜像" ./scripts/sync.sh --src "nginx:1.27,redis:7.4" --dest-exact h.example.com/a --dry-run
+          # ---- 数值型与数量型参数 ----
+          check_reject "并发度非数字" "--concurrency 必须是非负整数" \
+            ./scripts/sync.sh --src "nginx:1.27" --dest r.example.com/x --concurrency abc
+          check_reject "并发度为 0" "--concurrency 至少为 1" \
+            ./scripts/sync.sh --src "nginx:1.27" --dest r.example.com/x --concurrency 0
+          check_reject "超时为非数字" "--timeout 必须是非负整数" \
+            ./scripts/sync.sh --src "nginx:1.27" --dest r.example.com/x --timeout soon
+          check_reject "精确目标配多个镜像" "--dest-exact 只能搭配单个源镜像使用" \
+            ./scripts/sync.sh --src "nginx:1.27,redis:7.4" --dest-exact h.example.com/a --dry-run
+
+          # ---- 互斥组合 ----
+          # 互斥判定排在**文件存在性检查之前**（sync.sh 的启动校验区），所以
+          # --audit-lock 给一个不存在的路径就够了，不需要真实锁文件。
+          check_reject "--dest-exact 与 --dest 互斥" "--dest-exact 不能与 --dest / --dest-keep-path 同时使用" \
+            ./scripts/sync.sh --src "nginx:1.27" --dest-exact r.example.com/a --dest r.example.com/x
+          check_reject "--dest-exact 与 --dest-keep-path 互斥" "--dest-exact 不能与 --dest / --dest-keep-path 同时使用" \
+            ./scripts/sync.sh --src "nginx:1.27" --dest-exact r.example.com/a --dest-keep-path r.example.com/x
+          check_reject "--audit 与 --check-updates 互斥" "--audit 与 --check-updates 不能同时使用" \
+            ./scripts/sync.sh --src "nginx:1.27" --audit --check-updates
+          check_reject "--audit-lock 与 --check-updates 互斥" "--audit-lock 与 --check-updates 不能同时使用" \
+            ./scripts/sync.sh --audit-lock /tmp/no-such.lock --check-updates
+          check_reject "--audit-lock 与 --audit 互斥" "--audit-lock 与 --audit 不能同时使用" \
+            ./scripts/sync.sh --audit-lock /tmp/no-such.lock --audit
+
+          # --audit-lock 自带条目来源：再混入 --src / --file 会让「校验哪些」变成
+          # 两份清单的并集，语义只能靠猜。两个入口都要覆盖。
+          file_dir="$(mktemp -d)"
+          printf 'nginx:1.27\n' > "${file_dir}/images.txt"
+          check_reject "--audit-lock 与 --src 互斥" "--audit-lock 自带校验清单" \
+            ./scripts/sync.sh --audit-lock /tmp/no-such.lock --src "nginx:1.27"
+          check_reject "--audit-lock 与 --file 互斥" "--audit-lock 自带校验清单" \
+            ./scripts/sync.sh --audit-lock /tmp/no-such.lock --file "${file_dir}/images.txt"
+
+          # 剔除 attestation 会重建索引，目标的平台摘要必然与源不同，于是审计只
+          # 会给出一排**假的「落后」**——比报错更糟，它让人去排查一个并不存在的问题
+          check_reject "--audit 与 --strip-attestation 互斥" "--audit 与 --strip-attestation 不能同时使用" \
+            ./scripts/sync.sh --src "nginx:1.27" --dest r.example.com/x --audit --strip-attestation
+
+      - name: 验证只读模式的不生效参数告警
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 三个只读模式（--check-updates / --audit / --audit-lock）都会把「传了
+          # 但这次用不上」的参数合并成**一条**告警、一次列全。这类告警是使用者
+          # 唯一能察觉「参数被吃掉了」的出口，所以断两件事：出现过，以及**只有
+          # 一条**——拆成每项一行同样是静默失效，淹没在输出里就没人看得见。
+          fail() { echo "::error::$1"; exit 1; }
+
+          # 断言：该模式的告警恰好一行，且这一行里列全了所有预期参数名。
+          #
+          # marker 要取到告警的**整句前缀**，不能只用「模式名 + 一句形容」那种短串：
+          # 「--check-updates 只查上游」在 usage 正文里也写着（sync.sh 的目标地址
+          # 一节），运行中的进度行也提到「只查上游 tag」。撞车不会漏报，但会把
+          # lines 撑到 2 而假红——假红和恒真一样不可信。带上「，以下参数本次不生效」
+          # 这半句就只可能命中这三条告警本身了。
+          assert_merged_ignored() {
+            local desc="$1" marker="$2" out="$3"; shift 3
+            local lines=0 line="" l tok missing=""
+            while IFS= read -r l; do
+              [[ "$l" == *"$marker"* ]] || continue
+              lines=$((lines + 1))
+              line="$l"
+            done <<<"$out"
+            if [[ "$lines" -eq 0 ]]; then
+              printf '%s\n' "$out"
+              fail "${desc}：输出里没有「${marker}」这条告警"
+            fi
+            if [[ "$lines" -gt 1 ]]; then
+              printf '%s\n' "$out"
+              fail "${desc}：这条告警出现了 ${lines} 行，应合并成一条一次列全"
+            fi
+            for tok in "$@"; do
+              [[ "$line" == *"$tok"* ]] || missing="${missing}「${tok}」"
+            done
+            if [[ -n "$missing" ]]; then
+              printf '%s\n' "$line"
+              fail "${desc}：告警里没列全，缺 ${missing}"
+            fi
+            echo "✓ ${desc}：一条告警列全（${line}）"
+          }
+
+          # mock skopeo：三条告警都打印在**任何工具调用之前**（`sync.sh` 的启动
+          # 校验区），所以被断的东西本身不依赖网络——mock 不是为了「防时绿时红」，
+          # 而是为了不联网，并把 run 时间钉死：真 skopeo 会去查 Docker Hub 与
+          # r.example.com，配上 --timeout 900 与失败重试会把 runner 白拖住。
+          mock_dir="$(mktemp -d)"
+          printf '#!/usr/bin/env bash\nexit 1\n' > "${mock_dir}/skopeo"
+          chmod +x "${mock_dir}/skopeo"
+          PATH="${mock_dir}:$PATH"
+          export PATH
+
+          # ③ 的告警在**文件存在性检查之后**（互斥判定才在它之前，两者的先后
+          # 不同，别把结论套过来），所以这个用例必须有真实锁文件
+          lock_file="${mock_dir}/lock.txt"
+          printf 'nginx@sha256:%064d\n' 0 > "$lock_file"
+
+          # ① --check-updates：并发与超时是**与硬编码默认值直接比较**才进列表的
+          #    （源码里写死 `CONCURRENCY != "1"` / `TIMEOUT != "600"`），默认值
+          #    一改这两项就静默消失。所以两个都要传非默认值过来钉住。
+          set +e
+          out="$(./scripts/sync.sh --src 'nginx:1.27' --check-updates --dry-run \
+            --write-lock "${mock_dir}/never-written.lock" \
+            --concurrency 4 --timeout 900 2>&1)"
+          set -e
+          assert_merged_ignored "--check-updates" "--check-updates 只查上游，以下参数本次不生效" "$out" \
+            "本次不生效" "--dry-run" "--write-lock" "--concurrency" "--timeout"
+
+          # ② --audit
+          set +e
+          out="$(./scripts/sync.sh --src 'nginx:1.27' --dest r.example.com/x --audit \
+            --dry-run --write-lock "${mock_dir}/never-written.lock" \
+            --verify --skip-existing 2>&1)"
+          set -e
+          assert_merged_ignored "--audit" "--audit 是只读检查，以下参数本次不生效" "$out" \
+            "本次不生效" "--dry-run" "--write-lock" "--verify" "--skip-existing"
+
+          # ③ --audit-lock：--filter 与目标地址都列在同一条里
+          set +e
+          out="$(./scripts/sync.sh --audit-lock "$lock_file" --dry-run --filter 'kube-' \
+            --dest r.example.com/x 2>&1)"
+          set -e
+          assert_merged_ignored "--audit-lock" "--audit-lock 只校验锁文件，以下参数本次不生效" "$out" \
+            "本次不生效" "--dry-run" "--filter / --exclude" "目标地址（--dest / --dest-keep-path）"
+
+      - name: 验证 -h / --help 的退出码
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # -h/--help 与未知参数**共用同一份 usage 输出**，退出码却必须不同：
+          # 0 是「你要的帮助给你了」，1 是「你给的东西不认」。脚本常常嵌在
+          # set -e 的流水线里，这条差别就是「打印帮助算不算一次失败」。
+          fail() { echo "::error::$1"; exit 1; }
+
+          expect_code() {
+            local desc="$1" want="$2" expect="$3"; shift 3
+            local out code
+            set +e
+            out="$("$@" 2>&1)"
+            code=$?
+            set -e
+            if [[ "$code" -ne "$want" ]]; then
+              printf '%s\n' "$out"
+              fail "${desc}：期望退出码 ${want}，实际 ${code}"
+            fi
+            if [[ "$out" != *"$expect"* ]]; then
+              printf '%s\n' "$out"
+              fail "${desc}：输出里没有「${expect}」"
+            fi
+            echo "✓ ${desc}：退出码 ${want}"
+          }
+
+          for s in sync history; do
+            expect_code "./scripts/${s}.sh -h" 0 "-h, --help" "./scripts/${s}.sh" -h
+            expect_code "./scripts/${s}.sh --help" 0 "-h, --help" "./scripts/${s}.sh" --help
+            expect_code "./scripts/${s}.sh --no-such-flag" 1 "未知参数：--no-such-flag" \
+              "./scripts/${s}.sh" --no-such-flag
+          done
+
+      - name: 验证 history.sh 的常量与体检工作流一致
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # history.sh --check 要下载「Check-Registry 工作流里名为 check-report 的
+          # Artifact」——这两个字面量一个在脚本里、一个在工作流 YAML 里。对不上时
+          # 不会报参数错，而是走完整条下载流程再 die，诊断信息把人指向 GitHub
+          # Actions 配置，真实原因却是本地常量过期。所以这条比对是纯文本的。
+          fail() { echo "::error::$1"; exit 1; }
+
+          # 取「紧跟在含 CHECK_MODE 的 if 之后」的那条赋值——它才是 --check 模式下
+          # 生效的取值；文件开头另有一份同步模式的默认值，取错就变成恒真断言
+          check_mode_const() {
+            local var="$1"
+            awk -v v="$var" '
+              prev ~ /CHECK_MODE/ && $0 ~ ("^[[:space:]]*" v "=\"") {
+                s = $0; sub(/^[^"]*"/, "", s); sub(/".*$/, "", s); print s
+              }
+              { prev = $0 }
+            ' scripts/history.sh
+          }
+
+          # Artifact 名可能出现在多个上传步骤里，全收进来再逐行比对，
+          # 免得将来加一个附件就变成误判
+          uploaded_artifacts="$(
+            awk '
+              /uses: actions\/upload-artifact/ { want = 1; next }
+              want && /^[[:space:]]*name:/ {
+                s = $0; sub(/^[[:space:]]*name:[[:space:]]*/, "", s); print s; want = 0
+              }
+            ' .github/workflows/check-registry.yml
+          )"
+
+          hist_report="$(check_mode_const REPORT_NAME)"
+          hist_workflow="$(check_mode_const WORKFLOW_FILTER)"
+          # 顶层 name 在文件里必须是独一份；`sed | head` 的写法在 set -o pipefail
+          # 下有 SIGPIPE 假红的可能——断言误伤正确实现和恒真一样不可信
+          wf_name="$(sed -n 's/^name:[[:space:]]*//p' .github/workflows/check-registry.yml)"
+
+          [[ -n "$hist_report" ]] || fail "没能从 history.sh 取到 --check 模式的 REPORT_NAME（常量改名了？）"
+          [[ -n "$hist_workflow" ]] || fail "没能从 history.sh 取到 --check 模式的 WORKFLOW_FILTER（常量改名了？）"
+          [[ -n "$wf_name" ]] || fail "没能从 check-registry.yml 取到工作流 name"
+          if [[ "$hist_workflow" != "$wf_name" ]]; then
+            fail "history.sh --check 只看工作流「${hist_workflow}」，而体检工作流的 name 是「${wf_name}」——两边对不上"
+          fi
+          if ! grep -qxF -- "$hist_report" <<<"$uploaded_artifacts"; then
+            printf '%s\n' "$uploaded_artifacts"
+            fail "history.sh --check 下载的 Artifact 是「${hist_report}」，体检工作流上传的却是上面这些"
+          fi
+          echo "✓ history.sh 的常量与 check-registry.yml 一致（工作流「${wf_name}」、Artifact「${hist_report}」）"
 
       - name: 验证镜像筛选
         run: |
