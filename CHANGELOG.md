@@ -9,6 +9,16 @@
 
 ## [Unreleased]
 
+### 修复
+
+- **`check-commit-msg.sh` 的 `--range` 不再对无效区间静默放行**（[#132](https://github.com/nicholyx/action-sync-images/issues/132)）。`git log` 的 stderr 被 `2>/dev/null` 丢掉，于是**「区间无效」与「区间内没有提交」混成同一种「读到 0 条」**——两者都打印「全部合规（共检查 0 条）」并 exit 0。而脚本 header 推荐的本地用法 `--range origin/main..HEAD`，在刚 clone、没 fetch 过 remote-tracking ref、或 detached HEAD 时**正是这个形态**，会静默放行。这与项目记过的「恒真的断言比没有断言更糟」是同一族：**0 条检查结果冒充「全部合规」**
+  - 修法是**让静默变成可见，不是让空区间失败**。命令替换接住 `git log` 的退出码——实测 ref 不存在 / SHA 不存在是 128、区间有效但为空是 0，两者本就分得开，不需要先逐个 `rev-parse --verify`。rc≠0 时报错退出，**只取 stderr 首行如实转述 git 的话**（与 `history.sh` 取首行的既有做法一致），并带上使用者给的那个区间字符串，不猜具体原因
+  - **空区间的退出码保持 0，措辞改为「区间内没有提交，没有可校验的内容」**：CI 里 `BASE..HEAD` 为空是合法情形（例如只有 merge 的 PR），判失败会制造假红；判据是「0 条检查结果不能冒充『全部合规』」，不是「0 条就是错」。这一段**不再打印「共检查 0 条」**——那行数字正是原来看起来像「验过了」的东西
+  - 读取方式从进程替换改成 `done <<<"$log_out"`（重定向而非管道）：管道会让 `while` 落进子 shell，`CHECKED_COUNT` / `FAILED_COUNT` 的累加传不回父进程。这不是风格偏好——变异验证里单独换成管道，「共检查 1 条」的断言当场变红
+  - 断言进 CI 的 `smoke-test` 而非 `commit-messages` job：后者带 `if: github.event_name == 'pull_request'` 只在 PR 上跑，语义也是「校验这个 PR」；新用例用临时仓库做夹具，不依赖本仓库历史（smoke-test 是浅克隆）
+  - **变异验证**：三个变异体都先过 `bash -n`，且各自被对应的断言当场抓住——整段还原成 `done < <(git log … 2>/dev/null)` → 退出码断言红；只在 `git log` 后插 `|| true`（单点变异）→ 退出码断言红；把自己报错文案里的区间插值去掉 → 自造文案断言红
+  - `--last` 的 `HEAD~1..HEAD` 在仓库首个提交上本就无从比较，如今报错而非静默放行——这是期望行为，没有为它加特例。「要不要把本脚本接进 `lint.sh`」仍留给 #130 重新评估，本 PR 不动
+
 ## [1.19.4] - 2026-09-23
 
 ### 修复

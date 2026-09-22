@@ -2953,6 +2953,104 @@ jobs:
             || { echo "::error::SYNC_SRC_CREDENTIALS 未生效"; exit 1; }
           echo "✓ 环境变量注入（Secret 场景）可用"
 
+      - name: 验证提交信息的区间校验区分「区间无效」与「区间为空」
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # --range 把 git log 的 stderr 丢掉时，「区间无效」与「区间里没有提交」
+          # 混成同一种「读到 0 条」，双双打印「全部合规（共检查 0 条）」并 exit 0。
+          # header 推荐的 origin/main..HEAD 在没 fetch 过时正是这个形态——静默放行。
+          # 判据是「0 条检查结果不能冒充「全部合规」」，不是「0 条就是错」。
+          fail() { echo "::error::$1"; exit 1; }
+
+          # 夹具用临时仓库：三种情形一次摆好，且不依赖本仓库历史（提交信息会变）。
+          # 提交身份显式给出——runner 上不一定配了全局 user.name/user.email。
+          script="$(pwd)/scripts/check-commit-msg.sh"
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          git -C "$work" init -q
+          for msg in "chore: 初始提交" "坏消息 没有类型" "feat: 合规的提交"; do
+            git -C "$work" -c user.name=ci -c user.email=ci@example.com \
+              commit -q --allow-empty -m "$msg"
+          done
+          check() { ( cd "$work" && "$script" "$@" ); }
+
+          # 1) 区间无效（ref 不存在）：报错退出，如实转述 git 的话，并带上使用者给的区间
+          set +e
+          out="$(check --range nonsense..HEAD 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          [[ "$code" -eq 1 ]] || fail "无效区间应退出码 1，实际 ${code}"
+          grep -qF "ambiguous argument 'nonsense..HEAD'" <<<"$out" \
+            || fail "未转述 git 的报错原文"
+          # 这句断的是**自己那条**文案带了区间。不能只断 git 那行里有区间——
+          # 那是上一句的必然推论（恒真），断不出「自造文案把区间丢了」
+          grep -qF '无法解析提交区间「nonsense..HEAD」' <<<"$out" \
+            || fail "自己的报错文案未带上使用者给的区间"
+          if grep -qF '全部合规' <<<"$out"; then
+            fail "无效区间被报成了「全部合规」"
+          fi
+          echo "✓ 无效区间报错退出，且不含「全部合规」"
+
+          # 2) 区间有效但为空：退出码保持 0（CI 里 BASE..HEAD 为空是合法情形，
+          #    例如只有 merge 的 PR，判失败会制造假红），但措辞不能说「全部合规」——
+          #    「有没有提交可验」与「提交信息合不合规」是两回事
+          set +e
+          out="$(check --range HEAD..HEAD 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          [[ "$code" -eq 0 ]] || fail "空区间是合法情形，应退出码 0，实际 ${code}"
+          grep -qF '没有提交，没有可校验的内容' <<<"$out" \
+            || fail "空区间未说明「没有可校验的内容」"
+          if grep -qF '全部合规' <<<"$out"; then
+            fail "0 条检查结果冒充了「全部合规」"
+          fi
+          echo "✓ 空区间如实说明「没有可校验的内容」，退出码仍为 0"
+
+          # 3) 有效非空区间：合规 → 0，不合规 → 1。这段语义本次不改，
+          #    钉住它是防止重写区间逻辑时把它一起带走。
+          #    计数串只能断「共检查 N 条」「N 条不合规」两截：颜色转义码夹在中间，
+          #    整句串（含「全部合规（共检查 1 条）」）匹配不上。
+          set +e
+          out="$(check --range HEAD~1..HEAD 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 0 ]] || fail "合规区间应退出码 0，实际 ${code}"
+          grep -qF '全部合规' <<<"$out" || fail "合规区间未报「全部合规」"
+          grep -qF '共检查 1 条' <<<"$out" || fail "合规区间未给出 1 条检查结果"
+
+          set +e
+          out="$(check --range HEAD~2..HEAD~1 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 1 ]] || fail "不合规区间应退出码 1，实际 ${code}"
+          grep -qF '条不合规' <<<"$out" || fail "不合规区间未报「条不合规」"
+          grep -qF '共检查 1 条' <<<"$out" || fail "不合规区间未给出 1 条检查结果"
+          echo "✓ 有效区间行为不变（合规 0 / 不合规 1）"
+
+          # 4) --message / --file 的退出码语义本次不动，但 CI 的 commit-messages job
+          #    正是靠它们校验 PR 标题，一并钉住
+          set +e
+          out="$(check --message "feat: ok" 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 0 ]] || fail "--message 合规应退出码 0，实际 ${code}"
+          set +e
+          out="$(check --message "坏消息 没有类型" 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 1 ]] || fail "--message 不合规应退出码 1，实际 ${code}"
+          printf '坏消息 没有类型\n' > "${work}/msg.txt"
+          set +e
+          out="$(check --file "${work}/msg.txt" 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 1 ]] || fail "--file 不合规应退出码 1，实际 ${code}"
+          echo "✓ --message / --file 模式不受影响"
+
   # ---------------------------------------------------------------------------
   # 工作流安全扫描
   # zizmor 专查 GitHub Actions 的已知反模式：凭证持久化、危险触发器、
