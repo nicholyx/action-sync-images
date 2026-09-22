@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "本改动全是退出码语义：命令替换的退出码即赋值的退出码、期限「失败时输出 unknown、成功时输出判定值」不能依赖调用方 shell 选项、以及「第三方工具的退出码不得冒成脚本的退出码」——本 moven 的核心就是接住 git log 的退出码"}
+{"file": ".trellis/spec/engine/index.md", "reason": "断言可信度：恒真的断言比没有断言更糟（本 issue 的「0 条冒充全部合规」正是这个形态）、变异要精确到单点"}
+{"file": ".trellis/spec/maintenance/index.md", "reason": "「改动 CI 步骤」一节（断言放哪里、资源冲突）；以及 commit-messages job 的既有形态在维护规范里的位置"}
