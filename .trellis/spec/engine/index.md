@@ -14,6 +14,19 @@
 - **并发**：子进程 + 带序号的结果文件（`result_file_for` / `audit_result_file_for` / `lock_result_file_for`），槽位控制用 `jobs -pr` 计数（不用 `wait -n`，bash 3.2 没有）
 - **多值传出**：用全局变量（`OCI_STAGING_DIR` / `DEST_REFS` / `REF_REPO` 等），**不用命令替换**——那是子 shell，赋值传不回父进程
 - **新参数**：解析在 `parse_args`，显式指定但不生效的必须进对应模式的「不生效」告警列表（默认值不生效不打扰）
+- **外部工具的配置入口分「叠加」与「替代」两类，动手前先查清是哪一类**。regctl 的三个入口就是三种语义，选错会把使用者已有的配置悄悄作废：
+
+  | 入口 | 语义 | 能否用于「临时覆盖」 |
+  | --- | --- | --- |
+  | `--host reg=<host>,key=value` | **叠加**：注入值不写进任何文件 | ✅ 首选，使用者原有配置原样保留 |
+  | `REGCTL_CONFIG=<file>` | **替代** `~/.regctl/config.json` | ❌ 设上它，使用者原有的全部 host 配置消失 |
+  | `DOCKER_CONFIG=<dir>` | **替代** `~/.docker/config.json` | ⚠️ 必须先把使用者配置**合并**进去，否则他在目标仓库的 `docker login` 凭证会丢 |
+
+  `REGCTL_CONFIG` 与 `DOCKER_CONFIG` 都是**替代**——不是合并，这一点只能实测确认（写一份只含本次 host 的配置，指向它，再读回来看原有的还在不在）。「修好了源、弄坏了目标」这类回归比原始缺陷更隐蔽：原始缺陷至少会在日志里留下一个 401。范本见 `sync_via_regctl` 与 `prepare_regctl_cred_dir`
+
+- **regctl 的 `tls` 是单值，不是开关**。取值只有 `enabled` / `insecure` / `disabled`，而 skopeo 的 `--tls-verify=false` **同时**覆盖「明文 HTTP」与「自签 HTTPS」两种场景——一个值映射不了两个语义。当前选 `disabled`（明文 HTTP），代价是自签证书在这条路径下不适用，因此该组合生效时会打印一条说明。改这里之前先想清楚要放弃哪一个
+
+- **给某条路径补「另一个工具也能读懂」的配置时，先确认工具认哪些名字**。`registry_host_of` 对 Docker Hub 返回 `docker.io`，而 regclient **认**这个名字（映射到 `registry-1.docker.io` 后照样套用注入的设置），不会因为「名字对不上」而无害地忽略——所以对 Docker Hub 这类只走 HTTPS 的仓库要显式跳过注入
 
 ## Quality Check
 

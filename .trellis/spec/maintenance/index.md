@@ -44,6 +44,17 @@ v1.7.0 真实踩过两次）。合并后核对 issue 是否自动关闭。
 - `gh` / `git push` 失败就重试（间隔递增）。重试前**先读报错原文**——「must first push the current branch to a remote」是分支不在 origin，重试 20 次也不会好；加 `--head <owner>:<branch>` 一次就过
 - HTTPS 对 github.com 不稳定时先试 SSH：`ssh -T git@github.com` 十几秒可验证；用临时 remote 兜底（`git remote add ssh-origin ...`，用完删除），不动使用者的 `origin` 配置
 
+## 改动 CI 步骤
+
+- **新增步骤前，先搜一遍这个 job 里已经有什么。** 集成测试 job 已经跑着不少脚手架（本地 registry、带 htpasswd 的私有源、多平台源索引），新用例常常应当**复用**而不是重建。2026-09-23 真实踩到：为 regctl 路径的私有源用例新起了一个 `registry-auth` 容器，而 job 里早已有一个同名同端口（5001）的。两条用例都红，报的是 `Conflict. The container name "/registry-auth" is already in use`——**而它看起来像是新用例自己的问题**
+- **容器名与端口是 job 内共享的资源**，不是步骤私有的。动手前先 `grep -n 'registry-auth\|<端口>' .github/workflows/ci.yml`
+- **`docker run` 失败是 `exit 125`，不是「测试失败」**。名字冲突、端口占用都先炸在这里，日志里只有 docker 的英文报错；新步骤要么用自己的容器名，要么明确复用，别让下一个人再猜一次
+- **复用别人启动的容器，位置就必须排在它之后**。写完用下面这条把步骤顺序打出来核对，比肉眼读 YAML 可靠：
+
+  ```bash
+  ruby -ryaml -e 'YAML.load_file(".github/workflows/ci.yml")["jobs"]["integration-test"]["steps"].map { |s| s["name"] }.compact.each_with_index { |n,i| puts "#{i+1}. #{n}" }'
+  ```
+
 ## 文档同步
 
 改了行为不改文档等于没有改。参数变化 → `--help` + `docs/USAGE.md`（场景编号顺延）+
