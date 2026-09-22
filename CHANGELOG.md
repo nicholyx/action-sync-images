@@ -9,6 +9,8 @@
 
 ## [Unreleased]
 
+## [1.19.2] - 2026-09-23
+
 ### 修复
 
 - **`--strip-attestation` 下 `--tls-verify false` 与源仓库凭证不再被静默忽略**（[#120](https://github.com/nicholyx/action-sync-images/issues/120)）。regctl 路径（`sync_via_regctl`）此前只构造 `regctl index create <dest> --ref <src> --platform …`，既不传 TLS 也不传凭证——而这两样在 skopeo 路径上都有。后果分两类：自建 HTTP / 自签仓库的使用者**根本用不了**这个模式（报 `server gave HTTP response to HTTPS client`，尽管参数已显式传了）；配了 `--src-username` / `--src-password` / `--src-credentials` 的私有上游会拿到 `no credentials available: unauthorized`，**而日志里还照常写着「源仓库凭证已装载」**——把排查引向完全错误的方向。两者都属于「显式传入却不生效」，正是本项目明确定为比直接报错更危险的那种失败
