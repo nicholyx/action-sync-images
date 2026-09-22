@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/engine/index.md", "reason": "断言可信度那几条：AC1/AC2/AC3 都要用 mock curl 制造失败，必须确认断言不是恒真的（例如 mock 没生效时「重试成功」照样打印），也不是对正确实现假报错的"}
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "核对实现有没有踩已知的 bash 坑：包装函数吞退出码、命令替换是子 shell、管道接 tail 后 if 判错退出码、空数组 + set -u"}
+{"file": ".trellis/spec/maintenance/index.md", "reason": "「容器名与端口是 job 内共享资源」与「新增 CI 步骤前先搜一遍 job 里已有什么」——本任务若动 ci.yml 需按此核对"}

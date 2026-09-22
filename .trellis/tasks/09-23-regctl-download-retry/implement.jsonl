@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "本改动全部落在 bash 上：退出码语义（第三方工具 jq/curl 的退出码不得冒成脚本的退出码）、函数被 sed 抽取执行时须自包含（ensure_regctl 会被 CI 抽取吗——写之前先确认）、空数组与 set -u、以及「多命令串联时前一步失败不中断后续」这条不可逆操作的教训"}
+{"file": ".trellis/spec/engine/index.md", "reason": "本层的既有模式与 Quality Check 清单：断言不得恒真也不得对正确实现假报错；真实路径的行为要进 CI；每条 CI 断言先在本地复现"}
+{"file": ".trellis/spec/maintenance/index.md", "reason": "收尾阶段的文档同步清单与 CHANGELOG 锚点归属校验；以及新增的「改动 CI 步骤」一节（本任务若碰 ci.yml 需要）"}

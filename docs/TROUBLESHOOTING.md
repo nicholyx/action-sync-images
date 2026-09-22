@@ -356,6 +356,57 @@ GitHub 官方的 `ubuntu-latest` 运行器**预装了 skopeo**，正常情况下
 
 ---
 
+## 错误：`regctl 下载失败（已重试一次）`
+
+### 现象
+
+```text
+[警告] regctl 下载失败，重试一次（多为网络抖动）...
+[错误] regctl 下载失败（已重试一次）：https://github.com/regclient/regclient/releases/download/v0.11.6/regctl-linux-amd64。多为网络原因，稍后重跑即可
+```
+
+### 原因
+
+用 `--strip-attestation` 时需要 `regctl`，脚本会从 GitHub release 下载到 `$HOME/.regclient/bin`。
+
+**这条下载已经重试过一轮**（间隔 5 秒）。两次都失败，说明多半不是一次瞬时抖动：跑在封锁 GitHub releases 的网络里、代理需要额外配置、或者 GitHub 自身故障。
+
+### 解决
+
+1. **先原样重跑一次**。抖动窗口有时比 5 秒长，CI 上尤其如此
+2. **手动放一份**。脚本只在 `command -v regctl` **不命中**时才下载，所以把二进制放进 `PATH` 里的任意位置就能完全跳过这条路径：
+
+   ```bash
+   # 版本要与脚本固定的那个一致，见 scripts/sync.sh 的 REGCTL_VERSION
+   version="v0.11.6"
+   os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+   arch="$(uname -m)"
+   case "$arch" in                       # 注意：uname 给的是 x86_64/aarch64，
+     x86_64|amd64)  arch="amd64" ;;      # 而 release 上的文件名用的是 amd64/arm64
+     aarch64|arm64) arch="arm64" ;;
+   esac
+
+   mkdir -p "$HOME/.regclient/bin"
+   curl -fsSL "https://github.com/regclient/regclient/releases/download/${version}/regctl-${os}-${arch}" \
+     -o "$HOME/.regclient/bin/regctl"
+   chmod 755 "$HOME/.regclient/bin/regctl"
+   export PATH="$HOME/.regclient/bin:$PATH"   # 关键的一行，理由见下
+   ```
+
+   `$HOME/.regclient/bin` 默认**不在**使用者的 `PATH` 里——脚本下载完只是在自己进程内临时前置它。所以**光把文件放进那个目录不算数**：新起的 shell 里 `command -v regctl` 仍然不命中，脚本会再走一次下载路径（实测确认：只放文件、不加 `PATH` 时，`curl` 仍被调用了两次并以「已重试一次」失败）。CI 里对应的是把目录写进 `$GITHUB_PATH`——下载与 `chmod` 同上（注意把 `uname -m` 映射成 `amd64`/`arm64`），这一行才是关键：
+
+   ```yaml
+   - name: 准备 regctl
+     run: |
+       # …下载到 "$HOME/.regclient/bin/regctl" 并 chmod 755，同上…
+       echo "$HOME/.regclient/bin" >> "$GITHUB_PATH"
+   ```
+3. **确认能连到 GitHub**：拿报错里那个 URL 在浏览器或 `curl -I` 里试一次，能区分「网络策略」与「脚本问题」
+
+> ⚠️ **别把它当成「网络不好」一笔带过。** 这条报错此前是**一次失败就放弃**的（[#122](https://github.com/nicholyx/action-sync-images/issues/122)），看到它意味着两轮都没成——值得花一分钟看一眼 URL 是否可达。
+
+---
+
 ## 错误：`Permission denied` / `Resource not accessible by integration`
 
 ### 原因
