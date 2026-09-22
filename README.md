@@ -69,7 +69,7 @@
 - **可看趋势** —— `scripts/history.sh` 汇总历次报告，回答「哪个镜像总在失败」「哪个镜像一直落后 / 一直在漂移」
 - **可在本地复现** —— 同一套逻辑封装成 `scripts/sync.sh`，本地也能跑；`--dry-run` 会先输出源 → 目标同步计划，再打印实际命令
 - **目标仓库可配置** —— 换命名空间或区域不需要改代码
-- **静态检查齐全** —— actionlint + yamllint + shellcheck + 提交信息规范，`./scripts/lint.sh` 一键跑完
+- **静态检查齐全** —— actionlint + yamllint + shellcheck + zizmor（工作流安全扫描），`./scripts/lint.sh` 一键跑完；提交信息规范不在其中——CI 校的是 PR 标题，本地无从验证
 
 ---
 

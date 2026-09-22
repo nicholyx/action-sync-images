@@ -29,8 +29,10 @@ zizmor 在 CI 里盯着，但它不是万能的。
 - **无结构的简单替换**（如把 `@v7` 换成 `@<sha>`）→ 脚本批量安全
 - **涉及缩进/块结构的插入**（如给 step 加 `with:`）→ **逐个手工做**。批量脚本曾连续三次算错 `with:` 与 `uses:` 的层级关系弄坏 YAML
 - **heredoc 内容必须跟着 block scalar 的缩进走**——`run: |` 里的 heredoc 结束符也要缩进，否则 YAML 解析坏掉
-- 每次改完工作流：`./scripts/lint.sh`（含 actionlint + yamllint）之外跑 zizmor（本地容器）：
-  `docker run --rm -v "$PWD":/repo:ro ghcr.io/zizmorcore/zizmor:<版本> /repo --no-online-audits`
+- 每次改完工作流：跑 `./scripts/lint.sh`——**zizmor 已在其中**（docker + `ci.yml` 里 pin 的
+  那个版本，版本从 `ci.yml` 抽，不另写一份；基线 0 findings，豁免集中在 `.github/zizmor.yml`）。
+  单独跑同一件事才是：
+  `docker run --rm -v "$PWD":/repo:ro ghcr.io/zizmorcore/zizmor:<与 ci.yml 一致的版本> /repo --no-online-audits`
 
 ## CI 结构（ci.yml）
 

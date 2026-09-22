@@ -70,7 +70,7 @@ The runner sits overseas with direct access to all upstream registries. You clic
 - **Trends** — `scripts/history.sh` aggregates past reports to answer "which image keeps failing"
 - **Local reproduction** — the same logic ships as `scripts/sync.sh`; `--dry-run` shows a source → destination plan before printing real commands
 - **Configurable destination** — change namespace or region without touching code
-- **Full static checks** — actionlint + yamllint + shellcheck + commit conventions via `./scripts/lint.sh`
+- **Full static checks** — actionlint + yamllint + shellcheck + zizmor (workflow security scan) via `./scripts/lint.sh`. Commit conventions are *not* covered: CI validates the PR title, which does not exist before the PR is opened
 
 ---
 
