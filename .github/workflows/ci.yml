@@ -2344,6 +2344,136 @@ jobs:
           echo "✓ 下载重试正确（挽回计入 got / 全败如实报错 / 无附件与过期不重试）"
           echo "✓ 运行列表获取正确（失败重试一轮 / 全败报网络错 / 空列表原文案不重试）"
 
+      - name: 验证 regctl 下载的重试（mock curl）
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # #122 加的是「下载失败重试一轮」，而它的**成功路径** CI 每次运行都会
+          # 真实走到（runner 环境干净，command -v regctl 必然不命中）——被覆盖的
+          # 恰恰是新增的那条重试路径：它只在失败时触发，而抖动造不出来。
+          # 所以整体 mock 掉 curl，与上面 #97 的重试用例同一手法。
+          #
+          # 生产函数按惯例用 sed 抽取、跑在只有 stub 的上下文里。
+          WORK="$(mktemp -d)"
+          trap 'rm -rf "$WORK"' EXIT
+
+          sed -n '/^ensure_regctl()/,/^}/p' scripts/sync.sh > "${WORK}/fn.sh"
+          if [[ ! -s "${WORK}/fn.sh" ]]; then
+            echo "::error::未能从 sync.sh 抽出 ensure_regctl"
+            exit 1
+          fi
+
+          cat > "${WORK}/run.sh" <<'TESTCASE'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          source "${WORK}/fn.sh"
+
+          # 生产文件的日志函数（mock：写 stderr，文本即断言对象）
+          log_info() { printf '[信息] %s\n' "$*" >&2; }
+          log_warn() { printf '[警告] %s\n' "$*" >&2; }
+          log_ok()   { printf '[成功] %s\n' "$*" >&2; }
+          log_dim()  { printf '%s\n' "$*" >&2; }
+          die()      { printf '[错误] %s\n' "$*" >&2; exit 1; }
+
+          # 间隔的值不在断言范围（PRD 明确不做参数化），mock 掉让 CI 不白等 5 秒。
+          # 计数走文件而不是变量：ensure_regctl 在命令替换的子 shell 里执行，
+          # 子 shell 里对全局变量的赋值传不回父进程（bash 3.2 也没有关联数组）
+          sleep() {
+            local n
+            n="$(cat "${CALLS_DIR}/sleeps" 2>/dev/null || echo 0)"
+            echo $((n + 1)) > "${CALLS_DIR}/sleeps"
+          }
+
+          # mock curl：前 MOCK_FAIL_TIMES 次失败，并像真 curl -o 那样把**残缺内容**
+          # 写进目标文件——修复前的那条缺陷正是「失败后残缺文件躺在 ${bindir}/regctl
+          # 上」，断言要能抓住它
+          curl() {
+            local cnt out=""
+            cnt="$(cat "${CALLS_DIR}/calls" 2>/dev/null || echo 0)"
+            cnt=$((cnt + 1)); echo "$cnt" > "${CALLS_DIR}/calls"
+            while [[ $# -gt 0 ]]; do
+              case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac
+            done
+            if [[ "$cnt" -le "${MOCK_FAIL_TIMES:-0}" ]]; then
+              [[ -n "$out" ]] && printf 'PARTIAL-GARBAGE-NOT-A-BINARY' > "$out"
+              return 22
+            fi
+            [[ -n "$out" ]] && printf '#!/bin/sh\necho v0.11.6-MOCK\n' > "$out"
+            return 0
+          }
+
+          REGCTL_VERSION="v0.11.6"
+          # 限定 PATH 确保 command -v regctl 不命中——否则整条下载路径被跳过，
+          # 三条用例会「全绿」地什么都没测
+          export PATH="/usr/bin:/bin"
+
+          case_name="$1"
+          export CALLS_DIR="${WORK}/calls-${case_name}"
+          mkdir -p "$CALLS_DIR"
+          export HOME="${WORK}/home-${case_name}"
+          mkdir -p "$HOME"
+
+          case "$case_name" in
+            fail-then-ok) MOCK_FAIL_TIMES=1 ;;
+            always-fail)  MOCK_FAIL_TIMES=2 ;;
+            ok-first)     MOCK_FAIL_TIMES=0 ;;
+            *) echo "未知用例：$case_name" >&2; exit 1 ;;
+          esac
+          export MOCK_FAIL_TIMES
+
+          rc=0
+          out="$(ensure_regctl 2>&1)" || rc=$?
+          echo "$out"
+
+          calls="$(cat "${CALLS_DIR}/calls" 2>/dev/null || echo 0)"
+          sleeps="$(cat "${CALLS_DIR}/sleeps" 2>/dev/null || echo 0)"
+          target="${HOME}/.regclient/bin/regctl"
+          leftovers="$(find "${HOME}/.regclient/bin" -name '.regctl-dl.*' 2>/dev/null | wc -l | tr -d ' ')"
+          garbage="no"
+          [[ -e "$target" ]] && grep -q 'PARTIAL-GARBAGE' "$target" 2>/dev/null && garbage="yes"
+
+          fail() { echo "::error::$1"; exit 1; }
+
+          case "$case_name" in
+            fail-then-ok)
+              [[ "$rc" -eq 0 ]]        || fail "首败次成应成功（rc=${rc}）"
+              [[ "$calls" -eq 2 ]]     || fail "应调用 curl 两次（实际 ${calls}）"
+              [[ "$sleeps" -eq 1 ]]    || fail "应等待一次（实际 ${sleeps}）"
+              grep -q '重试成功' <<<"$out" || fail "应打印「重试成功」——重试过这件事必须可见"
+              [[ -x "$target" ]]       || fail "目标应可执行"
+              [[ "$garbage" == "no" ]] || fail "目标含残留的残缺内容"
+              ;;
+            always-fail)
+              [[ "$rc" -ne 0 ]]       || fail "两次都失败应以非零退出"
+              [[ "$calls" -eq 2 ]]    || fail "应重试一次、共两次（实际 ${calls}）"
+              grep -q '已重试一次' <<<"$out" || fail "报错应含「已重试一次」"
+              grep -q 'https://' <<<"$out"   || fail "报错应保留下载 URL"
+              [[ ! -e "$target" ]]    || fail "失败后目标不该存在（残缺文件会被后续运行误用）"
+              [[ "$leftovers" -eq 0 ]] || fail "不该有临时文件残留（${leftovers} 个）"
+              ;;
+            ok-first)
+              [[ "$rc" -eq 0 ]]     || fail "一次成功应 rc=0"
+              [[ "$calls" -eq 1 ]]  || fail "应只调用一次（实际 ${calls}）"
+              # 这条是对照：没有重试就不该打印「重试成功」——否则上面那条断言
+              # 在「无论重试与否都打印」的实现下同样会通过，等于没测
+              if grep -q '重试成功' <<<"$out"; then
+                fail "没有发生重试却打印了「重试成功」"
+              fi
+              [[ -x "$target" ]]    || fail "目标应可执行"
+              ;;
+          esac
+          echo "✓ ${case_name} 通过（calls=${calls} sleeps=${sleeps}）"
+          TESTCASE
+
+          export WORK
+          for c in fail-then-ok always-fail ok-first; do
+            echo "--- 用例：${c} ---"
+            bash "${WORK}/run.sh" "$c"
+          done
+          echo "✓ regctl 下载重试正确（首败次成 / 两次全败如实报错且不留残缺 / 一次成功不误报重试）"
+
       - name: 验证凭证映射文件
         run: |
           #!/usr/bin/env bash

@@ -110,6 +110,12 @@ SRC_CREDENTIALS_TMPFILE=""
 # 本次不需要——只有 --strip-attestation 且配了源凭证时才有内容。
 # 空时 sync_via_regctl 不加 env 前缀，命令与修复前逐字节一致。
 REGCTL_CRED_DIR=""
+# ensure_regctl 的下载临时文件（建在 bindir 内，成功后 mv 是同一文件系统内的
+# 原子替换）。下载之所以不直接写目标路径：curl -o 失败会留下**不完整文件**，
+# 而重试让「同一个固定名字被写两次」成为常态——半成品留在 PATH 前置目录里，
+# 后续运行或使用者手工调用都会撞上它。中断时由 cleanup() 删除（下载期间
+# cleanup 的 trap 还没装上，那段窗口由 ensure_regctl 内的临时退出陷阱兜住）。
+REGCTL_DL_TMPFILE=""
 # 多目标中转：prepare_oci_staging 的传出变量（不能用命令替换传——
 # 那是子 shell，赋值传不回父进程，set -u 下读会炸）
 OCI_STAGING_DIR=""
@@ -768,8 +774,12 @@ ensure_regctl() {
     return 0
   fi
 
-  # dry-run 不需要真的执行 regctl，也就不必下载
-  if [[ "$DRY_RUN" == "true" ]]; then
+  # dry-run 不需要真的执行 regctl，也就不必下载。
+  # 用 `:-` 兜底而不是裸引用：CI 会把这个函数按 sed 抽出、放进只有 stub 的
+  # 上下文里跑（见 ci.yml 的「验证 regctl 下载的重试」），那里没有运行级全局，
+  # `set -u` 下裸引用会当场 unbound variable。函数要能被独立调起，
+  # 未声明时按「非 dry-run」处理是它唯一合理的默认
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
     log_warn "未找到 regctl（dry-run 模式，仅提示不中断）"
     return 0
   fi
@@ -788,8 +798,46 @@ ensure_regctl() {
   url="https://github.com/regclient/regclient/releases/download/${REGCTL_VERSION}/regctl-${os}-${arch}"
   log_info "下载 regctl ${REGCTL_VERSION}（${os}/${arch}）..."
   mkdir -p "$bindir"
-  curl -fsSL "$url" -o "${bindir}/regctl" || die "regctl 下载失败：${url}"
-  chmod +x "${bindir}/regctl"
+
+  # 下载先落临时文件、成功后再原子替换到目标路径（R4）。curl -o 失败会留下
+  # 不完整的文件，而重试让「同一个固定名字被写两次」成为常态——半成品留在
+  # PATH 前置目录里会被后续运行或使用者手工调用撞上。临时文件建在 bindir 内，
+  # mv 因此是同一文件系统内的原子替换（跨设备时会退化成拷贝+删除）。
+  REGCTL_DL_TMPFILE="$(mktemp "${bindir}/.regctl-dl.XXXXXX")" || die "无法创建 regctl 下载临时文件"
+  # cleanup 的 trap 要到后面创建 WORK_DIR 时才安装，而本函数跑在它之前——
+  # 下载（尤其重试那 5 秒等待）期间中断就没人清这个临时文件了。所以这里单装
+  # 一个只做这件事的退出陷阱；后面的 `trap cleanup EXIT` 会把它替换掉，此后
+  # 由 cleanup 负责（见其中 REGCTL_DL_TMPFILE 那一行）。刻意不直接调用
+  # cleanup：它依赖尚未创建的 WORK_DIR 等运行级全局，本函数要能单独抽取执行。
+  trap 'rm -f "${REGCTL_DL_TMPFILE:-}"' EXIT
+  local dl_rc=0
+  curl -fsSL "$url" -o "$REGCTL_DL_TMPFILE" || dl_rc=$?
+
+  # 重试一轮的取舍与 #97 / #122 同口径：间隔固定 5 秒、不做参数化。
+  # 重试有上限而非「重试到成功」——无上限会让 URL 失效、版本不存在这类
+  # 真正的配置错误变成一次长时间挂起。
+  if [[ "$dl_rc" -ne 0 ]]; then
+    log_warn "regctl 下载失败，重试一次（多为网络抖动）..."
+    sleep 5
+    dl_rc=0
+    curl -fsSL "$url" -o "$REGCTL_DL_TMPFILE" || dl_rc=$?
+    [[ "$dl_rc" -eq 0 ]] && log_info "重试成功"
+  fi
+
+  if [[ "$dl_rc" -ne 0 ]]; then
+    rm -f "$REGCTL_DL_TMPFILE"
+    REGCTL_DL_TMPFILE=""
+    die "regctl 下载失败（已重试一次）：${url}。多为网络原因，稍后重跑即可"
+  fi
+
+  mv -f "$REGCTL_DL_TMPFILE" "${bindir}/regctl"
+  REGCTL_DL_TMPFILE=""
+  # 显式 755 而不是 chmod +x：mktemp 建的临时文件是 600，+x 只会得到 711，
+  # 与改动前（curl 按 umask 建出 644，再 +x 得 755）不一致。成功路径的行为
+  # 不在这次改动的范围内，权限也不该顺带变——取常见 umask 022 下的结果。
+  # （umask 077 时改动前是 700、这里是 755；两种 umask 下 chmod 都对不上，
+  #  与其猜不如固定成「PATH 里一份可执行文件」该有的样子。）
+  chmod 755 "${bindir}/regctl"
   export PATH="${bindir}:${PATH}"
   log_ok "regctl 已就绪：$(regctl version --format '{{.VCSTag}}' 2>/dev/null || echo "$REGCTL_VERSION")"
 }
@@ -1538,6 +1586,7 @@ cleanup() {
   [[ -n "${SRC_CRED_ENTRIES:-}" ]] && rm -f "$SRC_CRED_ENTRIES"
   [[ -n "${SRC_CREDENTIALS_TMPFILE:-}" ]] && rm -f "$SRC_CREDENTIALS_TMPFILE"
   [[ -n "${REGCTL_CRED_DIR:-}" ]] && rm -rf "$REGCTL_CRED_DIR"
+  [[ -n "${REGCTL_DL_TMPFILE:-}" ]] && rm -f "$REGCTL_DL_TMPFILE"
   [[ -n "${WORK_DIR:-}" ]] && rm -rf "$WORK_DIR"
   return 0
 }
@@ -3869,10 +3918,25 @@ main() {
     fi
   fi
 
+  # 本次运行会不会**真的走** regctl 路径：--check-updates 与 --audit-lock 都只读
+  # 上游 / 锁文件，各自的不生效列表里已经列出 --strip-attestation，它们根本不经过
+  # sync_via_regctl（--audit 与 --strip-attestation 互斥，上面已 die，不在此列）。
+  #
+  # 挂在这个条件上的有三处：下面「要不要下载 regctl」、后面的明文 HTTP 告警、
+  # 以及 regctl 专属的失效参数告警。三处必须同源——先说「--strip-attestation
+  # 本次不生效」、紧接着又说「regctl 路径下……映射为明文 HTTP」，等于自相矛盾；
+  # 而各写一遍条件就是「改一处漏一处」的温床，那是本项目记过的典型故障。
+  local regctl_path_active="false"
+  if [[ "$STRIP_ATTESTATION" == "true" && "$CHECK_UPDATES" != "true" && -z "$AUDIT_LOCK_FILE" ]]; then
+    regctl_path_active="true"
+  fi
+
   ensure_skopeo
   ensure_jq
   setup_timeout
-  if [[ "$STRIP_ATTESTATION" == "true" ]]; then
+  # 只有真会走 regctl 路径时才要它。少了这个条件，检查模式会平白下载一次
+  # regctl——没有网络的环境里还会以「下载失败」退出 1，而它压根不需要这个工具。
+  if [[ "$regctl_path_active" == "true" ]]; then
     ensure_regctl
   fi
   if [[ "$DRY_RUN" == "true" ]]; then
@@ -3896,16 +3960,6 @@ main() {
   # 凭证依赖最终的镜像列表（未指定 --src-registry 时要从里面推导 host），
   # 因此放在筛选之后——被筛掉的镜像不该影响凭证要发给谁
   setup_src_auth
-  # 本次运行会不会**真的走** regctl 路径：--check-updates 与 --audit-lock 都只读
-  # 上游 / 锁文件，各自的不生效列表里已经列出 --strip-attestation，它们根本不经过
-  # sync_via_regctl（--audit 与 --strip-attestation 互斥，上面已 die，不在此列）。
-  # 下面几处 regctl 专属的输出都挂在这个条件上：先说「--strip-attestation 本次
-  # 不生效」、紧接着又说「regctl 路径下……映射为明文 HTTP」，等于自相矛盾——
-  # 错误的信息比没有信息更糟。
-  local regctl_path_active="false"
-  if [[ "$STRIP_ATTESTATION" == "true" && "$CHECK_UPDATES" != "true" && -z "$AUDIT_LOCK_FILE" ]]; then
-    regctl_path_active="true"
-  fi
 
   # regctl 读不了 SRC_AUTHFILE 的格式，把源凭证与使用者的 docker 配置合并成
   # 它认的那份临时 DOCKER_CONFIG 目录。凭证在启动时即固定，只准备一次。
