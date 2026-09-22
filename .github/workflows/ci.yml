@@ -2404,7 +2404,13 @@ jobs:
             return 0
           }
 
-          REGCTL_VERSION="v0.11.6"
+          # 版本从生产文件抽，不在夹具里写死。写死会在升级 REGCTL_VERSION 时
+          # 静默漂移（不红也不报，断言照过），而这里本来就要顺带钉住下载 URL 的形状
+          REGCTL_VERSION="$(sed -n 's/^REGCTL_VERSION="\(.*\)"$/\1/p' scripts/sync.sh | head -n1)"
+          if [[ -z "$REGCTL_VERSION" ]]; then
+            echo "::error::未能从 scripts/sync.sh 抽出 REGCTL_VERSION"
+            exit 1
+          fi
           # 限定 PATH 确保 command -v regctl 不命中——否则整条下载路径被跳过，
           # 三条用例会「全绿」地什么都没测
           export PATH="/usr/bin:/bin"
@@ -2444,12 +2450,18 @@ jobs:
               grep -q '重试成功' <<<"$out" || fail "应打印「重试成功」——重试过这件事必须可见"
               [[ -x "$target" ]]       || fail "目标应可执行"
               [[ "$garbage" == "no" ]] || fail "目标含残留的残缺内容"
+              # 成功路径也要查临时文件：只查 -x 会放过「mv 写成 cp」这类
+              # （成功、但把临时文件留在目录里），而那正是这个用例该守的东西
+              [[ "$leftovers" -eq 0 ]] || fail "成功路径不该留下临时文件（${leftovers} 个）"
               ;;
             always-fail)
               [[ "$rc" -ne 0 ]]       || fail "两次都失败应以非零退出"
               [[ "$calls" -eq 2 ]]    || fail "应重试一次、共两次（实际 ${calls}）"
               grep -q '已重试一次' <<<"$out" || fail "报错应含「已重试一次」"
-              grep -q 'https://' <<<"$out"   || fail "报错应保留下载 URL"
+              # 断言的是**指向所固定版本**的那个 URL，不只是「有个 https 链接」——
+              # 后者在 URL 拼错、版本占位符没替换时同样会通过
+              grep -q "releases/download/${REGCTL_VERSION}/regctl-" <<<"$out" \
+                || fail "报错应含指向 ${REGCTL_VERSION} 的下载 URL"
               [[ ! -e "$target" ]]    || fail "失败后目标不该存在（残缺文件会被后续运行误用）"
               [[ "$leftovers" -eq 0 ]] || fail "不该有临时文件残留（${leftovers} 个）"
               ;;
