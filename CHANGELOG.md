@@ -9,6 +9,8 @@
 
 ## [Unreleased]
 
+## [1.19.5] - 2026-09-23
+
 ### 修复
 
 - **`check-commit-msg.sh` 的 `--range` 不再对无效区间静默放行**（[#132](https://github.com/nicholyx/action-sync-images/issues/132)）。`git log` 的 stderr 被 `2>/dev/null` 丢掉，于是**「区间无效」与「区间内没有提交」混成同一种「读到 0 条」**——两者都打印「全部合规（共检查 0 条）」并 exit 0。而脚本 header 推荐的本地用法 `--range origin/main..HEAD`，在刚 clone、没 fetch 过 remote-tracking ref、或 detached HEAD 时**正是这个形态**，会静默放行。这与项目记过的「恒真的断言比没有断言更糟」是同一族：**0 条检查结果冒充「全部合规」**
