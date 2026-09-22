@@ -130,7 +130,7 @@ if [[ -n "$PLATFORMS" ]];        then args+=(--platforms "$PLATFORMS"); fi
 ```text
 解析参数
    │
-   ├─ 校验：--dest 和 --dest-exact 至少给一个
+   ├─ 校验：--dest / --dest-keep-path / --dest-exact 至少给一个
    ├─ 规范化：去掉可能误带的 docker:// 前缀和结尾斜杠
    │
    ├─ 检查依赖：skopeo 必须存在；jq 可选；strip 模式下才需要 regctl
