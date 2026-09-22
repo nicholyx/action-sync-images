@@ -278,6 +278,154 @@ jobs:
           fi
           echo "✓ 只读检查模式不渲染同步计划"
 
+      - name: 验证 --file 清单解析
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # --file / -f / --source-file 走的是 collect_images 的文件解析分支，
+          # 也是两个生产工作流（sync-images-batch.yml、check-registry.yml）的正式入口，
+          # 此前整条路径零覆盖。
+          #
+          # 断言一律断「数量 + 内容」两件事。解析分六步——整行注释剥离、行尾注释剥离、
+          # 空行跳过、首尾空白 trim、去重保序、以及与 --src 合并——其中任何一步退化都可能
+          # 让**数量碰巧不变而内容已错**，只断数量就会被静默放过。实测（删掉尾部 trim）：
+          # 带空白的引用被判为非法而**整条掉出计划**、脚本以 2 退出，而
+          # 「待同步镜像 2 个」照旧——那条只断数量的断言依然是绿的。
+          #
+          # 断内容断的是计划映射行 `[i] src → dest` 的**原文**：dry-run 复述的就是真正
+          # 会执行的命令参数，源名或目标名多一个字符都对不上。
+
+          # 输出与退出码都要看，所以用全局变量传出（命令替换是子 shell，函数里赋值传不回
+          # 调用方）。也不能写 out="$(...)" 再靠 set -e 兜底：解析退化时脚本会以非零退出，
+          # 而命令替换把它的输出一并吞掉，日志里只剩一条没有上下文的失败——排查的人
+          # 正是最需要看到「清单被解析成了什么」的那个。
+          OUT=""
+          CODE=0
+          run_sync() {
+            set +e
+            OUT="$(./scripts/sync.sh "$@" 2>&1)"
+            CODE=$?
+            set -e
+          }
+
+          fail() {
+            echo "::error::$1"
+            printf '%s\n' "$OUT"
+            exit 1
+          }
+
+          # 期望解析成功：退出码 0，数量对，且清单里**每一个**镜像都出现在计划里。
+          # $1 用例说明，$2 期望镜像个数，$3 seq/any，其余为清单中的镜像。
+          #
+          # seq 连计划序号一起断（`[1] a → …`），顺带锁住「去重保序」——第 i 个输入必须
+          # 落在第 i 条计划上。any 只要求出现过：合并语义里 --src 与清单的先后不是契约，
+          # 锁它就成了对正确实现的假报错。
+          assert_parsed() {
+            local desc="$1" expect="$2" mode="$3"; shift 3
+            local i=0 src pattern
+            [[ "$CODE" -eq 0 ]] || fail "${desc}：期望退出码 0，实际 ${CODE}"
+            grep -qF -- "待同步镜像 ${expect} 个" <<<"$OUT" \
+              || fail "${desc}：期望待同步镜像 ${expect} 个"
+            for src in "$@"; do
+              i=$((i + 1))
+              pattern="${src} → r.example.com/x/${src}"
+              if [[ "$mode" == "seq" ]]; then
+                pattern="[${i}] ${pattern}"
+              fi
+              grep -qF -- "$pattern" <<<"$OUT" \
+                || fail "${desc}：计划里没有「${pattern}」"
+            done
+          }
+
+          # 期望解析失败：退出码 1 **且**报错文案对得上。两类「清单不可用」的退出码都是 1，
+          # 含义却完全不同——文件不存在要人去核对路径，内容为空要人去看清单本身——所以
+          # 只断退出码等于把两者混成一条。$3 是**不该出现**的另一条文案。
+          assert_rejected() {
+            local desc="$1" expect="$2" other="$3"
+            [[ "$CODE" -eq 1 ]] || fail "${desc}：期望退出码 1，实际 ${CODE}"
+            grep -qF -- "$expect" <<<"$OUT" || fail "${desc}：输出里没有「${expect}」"
+            if grep -qF -- "$other" <<<"$OUT"; then
+              fail "${desc}：误报了「${other}」"
+            fi
+          }
+
+          work="$(mktemp -d)"
+
+          # ---- 六项解析行为：每项一个独立清单 ----
+          # 不合并成一个「大杂烩」清单：那样任何一步退化都只表现为数量变了，指不出坏在
+          # 哪一步，也没法对单点变异做验证。
+
+          # ① 整行注释剥离（# 起头的整行都不是镜像）
+          printf '# 这是整行注释\nnginx:1.27\n# 另一行注释\nredis:7.4\n' > "${work}/whole-comment.txt"
+          run_sync --file "${work}/whole-comment.txt" --dest r.example.com/x --dry-run
+          assert_parsed "整行注释必须被剥离" 2 seq nginx:1.27 redis:7.4
+          echo "✓ 整行注释被剥离"
+
+          # ② 行尾注释剥离（含制表符分隔的注释）。顺带覆盖短选项 -f。
+          # 第二行故意让注释里再出现一个 #（写 issue 号是常见写法）：行内注释从
+          # **第一个** # 起截断，所以 `%%#*` 才是对的；换成 `%#*`（从最后一个 # 截）
+          # 会留下 `redis:7.4\t# 制表符后的注释` 这样一段非法引用。锁文件的解析器
+          # （`parse_lockfile`）用的是同一套规则，并注明「与 --file 的读取规则一致」。
+          printf 'nginx:1.27 # 行尾注释\nredis:7.4\t# 制表符后的注释 #135\n' > "${work}/trailing-comment.txt"
+          run_sync -f "${work}/trailing-comment.txt" --dest r.example.com/x --dry-run
+          assert_parsed "行尾注释必须被剥离（-f）" 2 seq nginx:1.27 redis:7.4
+          echo "✓ 行尾注释被剥离"
+
+          # ③ 空行跳过（首、中、尾都放上空行）。顺带覆盖长选项 --source-file。
+          printf '\nnginx:1.27\n\n\nredis:7.4\n\n' > "${work}/blank-lines.txt"
+          run_sync --source-file "${work}/blank-lines.txt" --dest r.example.com/x --dry-run
+          assert_parsed "空行必须被跳过（--source-file）" 2 seq nginx:1.27 redis:7.4
+          echo "✓ 空行被跳过"
+
+          # ④ 首尾空白 trim。这条**只能断内容**：删掉 trim 后「待同步镜像 2 个」照旧，
+          # 而带空白的引用被判为非法、整条掉出计划（脚本以 2 退出）。只断数量的断言
+          # 在这里是绿的，所以映射行必须逐条断原文。
+          printf '  nginx:1.27  \n\t redis:7.4\t\n' > "${work}/padding.txt"
+          run_sync --file "${work}/padding.txt" --dest r.example.com/x --dry-run
+          assert_parsed "首尾空白必须被去掉" 2 seq nginx:1.27 redis:7.4
+          echo "✓ 首尾空白被去掉"
+
+          # ⑤ 去重保序。只断数量不够：换成 sort -u 去重，数量照样对、顺序却变了，
+          # 所以第二个清单故意让先出现的那个不是字典序靠前的。
+          printf 'nginx:1.27\nnginx:1.27\n' > "${work}/duplicate.txt"
+          run_sync --file "${work}/duplicate.txt" --dest r.example.com/x --dry-run
+          assert_parsed "重复项必须去重" 1 seq nginx:1.27
+          printf 'redis:7.4\nnginx:1.27\nredis:7.4\n' > "${work}/order.txt"
+          run_sync --file "${work}/order.txt" --dest r.example.com/x --dry-run
+          assert_parsed "去重必须保持原有顺序" 2 seq redis:7.4 nginx:1.27
+          echo "✓ 重复项被去重且顺序保持"
+
+          # ---- 两类「清单不可用」是两条不同的报错 ----
+          # 退出码相同（1），含义完全不同，所以文案必须分别断：只断退出码等于把
+          # 「路径写错了」和「清单是空的」混成一条，而使用者要做的下一步完全不同。
+
+          # ⑥ 文件不存在
+          run_sync --file "${work}/absent.txt" --dest r.example.com/x --dry-run
+          assert_rejected "文件不存在" "镜像清单文件不存在：${work}/absent.txt" "没有提供任何源镜像"
+          echo "✓ 文件不存在时报的是路径"
+
+          # ⑦ 内容为空：空文件 / 纯空白 / 只有注释，三条都要落到「没有源镜像」
+          printf '' > "${work}/empty.txt"
+          printf '   \n\t\n' > "${work}/blank-only.txt"
+          printf '# 只有注释\n# 又一行注释\n' > "${work}/comment-only.txt"
+          for f in empty blank-only comment-only; do
+            run_sync --file "${work}/${f}.txt" --dest r.example.com/x --dry-run
+            assert_rejected "清单 ${f} 内容为空" "没有提供任何源镜像" "镜像清单文件不存在"
+          done
+          echo "✓ 空文件 / 纯空白 / 纯注释都报「没有提供任何源镜像」"
+
+          # ---- 合并语义：--src 与 --file 是**合并**，不是替换 ----
+          # ARCHITECTURE 把这条当作一个必须解释的坑记着，此前没有任何测试保护。
+          # 断言必须**分别**看到 --src 的镜像与清单里的镜像：只断总数（2 个）的话，
+          # 实现退化成「替换」而这个清单恰好有 2 行时，断言会恒真。
+          printf 'redis:7.4\n' > "${work}/merge.txt"
+          run_sync --src nginx:1.27 --file "${work}/merge.txt" --dest r.example.com/x --dry-run
+          assert_parsed "--src 与 --file 必须合并" 2 any nginx:1.27 redis:7.4
+          echo "✓ --src 与 --file 是合并而非替换"
+
+          echo "✓ --file 清单解析全部断言通过"
+
       - name: 验证报告 JSON 转义与字段类型
         run: |
           #!/usr/bin/env bash
