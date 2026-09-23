@@ -1000,6 +1000,325 @@ jobs:
           fi
           echo "✓ 未知类型只告警、不发送"
 
+      - name: 验证通知送达判定（按平台解析响应体）
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # HTTP 码只说明「对方应答了」，而钉钉与飞书恰恰在 HTTP 200 的响应体里报错
+          # （Issue #159）：改前的判定是 `[[ "$http_code" =~ ^2 ]]`，于是「平台侧拒收」
+          # 被报成「结果已推送到」。判定的对错只能靠喂不同响应体来分辨，
+          # 所以把生产函数整段抽出来（CI 里已有的做法，见「验证重跑指引」那一步）。
+          #
+          # 抽取面要求函数自包含：下面以 `set -u` 运行，它若引用了运行级全局变量
+          # （WORK_DIR 之类），这一项会当场 unbound variable。
+          fail() { echo "::error::$1"; exit 1; }
+
+          sed -n '/^notify_delivery_verdict()/,/^}/p' scripts/sync.sh > /tmp/notify-verdict-fn.sh
+          [[ -s /tmp/notify-verdict-fn.sh ]] || fail "没能从 sync.sh 抽出 notify_delivery_verdict（函数改名了？）"
+          [[ "$(tail -n 1 /tmp/notify-verdict-fn.sh)" == "}" ]] \
+            || fail "抽出的片段没有以函数的收尾大括号结束（函数里出现了顶格的 } ？）"
+          # shellcheck disable=SC1091
+          source /tmp/notify-verdict-fn.sh
+
+          # 判定同时写到 stdout 与全局变量：stdout 供独立验证，全局变量供调用方读
+          # （调用方**不能**用命令替换取值——那是子 shell，赋值传不回父进程）。
+          # 三处都比对，「stdout 对了但全局变量忘了写」这类半吊子实现才拦得住。
+          out_file=/tmp/notify-verdict-stdout.txt
+          check() {
+            local desc="$1" type="$2" http_code="$3" body="$4" want_verdict="$5" want_detail="$6"
+            local body_file got_out got_verdict got_detail
+            body_file="$(mktemp)"
+            printf '%s' "$body" > "$body_file"
+            NOTIFY_VERDICT=""
+            NOTIFY_VERDICT_DETAIL=""
+            notify_delivery_verdict "$type" "$http_code" "$body_file" > "$out_file"
+            got_out="$(cat "$out_file")"
+            got_verdict="$NOTIFY_VERDICT"
+            got_detail="$NOTIFY_VERDICT_DETAIL"
+            rm -f "$body_file"
+            [[ "$got_out" == "$want_verdict" ]] \
+              || fail "${desc}：stdout 结论应为 ${want_verdict}，实际「${got_out}」"
+            [[ "$got_verdict" == "$want_verdict" ]] \
+              || fail "${desc}：NOTIFY_VERDICT 应为 ${want_verdict}，实际「${got_verdict}」"
+            [[ "$got_detail" == "$want_detail" ]] \
+              || fail "${desc}：详情应为「${want_detail}」，实际「${got_detail}」"
+            echo "✓ ${desc} → ${got_verdict}${got_detail:+（${got_detail}）}"
+          }
+
+          # ---- 非 2xx：连不上（000）与网关错误页，先判、不去解析响应体 ----
+          check "连接失败（000）" dingtalk 000 '' rejected 'HTTP 000'
+          check "500 + 错误页首行" generic 500 'upstream error' rejected 'HTTP 500，upstream error'
+          # 响应体进日志要限长：代理的错误页可能有几十 KB
+          long_body="$(printf 'x%.0s' {1..300})"
+          long_kept="$(printf 'x%.0s' {1..200})"
+          check "500 + 超长首行只留 200 字符" generic 500 "$long_body" rejected "HTTP 500，${long_kept}"
+          # 详情直接进 GitHub 注解，而注解按行解析：平台侧文本里的换行必须压掉，
+          # 否则后半段会被当成另一条工作流命令
+          check "500 + CRLF 首行只留一行" generic 500 $'bad gateway\r\nmore' rejected 'HTTP 500，bad gateway'
+
+          # ---- 钉钉：成败在响应体的 errcode 里，不在 HTTP 码里 ----
+          # 正对照：errcode 0 必须判「平台已确认送达」。没有它，一个「永远 rejected」
+          # 的实现也能让下面每条失败用例全绿。
+          check "钉钉 200 + errcode 0（正对照）" dingtalk 200 '{"errcode":0,"errmsg":"ok"}' confirmed ''
+          check "钉钉 200 + errcode 310000（关键词不命中）" dingtalk 200 \
+            '{"errcode":310000,"errmsg":"keywords not in content"}' \
+            rejected 'errcode=310000 errmsg=keywords not in content'
+          check "钉钉 200 + errcode 非 0 且无 errmsg" dingtalk 200 '{"errcode":300001}' rejected 'errcode=300001'
+          # jq -r 会把 JSON 里的 \n 还原成真换行（实测如此），平台侧文本因此可能
+          # 带换行——详情压成单行是进入 GitHub 注解的前提
+          check "钉钉 200 + errmsg 含换行（压成单行）" dingtalk 200 \
+            '{"errcode":310000,"errmsg":"first\nsecond"}' rejected 'errcode=310000 errmsg=first second'
+
+          # ---- 飞书：字段叫 code，StatusCode 只是回退 ----
+          check "飞书 200 + code 0（正对照）" feishu 200 '{"code":0,"msg":"success","data":{}}' confirmed ''
+          check "飞书 200 + code 11232（限流）" feishu 200 '{"code":11232,"msg":"rate limit"}' \
+            rejected 'code=11232 msg=rate limit'
+          check "飞书 200 + code 缺失时回退 StatusCode" feishu 200 \
+            '{"StatusCode":0,"StatusMessage":"success"}' confirmed ''
+          check "飞书 200 + 回退字段报错" feishu 200 '{"StatusCode":9499,"StatusMessage":"rate limit"}' \
+            rejected 'StatusCode=9499 msg=rate limit'
+
+          # ---- 无法判定：独立成类，绝不默认成功 ----
+          check "钉钉 200 + 非 JSON（代理错误页）" dingtalk 200 '<html>502 Bad Gateway</html>' \
+            undetermined '响应体不是 JSON'
+          check "飞书 200 + 非 JSON" feishu 200 '<html>502 Bad Gateway</html>' undetermined '响应体不是 JSON'
+          check "钉钉 200 + JSON 里没有 errcode" dingtalk 200 '{"foo":"bar"}' \
+            undetermined '响应体里没有 errcode 字段'
+          check "飞书 200 + JSON 里没有 code" feishu 200 '{"foo":"bar"}' undetermined '响应体里没有 code 字段'
+          check "钉钉 200 + 空体" dingtalk 200 '' undetermined '响应体为空'
+          check "飞书 200 + 空体" feishu 200 '' undetermined '响应体为空'
+          # `null` 是**合法** JSON，只是取值本身为假。判「能不能解析」不能用
+          # `jq -e .`——它在 null / false 上返回非零，会把「能解析」读成「不是 JSON」，
+          # 于是给出的原因与事实不符（判定同为 undetermined，但排查方向被带偏）。
+          # 仓库在 regctl 凭证合并那处已经记过这一条。
+          check "钉钉 200 + 裸 null（合法 JSON 但不是对象）" dingtalk 200 'null' \
+            undetermined '响应体里没有 errcode 字段'
+          check "未知类型不默认成功" bogus 200 'ok' undetermined '未知的通知类型：bogus'
+
+          # ---- Slack：回执是纯文本，不是 JSON ----
+          check "Slack 200 + ok（正对照）" slack 200 'ok' confirmed ''
+          check "Slack 200 + invalid_payload" slack 200 'invalid_payload' rejected 'invalid_payload'
+          check "Slack 200 + 空体" slack 200 '' undetermined '响应体为空'
+          # 透明代理返回的 200 HTML 错误页走的是同一条路径。它不是 Slack 的回执，
+          # 报成「平台拒收」会把排查方向带偏到机器人配置上——AC3 要求「响应体不是
+          # 预期结构」单独成「无法判定」，对 Slack 一样成立。
+          check "Slack 200 + HTML（透明代理的错误页）" slack 200 '<html>502 Bad Gateway</html>' \
+            undetermined '响应体不是 Slack 的预期回执（<html>502 Bad Gateway</html>）'
+
+          # ---- generic：自建 webhook 没有可依据的回执契约，不猜它的成败 ----
+          # 200 空体是本项目明确保留的边界：**必须继续算成功**，不能因为解析不了
+          # 就报失败。
+          check "generic 200 + 空体（自建 webhook 的常态）" generic 200 '' accepted '该类型无统一回执'
+          check "generic 200 + 任意响应体" generic 200 '{"whatever":true}' accepted '该类型无统一回执'
+
+          echo "NOTIFY-VERDICT-OK"
+
+      - name: 验证通知送达判定的端到端行为
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 抽取式单测证不了「响应体真的被交给了判定」——把 `-o "$body_file"` 改回
+          # `-o /dev/null`，判定看到的永远是空文件，而上面的单测照样全绿。
+          # 所以真发一次：让假 webhook 给出不同的响应体，看脚本怎么讲。
+          #
+          # 不能加 --dry-run（干跑不发通知，通知的对象不存在）；用非法引用造失败，
+          # 不需要 registry、也不联网。
+          fail() { echo "::error::$1"; exit 1; }
+
+          # 端口是 job 内共享的资源：8896 / 8897 / 8898 / 8899 已被本 job 其它步骤占用。
+          # 四个用例的响应体各不相同，改行为就重启服务器——不在同一个端口上复用响应内容。
+          hook_port=8895
+          cat > /tmp/hook-verdict.py <<'PY'
+          import os
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+
+          BODY = os.environ.get('HOOK_BODY', '').encode()
+
+
+          class H(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  n = int(self.headers.get('Content-Length', 0))
+                  self.rfile.read(n)
+                  self.send_response(int(os.environ.get('HOOK_CODE', '200')))
+                  self.end_headers()
+                  self.wfile.write(BODY)
+
+              def log_message(self, *a):
+                  pass
+
+
+          HTTPServer(('127.0.0.1', int(os.environ['HOOK_PORT'])), H).serve_forever()
+          PY
+
+          hook_pid=""
+          stop_hook() {
+            if [[ -n "$hook_pid" ]]; then
+              kill "$hook_pid" 2>/dev/null || true
+              wait "$hook_pid" 2>/dev/null || true
+              hook_pid=""
+            fi
+          }
+          trap stop_hook EXIT
+
+          # 换响应体就重启服务器，并等它真的能收请求：用固定 sleep 猜时长，
+          # 偶发会走成「连接失败」，而那条输出与「平台拒收」长得很像。
+          start_hook() {
+            HOOK_BODY="$1" HOOK_CODE="${2:-200}" HOOK_PORT="$hook_port" python3 /tmp/hook-verdict.py &
+            hook_pid=$!
+            local tries=0
+            while [[ "$tries" -lt 20 ]]; do
+              if curl -sS -o /dev/null --max-time 1 "http://127.0.0.1:${hook_port}/hook" 2>/dev/null; then
+                return 0
+              fi
+              tries=$((tries + 1))
+              sleep 0.25
+            done
+            fail "假 webhook 没起来（端口 ${hook_port}）"
+          }
+
+          # 输出落文件、退出码落变量：命令替换配 errexit 会把整段输出连同退出码
+          # 一起吞掉，而这两个都要断。
+          sync_out=/tmp/notify-verdict-sync-out.txt
+          sync_rc=0
+          run_sync() {
+            set +e
+            ./scripts/sync.sh --src 'https://bad.example.com/x:1' --dest r.example.com/x \
+              --notify-webhook "http://127.0.0.1:${hook_port}/hook" "$@" > "$sync_out" 2>&1
+            sync_rc=$?
+            set -e
+          }
+
+          # --- (a) 200 + errcode 0：平台确认接收 ---
+          start_hook '{"errcode":0,"errmsg":"ok"}'
+          run_sync --notify-type dingtalk
+          grep -qF '结果已推送到 dingtalk（平台已确认送达）' "$sync_out" \
+            || { cat "$sync_out"; fail "200 + errcode 0 未报「平台已确认送达」"; }
+          # AC5：通知的结论不能影响运行的退出码（这里是镜像失败的 2）
+          [[ "$sync_rc" == "2" ]] || fail "通知判定改变了退出码（期望 2，实际 ${sync_rc}）"
+          stop_hook
+          echo "✓ (a) 200 + errcode 0 → 平台已确认送达"
+
+          # --- (b) 200 + errcode 310000：平台侧拒收（本 issue 的缺陷形态）---
+          start_hook '{"errcode":310000,"errmsg":"keywords not in content"}'
+          run_sync --notify-type dingtalk
+          grep -qF '通知被 dingtalk 拒收' "$sync_out" \
+            || { cat "$sync_out"; fail "200 + errcode 非 0 未报「拒收」（HTTP 码不是成功的充分条件）"; }
+          grep -qF 'errcode=310000 errmsg=keywords not in content' "$sync_out" \
+            || { cat "$sync_out"; fail "拒收文案未带出平台给出的原因"; }
+          # 负向判据必须与上面的正向成对：单写「不含成功字样」时，一个根本没跑成的
+          # 步骤（跳过、输出为空）也会「通过」。
+          if grep -qF '平台已确认送达' "$sync_out"; then
+            cat "$sync_out"
+            fail "平台已拒收却仍报「已送达」——这正是 Issue #159 的缺陷形态"
+          fi
+          stop_hook
+          echo "✓ (b) 200 + errcode 310000 → 拒收，且带出原因"
+
+          # --- (c) 200 + 非 JSON：无法判定单独成一类 ---
+          start_hook '<html>502 Bad Gateway</html>'
+          run_sync --notify-type dingtalk
+          grep -qF '通知发送结果无法判定' "$sync_out" \
+            || { cat "$sync_out"; fail "200 + 非 JSON 未报「无法判定」"; }
+          grep -qF '响应体不是 JSON' "$sync_out" \
+            || { cat "$sync_out"; fail "无法判定未说明原因"; }
+          if grep -qF '平台已确认送达' "$sync_out"; then
+            cat "$sync_out"
+            fail "判不出来却被报成「已送达」"
+          fi
+          stop_hook
+          echo "✓ (c) 200 + 非 JSON → 无法判定"
+
+          # --- (d) generic + 200 空体：自建 webhook 必须继续算成功 ---
+          start_hook ''
+          run_sync --notify-type generic
+          grep -qF '结果已推送到 generic（该类型无统一回执，送达状态无法判定）' "$sync_out" \
+            || { cat "$sync_out"; fail "自建 webhook 的 200 空体未继续算成功（PRD 边界）"; }
+          if grep -qF '拒收' "$sync_out"; then
+            cat "$sync_out"
+            fail "自建 webhook 的空体被判成了拒收"
+          fi
+          stop_hook
+          echo "✓ (d) generic + 200 空体 → 仍算成功"
+
+          # --- (e) 非 2xx：网关的错误，与「平台拒收」是两副面孔 ---
+          # 合成一句话会误导排查方向（去查平台配置，而真正的问题是代理挂了）
+          start_hook 'bad gateway' 502
+          run_sync --notify-type dingtalk
+          grep -qF '通知发送失败（HTTP 502，bad gateway）' "$sync_out" \
+            || { cat "$sync_out"; fail "非 2xx 未报「通知发送失败」（HTTP 码与响应体首行都要带出）"; }
+          if grep -qF '拒收' "$sync_out"; then
+            cat "$sync_out"
+            fail "代理返回 502 被说成了「平台拒收」——两副面孔合并会误导排查方向"
+          fi
+          stop_hook
+          echo "✓ (e) HTTP 502 → 通知发送失败（与「拒收」文案分开）"
+
+          # --- (f) 非 2xx 且响应体为空：与改前的文案一字不差 ---
+          # 非 2xx 是既有路径（改前就在报「通知发送失败（HTTP <码>）」），使用者
+          # 的日志检索可能依赖这句话。带响应体是在它后面**追加**，不是替换；
+          # 空体这一支必须逐字保持原样。
+          start_hook '' 502
+          run_sync --notify-type dingtalk
+          grep -qF '通知发送失败（HTTP 502），结果不受影响' "$sync_out" \
+            || { cat "$sync_out"; fail "非 2xx 空体的文案与改前不一致（既有检索会失效）"; }
+          stop_hook
+          echo "✓ (f) HTTP 502 + 空体 → 文案与改前一字不差"
+
+          # --- AC5：通知发不出去只告警，绝不能让运行变红 ---
+          # 直接调 notify_send_text（抽出两个函数、桩掉日志函数），断返回值仍是 0：
+          # 它若返回非零，调用方在 set -e 下会当场中断——一次成功的同步就变红了。
+          for fn in notify_delivery_verdict notify_send_text; do
+            sed -n "/^${fn}()/,/^}/p" scripts/sync.sh
+          done > /tmp/notify-send-fns.sh
+          grep -qF 'notify_send_text()' /tmp/notify-send-fns.sh || fail "没能从 sync.sh 抽出 notify_send_text"
+
+          cat > /tmp/test-notify-return.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source /tmp/notify-send-fns.sh
+
+          log_info() { :; }
+          log_warn() { :; }
+          gh_warning() { :; }
+
+          # 可选：把 mktemp 换成一定失败，验证「建不出临时文件」时仍返回 0。
+          # 用 stub 而不是给 TMPDIR 一个不存在的目录：BSD 的 mktemp 根本不读
+          # TMPDIR（本机实测仍成功），那样写会在本地假绿、只有 Linux 上才红。
+          if [[ "${STUB_MKTEMP_FAIL:-}" == "1" ]]; then
+            mktemp() { return 1; }
+          fi
+
+          NOTIFY_TYPE=dingtalk
+          NOTIFY_VERDICT=""
+          NOTIFY_VERDICT_DETAIL=""
+          NOTIFY_WEBHOOK="$1"
+
+          # **裸调用**，不写成 `notify_send_text ... || fail`：调用点一旦进了
+          # `||` 列表，errexit 对函数**内部**就失效了——内部命令失败不会中断，
+          # 函数照常跑到 return 0，断言于是只能看到「返回值是 0」这一个形态
+          # （实测：mktemp 失败时函数继续执行、脚本以 0 退出，假绿）。
+          # 真实调用点（send_notification）就是裸调用，这里照着它写：
+          # 返回值非零、或内部命令失败触发 errexit，两种都会让本脚本以非零退出。
+          notify_send_text "正文" "标题"
+          echo "✓ notify_send_text 在「${2}」时既没中断、也没返回非零"
+          SCRIPT
+
+          # 两种失败形态各一次：判定落到 rejected（服务器此刻已经关掉，先重新起
+          # 一个会「拒收」的），以及连不上（8894 上没有东西在听 → HTTP 000）
+          start_hook '{"errcode":310000,"errmsg":"keywords not in content"}'
+          bash /tmp/test-notify-return.sh "http://127.0.0.1:${hook_port}/hook" 平台拒收
+          stop_hook
+          bash /tmp/test-notify-return.sh 'http://127.0.0.1:8894/hook' 连接失败
+          # 建不出临时文件（TMPDIR 不可写这类环境）也必须返回 0：临时文件是本次
+          # 新增的失败面，而 set -e 会穿透函数——mktemp 的失败一旦冒出去，一次
+          # 成功的同步就会因为通知这个附属动作而以非零退出。
+          STUB_MKTEMP_FAIL=1 bash /tmp/test-notify-return.sh 'http://127.0.0.1:8894/hook' 临时文件建不出来
+
+          echo "NOTIFY-VERDICT-E2E-OK"
+
       - name: 验证非法镜像引用会被拦下
         run: |
           #!/usr/bin/env bash

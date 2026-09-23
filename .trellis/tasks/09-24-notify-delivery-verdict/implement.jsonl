@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "本次改的是 bash 脚本：临时文件必须自己 mktemp+rm -f、jq 退出码不得泄漏、变量紧贴中文要加花括号、命令替换吞退出码"}
+{"file": ".trellis/spec/engine/index.md", "reason": "断言口径：恒真的断言比没有断言更糟、变异要精确到单点、负向判据几乎总是恒真——本次三条断言都按这个口径写"}
+{"file": ".trellis/spec/workflows/index.md", "reason": "要在 ci.yml 的 smoke-test 里加步骤：run 块的缩进规则、端口/容器是 job 共享、加步骤前先核实已有环境"}
+{"file": ".trellis/spec/maintenance/index.md", "reason": "改动 CI 步骤的既有教训（自己补写的那句话最危险）；本次新增断言文案属于同一类风险面"}

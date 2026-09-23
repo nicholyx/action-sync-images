@@ -71,6 +71,11 @@ AUDIT_LOCK_FILE=""
 NOTIFY_WEBHOOK=""
 NOTIFY_TYPE="auto"
 NOTIFY_ON="always"
+# 通知送达判定的产物：notify_delivery_verdict 写、notify_send_text 读。
+# 结论取值见该函数（confirmed / accepted / rejected / undetermined），
+# 详情是人类可读的原因（可能为空串）。
+NOTIFY_VERDICT=""
+NOTIFY_VERDICT_DETAIL=""
 # 同一个镜像连续失败多少次才通知。默认 1：每次失败都通知（与历史行为一致）。
 # 调大是为了对抗通知疲劳——上游抖动占了失败原因的一大部分，每次都响的话
 # 群里的通知很快就没有人看了，真正需要关注的问题反而被淹没。
@@ -3164,6 +3169,166 @@ build_notify_text() {
   append_run_link "$text"
 }
 
+# 把「HTTP 码 + 响应体」翻译成送达判定结论。
+#
+#   $1 type       平台类型（dingtalk / feishu / slack / generic）
+#   $2 http_code  curl -w '%{http_code}' 的输出（连接失败时是 000）
+#   $3 body_file  响应体落盘文件（可能为空文件）
+#
+# 结论输出到 stdout（单行单词），同时写进全局 NOTIFY_VERDICT；详情写进全局
+# NOTIFY_VERDICT_DETAIL（可能为空串）。
+#
+# **为什么需要它**：HTTP 码只说明「对方应答了」。钉钉与飞书恰恰在 HTTP 200 的
+# 响应体里报错——钉钉 310000（sign 不匹配 / 关键词不命中 / ip 不在白名单）、
+# 300001（token 不存在），飞书 11232（限流）。只看码就会把「平台侧拒收」报成
+# 「结果已推送到」，而一个假的成功通知比不发通知更坏：收件人不再去看日志。
+#
+# 各平台**分别**判定，不套用通用规则——响应体的字段名、成功值、形态三者本就
+# 不同：钉钉看 errcode、飞书看 code、Slack 是纯文本 ok、generic 没有可依据的
+# 回执契约（自建 webhook 常见 200 空体，必须继续算成功）。
+# 响应体不是预期结构时如实报「无法判定」，**绝不默认成功**：判不出来与
+# 「已送达」「被拒收」是三件事，混成一件就等于把本缺陷换个地方又犯一次。
+#
+# 调用方**不要**写成 verdict="$(notify_delivery_verdict ...)"：命令替换是子 shell，
+# 函数对全局变量的赋值传不回父进程（见 .trellis/spec/engine/bash-rules.md）。
+# stdout 那份输出留着，是为了让函数能被整段抽出来独立验证。
+notify_delivery_verdict() {
+  local type="$1" http_code="$2" body_file="$3"
+  local code msg field slack_reply
+  # 默认「无法判定」：任何分支没想到的情况都落到这里，绝不落到「成功」
+  local verdict="undetermined" detail="" first_line=""
+  local max_len=200
+
+  # 响应体只取首行：平台回执都是单行，而代理 / 网关的错误页可能很长，
+  # 整段进日志既没必要也不安全（可能含平台侧内容）
+  if [[ -s "$body_file" ]]; then
+    IFS= read -r first_line < "$body_file" || true
+    # CRLF 回执（Slack 常见）下 read 会把行尾的 CR 一起读进来
+    first_line="${first_line%$'\r'}"
+    first_line="${first_line:0:max_len}"
+  fi
+
+  # 非 2xx 先判（含连接失败时的 000）：这时响应体要么没有、要么是代理的错误页，
+  # 解析它没有意义。反方向**不**成立——2xx 不能直接算成功，见下面的按平台判定。
+  if [[ ! "$http_code" =~ ^2 ]]; then
+    verdict="rejected"
+    detail="HTTP ${http_code}"
+    if [[ -n "$first_line" ]]; then
+      detail="${detail}，${first_line}"
+    fi
+  else
+    case "$type" in
+      dingtalk)
+        # 成败在响应体的 errcode 里，不在 HTTP 码里
+        code="$(jq -r '.errcode // empty' "$body_file" 2>/dev/null)" || code=""
+        if [[ -z "$code" ]]; then
+          # 无法判定（独立成类）：空体 / 不是 JSON / JSON 里没有这个字段。
+          # 三者都不该被当成成功，分别给出原因便于排查。
+          # 判「能不能解析」用 `jq .`（只看解析成败），**不用** `jq -e .`：
+          # 后者在 `null` / `false` 这类取值为假的合法 JSON 上返回非零，
+          # 会把「能解析」读成「不是 JSON」——原因与事实不符，排查方向被带偏。
+          # 仓库在 regctl 凭证合并那处已经记过同一条。
+          if [[ ! -s "$body_file" ]]; then
+            detail="响应体为空"
+          elif jq . "$body_file" >/dev/null 2>&1; then
+            detail="响应体里没有 errcode 字段"
+          else
+            detail="响应体不是 JSON"
+          fi
+        elif [[ "$code" == "0" ]]; then
+          verdict="confirmed"
+        else
+          msg="$(jq -r '.errmsg // empty' "$body_file" 2>/dev/null)" || msg=""
+          msg="${msg:0:max_len}"
+          detail="errcode=${code}"
+          if [[ -n "$msg" ]]; then
+            detail="${detail} errmsg=${msg}"
+          fi
+          verdict="rejected"
+        fi
+        ;;
+      feishu)
+        # 同样在 HTTP 200 里用 code 报错。StatusCode / StatusMessage 是官方标注的
+        # **冗余字段**（兼容存量历史逻辑），只在 code 缺失时回退读取，不作首选
+        code="$(jq -r '.code // empty' "$body_file" 2>/dev/null)" || code=""
+        msg="$(jq -r '.msg // empty' "$body_file" 2>/dev/null)" || msg=""
+        msg="${msg:0:max_len}"
+        field="code"
+        if [[ -z "$code" ]]; then
+          code="$(jq -r '.StatusCode // empty' "$body_file" 2>/dev/null)" || code=""
+          msg="$(jq -r '.StatusMessage // empty' "$body_file" 2>/dev/null)" || msg=""
+          msg="${msg:0:max_len}"
+          field="StatusCode"
+        fi
+        if [[ -z "$code" ]]; then
+          # 无法判定（独立成类）：与钉钉同样分三种原因。判「能不能解析」用
+          # `jq .`，不用 `jq -e .`（null / false 上会误判，见上面钉钉那段的说明）
+          if [[ ! -s "$body_file" ]]; then
+            detail="响应体为空"
+          elif jq . "$body_file" >/dev/null 2>&1; then
+            detail="响应体里没有 code 字段"
+          else
+            detail="响应体不是 JSON"
+          fi
+        elif [[ "$code" == "0" ]]; then
+          verdict="confirmed"
+        else
+          detail="${field}=${code}"
+          if [[ -n "$msg" ]]; then
+            detail="${detail} msg=${msg}"
+          fi
+          verdict="rejected"
+        fi
+        ;;
+      slack)
+        # Slack 的回执是**纯文本**（不是 JSON）：成功就是字面量 ok，失败是一枚
+        # 短 token（invalid_payload / no_text / no_service / no_channel /
+        # action_prohibited / channel_is_archived）。先去掉行尾的 CR 与换行——
+        # 它们会破坏与字面量 ok 的比较（Slack 的回执常见 CRLF）
+        slack_reply="$(tr -d '\r\n' < "$body_file" 2>/dev/null)" || slack_reply=""
+        if [[ -z "$slack_reply" ]]; then
+          # 无法判定（独立成类）：空体判不出送达与否
+          detail="响应体为空"
+        elif [[ "$slack_reply" == "ok" ]]; then
+          verdict="confirmed"
+        elif [[ ${#slack_reply} -le 64 && "$slack_reply" != *[[:space:]]* && "$slack_reply" != *'<'* ]]; then
+          # 看起来确实是一枚回执 token：如实报失败
+          detail="${slack_reply:0:max_len}"
+          verdict="rejected"
+        else
+          # 200 但不是一枚回执 token（典型是透明代理返回的 HTML 错误页，或平台
+          # 换了回执格式）。判不了就报「无法判定」——把它说成「平台拒收」会把
+          # 排查方向带偏到机器人配置上，而真正的问题在链路上（与「rejected 的
+          # 两副面孔」是同一条原则：不同的事实不能共用一个结论）
+          detail="响应体不是 Slack 的预期回执（${first_line}）"
+        fi
+        ;;
+      generic)
+        # 自建 webhook 没有可依据的回执契约（常见 200 空体）：不猜它的成败。
+        # 算「已接受」并把「无法判定送达状态」如实说出来——报成功但不伪造「已送达」
+        verdict="accepted"
+        detail="该类型无统一回执"
+        ;;
+      *)
+        # 未知类型不该走到这里（notify_send_text 在发送前就把不认识的类型拦下了），
+        # 但真走到了也绝不能默认成功
+        detail="未知的通知类型：${type}"
+        ;;
+    esac
+  fi
+
+  # 详情会进 log_warn 与 GitHub 注解，而响应体是**平台侧内容**：这里统一压成单行。
+  # 注解按行解析，带换行的详情会让后半段被当成另一条工作流命令
+  # （jq -r 会把 JSON 里的 \n 还原成真换行，实测如此）。限长不在这里做——
+  # 各处带进详情的那段平台文本已按 max_len 截过，此处替换换行不改变长度。
+  detail="${detail//$'\n'/ }"
+  detail="${detail//$'\r'/ }"
+
+  NOTIFY_VERDICT="$verdict"
+  NOTIFY_VERDICT_DETAIL="$detail"
+  printf '%s\n' "$verdict"
+}
+
 # 把一段 Markdown 文本推送到 webhook。
 #
 # 同步、审计、上游检查三条路径共用它：类型识别、JSON 组装、HTTP 调用与降级
@@ -3198,19 +3363,63 @@ notify_send_text() {
   # 因此日志里只记录类型与结果，绝不输出 URL。
   # 注意不要写成 `... || printf '000'`：curl 的 -w '%{http_code}' 在连接失败时
   # 本身就会输出 000，再补一个会拼成 000000 这种看不懂的东西。
-  local http_code
-  http_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+  #
+  # 响应体落盘交给判定：只看 HTTP 码会把「平台侧拒收」报成「已推送」（Issue #159）。
+  #
+  # 临时文件由本函数自己建、自己删（bash 3.2 没有 `trap ... RETURN`）。
+  # mktemp 失败（TMPDIR 不可写这类环境）时退成 /dev/null：**临时文件是本次新增的
+  # 失败面**——旧实现直接写 /dev/null，没有这一步。而 `set -e` 会穿透函数，
+  # mktemp 的失败一旦冒出去，一次**成功的同步**会因为通知这个附属动作以非零退出，
+  # 「通知是附加能力」的既有契约就断了。退成 /dev/null 后通知照发，判定只会看到
+  # 空响应体、如实报「无法判定」，不伪造成功。
+  local http_code body_file
+  if ! body_file="$(mktemp 2>/dev/null)"; then
+    body_file="/dev/null"
+  fi
+  http_code="$(curl -sS -o "$body_file" -w '%{http_code}' -X POST \
     -H 'Content-Type: application/json' \
     --max-time 15 \
     -d "$payload" "$NOTIFY_WEBHOOK" 2>/dev/null)" || true
   http_code="${http_code:-000}"
 
-  if [[ "$http_code" =~ ^2 ]]; then
-    log_info "结果已推送到 ${type}"
-  else
-    log_warn "通知发送失败（HTTP ${http_code}），结果不受影响"
-    gh_warning "结果通知发送失败：HTTP ${http_code}"
+  # 结论与详情由判定函数写进全局变量——**不要**写成
+  # verdict="$(notify_delivery_verdict ...)"：命令替换是子 shell，
+  # 赋值传不回父进程（bash-rules.md 记过这个坑）
+  NOTIFY_VERDICT=""
+  NOTIFY_VERDICT_DETAIL=""
+  notify_delivery_verdict "$type" "$http_code" "$body_file" >/dev/null
+  # /dev/null 不是本函数建的，**别去 rm 它**（那是设备节点，不是临时文件）
+  if [[ "$body_file" != "/dev/null" ]]; then
+    rm -f "$body_file"
   fi
+
+  case "$NOTIFY_VERDICT" in
+    confirmed)
+      log_info "结果已推送到 ${type}（平台已确认送达）"
+      ;;
+    accepted)
+      log_info "结果已推送到 ${type}（该类型无统一回执，送达状态无法判定）"
+      ;;
+    rejected)
+      # 「代理返回 502」与「平台明确拒收」是两件事，文案分开——合成一句会把
+      # 排查方向带偏
+      if [[ "$http_code" =~ ^2 ]]; then
+        log_warn "通知被 ${type} 拒收（HTTP ${http_code}${NOTIFY_VERDICT_DETAIL:+，}${NOTIFY_VERDICT_DETAIL}），结果不受影响"
+        gh_warning "结果通知被 ${type} 拒收：${NOTIFY_VERDICT_DETAIL}"
+      else
+        # 非 2xx 的详情本身就是「HTTP <码>」开头，这里直接用它：空体时与历史
+        # 文案一字不差，带响应体时为「HTTP 502，bad gateway」——响应体首行在
+        # 本地也能看到，不是只出现在 GitHub 注解里
+        log_warn "通知发送失败（${NOTIFY_VERDICT_DETAIL}），结果不受影响"
+        gh_warning "结果通知发送失败：${NOTIFY_VERDICT_DETAIL}"
+      fi
+      ;;
+    undetermined|*)
+      # 无法判定单独成一类：响应体不是预期结构时，既不说送达也不说拒收
+      log_warn "通知发送结果无法判定（HTTP ${http_code}${NOTIFY_VERDICT_DETAIL:+，}${NOTIFY_VERDICT_DETAIL}），结果不受影响"
+      gh_warning "结果通知发送结果无法判定：${NOTIFY_VERDICT_DETAIL}"
+      ;;
+  esac
 
   return 0
 }
