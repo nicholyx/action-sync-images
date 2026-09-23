@@ -29,6 +29,8 @@ zizmor 在 CI 里盯着，但它不是万能的。
 - **无结构的简单替换**（如把 `@v7` 换成 `@<sha>`）→ 脚本批量安全
 - **涉及缩进/块结构的插入**（如给 step 加 `with:`）→ **逐个手工做**。批量脚本曾连续三次算错 `with:` 与 `uses:` 的层级关系弄坏 YAML
 - **heredoc 内容必须跟着 block scalar 的缩进走**——`run: |` 里的 heredoc 结束符也要缩进，否则 YAML 解析坏掉
+- **`run: |` 块里插入的任何多行内容都要保持同一个缩进**，不只是 heredoc——**注释也一样**。用 Edit 工具贴多行文本时最容易漏：第一行带缩进、后面几行没带。2026-09-24 一天里踩了两次（一次 heredoc，一次三行注释），症状都是 `did not find expected key while parsing a block mapping`，而报的行号指向**后面**一个正常行（解析器到那里才发现对不上），排查时要往**前**看。
+  **自检**：改完 `run:` 块后，`python3 -c "…"` 扫一遍该区域有没有「非空且不以空格开头、也不是 `- ` 列表项」的行——比肉眼可靠
 - 每次改完工作流：跑 `./scripts/lint.sh`——**zizmor 已在其中**（docker + `ci.yml` 里 pin 的
   那个版本，版本从 `ci.yml` 抽，不另写一份；基线 0 findings，豁免集中在 `.github/zizmor.yml`）。
   单独跑同一件事才是：
