@@ -44,6 +44,10 @@ PASSED=0
 FAILED=0
 SKIPPED=0
 declare -a FAILED_NAMES=()
+# 跑了、但**不是 CI 同源**的项。它们的「通过」与 CI 的通过可信度不同，而三计数
+# 分不出来（都计在 PASSED 里）——所以单独记下来，在结尾一并列出。
+# 判据是「这一项的结论与 CI 用的是不是同一套工具/规则」，不是「它有没有跑成」。
+declare -a NONSYNC_NOTES=()
 
 # 执行一项检查。$1 是显示名，其余是命令。
 run_check() {
@@ -203,11 +207,15 @@ if command -v docker >/dev/null 2>&1; then
       "$ZIZMOR_IMAGE" /repo --no-online-audits
   fi
 elif command -v zizmor >/dev/null 2>&1; then
+  local_zizmor_version="$(zizmor --version 2>/dev/null | head -n 1)"
   run_check "$ZIZMOR_NAME" zizmor . --no-online-audits
   # 这条结论的价值全在「与 CI 同源」上，而这条路径恰恰不同源——所以把两边的版本
   # 都摆出来，让读的人自己判断，而不是只说一句「可能有出入」就过去。
-  note "本机没有 docker，退而用本机 zizmor（$(zizmor --version 2>/dev/null | head -n 1)）；"
+  note "本机没有 docker，退而用本机 zizmor（${local_zizmor_version}）；"
   note "CI 在 ci.yml 里 pin 的是 ${ZIZMOR_IMAGE:-未取到}；两者不一致时，本项的通过不等于 CI 的通过。"
+  # 记进 NONSYNC_NOTES：上面两条 note 打在 zizmor 那一段，是否被读到取决于读者
+  # 有没有翻到那里；而结尾才是人真正会看的地方（Issue #139）。
+  NONSYNC_NOTES+=("zizmor（本机 ${local_zizmor_version}，CI pin ${ZIZMOR_IMAGE:-未取到}）")
 else
   skip_check "$ZIZMOR_NAME" "未安装 docker，本机也没有 zizmor" \
     "安装 Docker（CI 就是用 docker 跑 zizmor，本项依赖它），或 brew install zizmor"
@@ -221,6 +229,17 @@ printf '通过 %s%d%s · 失败 %s%d%s · 跳过 %s%d%s\n' \
   "$C_GREEN" "$PASSED" "$C_RESET" \
   "$C_RED" "$FAILED" "$C_RESET" \
   "$C_YELLOW" "$SKIPPED" "$C_RESET"
+
+# 非 CI 同源的项单独列一遍。它们被计在「通过」里——三计数分不出来，而两者的
+# 可信度不同。上面的 note 打在各自那一段，是否被读到取决于读者有没有翻到那里；
+# 这里是人真正会看的位置。**不改三计数**：那是结构改动，与本条要解决的问题不成比例。
+if [[ ${#NONSYNC_NOTES[@]} -gt 0 ]]; then
+  printf '\n%s本次有 %d 项不是 CI 同源，其「通过」不等于 CI 的通过：%s\n' \
+    "$C_YELLOW" "${#NONSYNC_NOTES[@]}" "$C_RESET"
+  for _n in "${NONSYNC_NOTES[@]}"; do
+    printf '  • %s\n' "$_n"
+  done
+fi
 
 if [[ "$FAILED" -gt 0 ]]; then
   printf '\n%s以下检查未通过：%s\n' "$C_RED" "$C_RESET"
