@@ -1319,6 +1319,136 @@ jobs:
 
           echo "NOTIFY-VERDICT-E2E-OK"
 
+      - name: 验证 feishu / slack 通知的端到端（包装与结论）
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # #159 把「通知到底送达没有」改成按平台分别解析响应体 —— **每多一个平台就多一份
+          # 实现**：类型识别、payload 包装、回执判定、日志结论四处都要各自接一遍线。
+          # 端到端此前只跑了 dingtalk 与 generic（见「验证通知送达判定的端到端行为」），
+          # feishu / slack 只有抽取式单测，而单测喂的是判定函数本身，绕开了
+          # 「payload 构造 → 假 webhook → 判定 → 文案」整条链路。feishu 的 msg_type 包装
+          # 或 slack 的 text 包装改错时，单测照样绿，**而真实发出去的 payload 平台不认**。
+          #
+          # 所以为这两个平台各跑一次真发（假 webhook 按该平台的回执形态应答），并且
+          # 同时断**包装字段**与**日志结论** —— 它们分属两条实现路径，只断一条等于
+          # 只接了一半的线。
+          #
+          # 端口是 job 内共享的资源：8894（用来造「连不上」）/ 8895 / 8896 / 8897 / 8898 /
+          # 8899 已被本 job 其它步骤占用，这里另起 8893。
+          fail() { echo "::error::$1"; exit 1; }
+
+          hook_port=8893
+          payload=/tmp/hook-platform-payload.json
+          sync_out=/tmp/hook-platform-sync-out.txt
+          sync_rc=0
+
+          # 假 webhook：请求体落盘（断言包装字段要看它），并按配置回应该平台的回执形态
+          cat > /tmp/hook-platform.py <<'PY'
+          import os
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+
+          BODY = os.environ.get('HOOK_BODY', '').encode()
+
+
+          class H(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  n = int(self.headers.get('Content-Length', 0))
+                  with open(os.environ['HOOK_PAYLOAD'], 'wb') as f:
+                      f.write(self.rfile.read(n))
+                  self.send_response(int(os.environ.get('HOOK_CODE', '200')))
+                  self.end_headers()
+                  self.wfile.write(BODY)
+
+              def log_message(self, *a):
+                  pass
+
+
+          HTTPServer(('127.0.0.1', int(os.environ['HOOK_PORT'])), H).serve_forever()
+          PY
+
+          hook_pid=""
+          stop_hook() {
+            if [[ -n "$hook_pid" ]]; then
+              kill "$hook_pid" 2>/dev/null || true
+              wait "$hook_pid" 2>/dev/null || true
+              hook_pid=""
+            fi
+          }
+          trap stop_hook EXIT
+
+          # 换回执就重启服务器，并等它真的能收请求：用固定 sleep 猜时长，偶发会走成
+          # 「连接失败」，而那条输出与「平台拒收」长得很像，排查会从一开始就被带偏
+          start_hook() {
+            HOOK_BODY="$1" HOOK_PAYLOAD="$payload" HOOK_PORT="$hook_port" \
+              python3 /tmp/hook-platform.py &
+            hook_pid=$!
+            local tries=0
+            while [[ "$tries" -lt 20 ]]; do
+              if curl -sS -o /dev/null --max-time 1 "http://127.0.0.1:${hook_port}/hook" 2>/dev/null; then
+                return 0
+              fi
+              tries=$((tries + 1))
+              sleep 0.25
+            done
+            fail "假 webhook 没起来（端口 ${hook_port}）"
+          }
+
+          # 不能加 --dry-run（干跑不发通知，通知的对象不存在）；用非法引用造失败，
+          # 不需要 registry、也不联网。输出落文件、退出码落变量：命令替换配 errexit
+          # 会把整段输出连同退出码一起吞掉，而这两个都要断。
+          #
+          # 每次发送前清掉上一份 payload —— 否则「这一次没发」会被上一份文件冒充成
+          # 「发了」，而下面几条断言看的正是那个文件
+          send_to_hook() {
+            rm -f "$payload"
+            set +e
+            ./scripts/sync.sh --src 'https://bad.example.com/x:1' --dest r.example.com/x \
+              --notify-webhook "http://127.0.0.1:${hook_port}/hook" "$@" > "$sync_out" 2>&1
+            sync_rc=$?
+            set -e
+          }
+
+          # --- feishu：HTTP 200 + code:0 → 平台确认送达 ---
+          start_hook '{"code":0,"msg":"success"}'
+          send_to_hook --notify-type feishu
+          # 夹具前提要自己先立住：这是一次**真的失败**运行（退出码 2），通知正文才可能是
+          # 「失败详情」。少了这一条，夹具哪天不再造出失败（比如非法引用被放行），
+          # 下面只断包装字段的几条会照样绿，而它们验证的现场已经不存在了
+          [[ "$sync_rc" == "2" ]] || fail "用例前提不成立：非法引用应让运行以 2 结束，实际 ${sync_rc}"
+          grep -qF '结果已推送到 feishu（平台已确认送达）' "$sync_out" \
+            || { cat "$sync_out"; fail "feishu 回执 code:0 未报「平台已确认送达」"; }
+          [[ -s "$payload" ]] || { cat "$sync_out"; fail "feishu 通知没发出去（假 webhook 没收到 POST）"; }
+          jq -e '(.msg_type == "text") and (.content | keys == ["text"])' "$payload" >/dev/null \
+            || { cat "$payload"; fail "feishu 真实发出的包装应为 msg_type=text + content.text"; }
+          # 与上面成对：确认送达时不该同时出现拒收的字样
+          if grep -qF '通知被 feishu 拒收' "$sync_out"; then
+            cat "$sync_out"
+            fail "feishu 已确认送达，却又报了拒收"
+          fi
+          stop_hook
+          echo "✓ feishu：回执 code:0 → 已确认送达，且包装为 msg_type=text"
+
+          # --- slack：HTTP 200 + 纯文本 invalid_payload → 拒收 ---
+          start_hook 'invalid_payload'
+          send_to_hook --notify-type slack
+          grep -qF '通知被 slack 拒收' "$sync_out" \
+            || { cat "$sync_out"; fail "slack 回执 invalid_payload 未报「拒收」（HTTP 码不是成功的充分条件）"; }
+          # 结论之外还要带出平台给的那枚 token：只说「拒收」会让人无从下手
+          grep -qF 'invalid_payload' "$sync_out" \
+            || { cat "$sync_out"; fail "slack 的拒收文案没带出平台回执里的 token"; }
+          [[ -s "$payload" ]] || { cat "$sync_out"; fail "slack 通知没发出去（假 webhook 没收到 POST）"; }
+          # slack 与 generic 共用同一条 payload 分支，所以这里要钉住「发出去的正是顶层
+          # text 这一种包装」——写成 feishu 的 msg_type 时，平台不认而单测照样绿
+          jq -e 'keys == ["text"]' "$payload" >/dev/null \
+            || { cat "$payload"; fail "slack 真实发出的包装应为顶层 text（且只有这一个键）"; }
+          if grep -qF '平台已确认送达' "$sync_out"; then
+            cat "$sync_out"
+            fail "slack 已拒收却仍报「已送达」——这正是 Issue #159 的缺陷形态"
+          fi
+          stop_hook
+          echo "✓ slack：回执 invalid_payload → 拒收并带出 token，且包装为顶层 text"
       - name: 验证非法镜像引用会被拦下
         run: |
           #!/usr/bin/env bash
@@ -1598,6 +1728,282 @@ jobs:
           assert_merged_ignored "--audit-lock" "--audit-lock 只校验锁文件，以下参数本次不生效" "$out" \
             "本次不生效" "--dry-run" "--filter / --exclude" "目标地址（--dest / --dest-keep-path）"
 
+      - name: 准备 stub skopeo 夹具（检查模式用例共用）
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 检查模式的三个用例（--updates-limit 的语义、三种检查的报告落盘、审计报告的
+          # summary）共用同一个 stub skopeo：它们要的都是**确定的**上游回答，而真 skopeo
+          # 会去查 mock-a.local / mock-b.local（DNS 必然失败）或真 registry，跑成什么样
+          # 取决于 runner 的网络。
+          #
+          # 放在**固定路径**上供后面的步骤按需前置到 PATH（每个 run 是独立 shell，
+          # 变量不延续）。不写进 PATH 全局：只有显式前置的步骤才看得到它，
+          # 免得别的用例在无意间撞上这个「什么仓库都答得出来」的假工具。
+          mkdir -p /tmp/stub-skopeo
+          cat > /tmp/stub-skopeo/skopeo <<'STUB'
+          #!/usr/bin/env bash
+          # stub skopeo：只实现本项目用到的两种调用——`list-tags`（--check-updates）
+          # 与 `inspect --raw`（审计家族 / 锁文件校验）。回答按引用里的主机与仓库名给出，
+          # 好让检查报告拿到**互不相同**的确定计数（计数全相等时，「两处渲染串位」
+          # 这类缺陷是隐形的）。
+          #
+          # 约定的仓库名（源 / 目标两侧共用同一套）：
+          #   .../curN      源与目标内容逐字相同 → 最新
+          #   .../staleN    目标内容与源不同     → 落后
+          #   .../missN     目标明确回答「不存在」→ 缺失
+          #   .../unreachN  源连不上             → 无法判定
+          #   .../exclN     由 --exclude 排除
+          #
+          # 源与目标要分开判：源侧的 missN 必须**正常回答**，否则它会被算成
+          # 「源仓库中不存在」（无法判定）而不是「目标缺失」，夹具就自己失准了。
+          sub="${1:-}"
+
+          # ref 是最后一个 docker:// 参数（前面可能跟着 --tls-verify=false / --authfile X）
+          ref=""
+          for a in "$@"; do
+            case "$a" in
+              docker://*) ref="$a" ;;
+            esac
+          done
+          ref="${ref#docker://}"
+
+          case "$sub" in
+            list-tags)
+              printf '%s\n' '{"Name":"stub","Tags":["v1","v2","v3","v4","v5","v6","v10"]}'
+              exit 0
+              ;;
+            inspect)
+              case "$ref" in
+                mock-b.local/*)
+                  case "$ref" in
+                    *stale*)
+                      printf '%s\n' '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":1,"platform":{"architecture":"amd64","os":"linux"}}]}'
+                      exit 0
+                      ;;
+                    *miss*)
+                      echo "manifest unknown" >&2
+                      exit 1
+                      ;;
+                    *)
+                      printf '%s\n' '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":1,"platform":{"architecture":"amd64","os":"linux"}}]}'
+                      exit 0
+                      ;;
+                  esac
+                  ;;
+                *unreach*)
+                  echo "connection refused" >&2
+                  exit 1
+                  ;;
+                *)
+                  printf '%s\n' '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":1,"platform":{"architecture":"amd64","os":"linux"}}]}'
+                  exit 0
+                  ;;
+              esac
+              ;;
+            *)
+              echo "stub skopeo: 未实现的子命令：${sub}" >&2
+              exit 1
+              ;;
+          esac
+          STUB
+          chmod +x /tmp/stub-skopeo/skopeo
+          /tmp/stub-skopeo/skopeo list-tags docker://anything >/dev/null
+          echo "✓ stub skopeo 已就位：/tmp/stub-skopeo/skopeo"
+
+      - name: 验证 --updates-limit 只限制展示条数（stub skopeo）
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # --updates-limit 的语义是「只限制**展示**条数，不改变总数」：源码里 limit 只出现在
+          # `sort -Vr | head -n "$limit"` 那一处，总数来自**完整**的 missing 列表
+          # （total_missing += missing_count）。
+          #
+          # 坏掉的方式很隐蔽：哪天 limit 被顺手用在过滤上（missing 先 `head -n "$limit"`），
+          # total_missing 跟着变小 —— 使用者看到「上游只差 3 个 tag」而实际差 6 个，
+          # 退出码仍是 2、也不会告警，**他不会知道还有三个没显示出来**。
+          #
+          # 所以一条运行里同时断两侧：总数（6 个）与列出条数（恰好 3 个）。只断一侧拦不住
+          # 上面那种改法——总数变小而列出条数不变，只断「列出几条」照样绿。
+          fail() { echo "::error::$1"; exit 1; }
+
+          # stub skopeo 由前一步放在固定路径上（见「准备 stub skopeo 夹具」）
+          PATH="/tmp/stub-skopeo:$PATH"
+          export PATH
+
+          # 上游 7 个 tag、清单里只有 v1 → 缺失 6 个。
+          # tag 里特意放了 v10：版本序（sort -Vr）与字典序在这里给出不同的前三名，
+          # 于是「列出的是 v10 v6 v5」同时钉住了排序口径。
+          set +e
+          out="$(./scripts/sync.sh --src mock-a.local/app:v1 --check-updates --updates-limit 3 2>&1)"
+          code=$?
+          set -e
+          printf '%s\n' "$out"
+          # 退出码 2 是 --check-updates 的既有约定（查出未收录 / 有查询失败）。先钉住它，
+          # 是为了把「检查跑完了」与「脚本半路死在别的校验上」区分开
+          [[ "$code" -eq 2 ]] || fail "--updates-limit 3：期望退出码 2，实际 ${code}"
+          # 断言取的是带数值的行，不是「共 N 个」这个措辞本身——措辞在跳过/失败路径上
+          # 也会出现，只匹配措辞等于断言恒真
+          grep -qF '上游共 7 个 tag，其中 6 个不在清单中，版本序最大的 3 个' <<<"$out" \
+            || fail "--updates-limit 3：总数被 limit 影响了（应仍是 6 个），或没说明只列了 3 个"
+          grep -qxF '    v10 v6 v5' <<<"$out" \
+            || fail "--updates-limit 3：应恰好列出 3 个（版本序最大的三个）"
+          grep -qF '有未收录的 tag（共 6 个）' <<<"$out" \
+            || fail "--updates-limit 3：汇总行里的总数应为 6"
+          echo "✓ --updates-limit 3：总数仍是 6，只列出 3 个"
+
+          # 正对照：不传 limit（默认 5）→ 总数**仍然**是 6，列出 5 个。
+          # 两次运行合起来才证明 limit 只影响展示：只有总数不动、列出条数随 limit 变，
+          # 才能把「限制展示」与「限制统计」区分开
+          set +e
+          out="$(./scripts/sync.sh --src mock-a.local/app:v1 --check-updates 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 2 ]] || fail "默认 limit：期望退出码 2，实际 ${code}"
+          grep -qF '上游共 7 个 tag，其中 6 个不在清单中，版本序最大的 5 个' <<<"$out" \
+            || fail "默认 limit（5）：总数应仍是 6 个、且说明只列了 5 个"
+          grep -qxF '    v10 v6 v5 v4 v3' <<<"$out" \
+            || fail "默认 limit（5）：应恰好列出 5 个"
+          echo "✓ 默认 limit（5）：总数仍是 6，列出 5 个——limit 只影响展示"
+
+      - name: 验证 check-updates / lock-audit 的报告落盘（stub skopeo）
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # write_check_report_files 是三种检查（audit / check-updates / lock-audit）**共用**的
+          # 一份实现，三处调用点各传一个 check_name。共用最典型的故障是「改一处、另外两处没跟
+          # 上」：check_name 传错时不会报任何错，只是**文件名不对**，按名字去找的消费方于是
+          # 永远找不到报告——而报告本身明明写出来了。
+          #
+          # 已有的「验证检查模式的报告落盘」只覆盖了 audit；后两种模式此前一次都没跑过
+          # （lock-audit-report 全文出现 0 次，check-updates-report 只出现在手写夹具里）。
+          #
+          # 这里对每种模式都断三件事：.md / .json 都落盘且非空；json 顶层形状成立；
+          # check 字段等于**模式名本身**（写成固定的 "audit" 是这条最可能出的错，也正是
+          # 共用实现最容易漏掉的地方）。
+          fail() { echo "::error::$1"; exit 1; }
+
+          # stub skopeo 由前面「准备 stub skopeo 夹具」那一步放在固定路径上
+          PATH="/tmp/stub-skopeo:$PATH"
+          export PATH
+
+          rep="$(mktemp -d)"
+          lock="$(mktemp)"
+          printf 'mock-a.local/app:v1@sha256:%064d\nmock-a.local/app:v2\n' 0 > "$lock"
+
+          # 两种模式都以退出码 2 结束（都查出了需要关注的项）。先钉退出码，是为了把
+          # 「检查跑完了」与「半路死在别的校验上」区分开
+          set +e
+          ./scripts/sync.sh --src mock-a.local/app:v1 --check-updates --updates-limit 3 \
+            --report-dir "$rep" >/dev/null 2>&1
+          upd_code=$?
+          ./scripts/sync.sh --audit-lock "$lock" --report-dir "$rep" >/dev/null 2>&1
+          lock_code=$?
+          set -e
+          [[ "$upd_code" -eq 2 ]] || fail "--check-updates 期望退出码 2，实际 ${upd_code}"
+          [[ "$lock_code" -eq 2 ]] || fail "--audit-lock 期望退出码 2，实际 ${lock_code}"
+
+          for f in check-updates-report.md check-updates-report.json \
+                   lock-audit-report.md lock-audit-report.json; do
+            [[ -s "${rep}/${f}" ]] || fail "报告未落盘或为空：${f}（检查报告共用一份实现，文件名取决于 check_name）"
+          done
+
+          # 顶层形状 + check 字段 + summary 的键名 + records 条数，一次比完。
+          # 比整串而不是逐项 `and`：逐项写会让人以为「字段存在」就算过，而这里要的是
+          # **每个字段都是这个模式自己的**。summary 用 keys 而不是值——值属于另一个用例
+          # （审计报告的 summary 与正文一致），这里管的是「没把别的模式的 summary 传进来」。
+          assert_shape() {
+            local file="$1" name="$2" want_keys="$3" want_records="$4" got
+            got="$(jq -r '[(.generated_at | type), .check, (.summary | type),
+                            (.summary | keys | join(",")), (.records | type),
+                            (.records | length | tostring)] | join(" ")' "$file")" \
+              || fail "报告 JSON 无法解析：${file}"
+            echo "  ${file##*/}: ${got}"
+            [[ "$got" == "string ${name} object ${want_keys} array ${want_records}" ]] \
+              || fail "${file##*/} 的形状不对：期望 check=${name}、summary keys=${want_keys}、records=${want_records} 条，实际：${got}"
+          }
+
+          assert_shape "${rep}/check-updates-report.json" "check-updates" \
+            "checked,failed,total_missing,with_updates" 1
+          assert_shape "${rep}/lock-audit-report.json" "lock-audit" \
+            "drift,marker,match,nodigest,unknown" 2
+          echo "✓ check-updates / lock-audit 的报告都落盘，check 字段与模式名一致"
+
+      - name: 验证审计报告 summary 与正文一致（stub skopeo）
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 检查报告是**双面**的：md 是给人看的（正文明写一行「**合计**：最新 1 · 落后 2 · …」），
+          # json 的 .summary 是给消费方读的。两者由同一批变量渲染，但走的是两条渲染路径，
+          # 一旦某条路径漏改或串了变量，只读 json 的下游就会得到一个**与报告正文矛盾**的结论
+          # ——而界面上看不出来：两处分别看都「正常」。
+          #
+          # 夹具刻意让四个计数**互不相同**（1 / 2 / 3 / 4，排除数是 5）：计数值全相等时，
+          # 「正文把 stale 渲染成 missing」这类串位是隐形的，等值断言照样绿——
+          # 这条正是本仓库记过的「夹具自己让自己恒真」。
+          #
+          # 此前 CI 里出现过的 .summary.stale 打的是 history.sh 的趋势产物，**不是**检查报告
+          # 自己的 summary；检查报告自己的这一项从未被断言过。
+          fail() { echo "::error::$1"; exit 1; }
+
+          # stub skopeo 由前面「准备 stub skopeo 夹具」那一步放在固定路径上
+          PATH="/tmp/stub-skopeo:$PATH"
+          export PATH
+
+          # 按仓库名造 15 个源：cur 1 个（最新）· stale 2 个（落后）· miss 3 个（缺失）
+          # · unreach 4 个（无法判定）· excl 5 个（被排除）
+          srcs=""
+          add_src() {
+            if [[ -z "$srcs" ]]; then srcs="$1"; else srcs="${srcs},$1"; fi
+          }
+          i=0; while [[ "$i" -lt 1 ]]; do add_src "mock-a.local/cur${i}:v1";     i=$((i + 1)); done
+          i=0; while [[ "$i" -lt 2 ]]; do add_src "mock-a.local/stale${i}:v1";   i=$((i + 1)); done
+          i=0; while [[ "$i" -lt 3 ]]; do add_src "mock-a.local/miss${i}:v1";    i=$((i + 1)); done
+          i=0; while [[ "$i" -lt 4 ]]; do add_src "mock-a.local/unreach${i}:v1"; i=$((i + 1)); done
+          i=0; while [[ "$i" -lt 5 ]]; do add_src "mock-a.local/excl${i}:v1";    i=$((i + 1)); done
+
+          rep="$(mktemp -d)"
+          set +e
+          out="$(./scripts/sync.sh --src "$srcs" --dest mock-b.local/x --exclude 'excl' \
+            --audit --report-dir "$rep" 2>&1)"
+          code=$?
+          set -e
+          printf '%s\n' "$out" | tail -6
+          # 有落后/缺失项 → 退出码 2（审计的既有约定）
+          [[ "$code" -eq 2 ]] || fail "审计有落后/缺失项，期望退出码 2，实际 ${code}"
+
+          json="${rep}/audit-report.json"
+          md="${rep}/audit-report.md"
+          [[ -s "$json" && -s "$md" ]] || fail "审计报告未落盘或为空"
+
+          # ① json 的 .summary 逐字段等于确定的数值——**等值**断言，不是「字段存在」。
+          # `-S` 先按键名排序再比：JSON 对象的键序不是语义（把 summary 的键重排是
+          # 行为等价的改动，报告内容一字不差），拿键序当判据会把正确实现判红——
+          # 那和恒真断言是同一枚硬币的两面，都让人不再信任绿灯。
+          got="$(jq -S -c '.summary' "$json" || true)"
+          want='{"current":1,"excluded":5,"missing":3,"stale":2,"unknown":4}'
+          [[ "$got" == "$want" ]] || fail "audit-report.json 的 .summary 不符：期望 ${want}，实际 ${got}"
+
+          # ② 报告正文里的合计行等于同一组数字。走 md 文件而不是 stdout：stdout 上是
+          # `最新 1 ｜ 落后 2 ｜ …`（全角竖线），与本行不是同一段渲染，断 stdout 等于
+          # 绕开了「报告正文」这个被断的对象
+          grep -qF '**合计**：最新 1 · 落后 2 · 缺失 3 · 无法判定 4' "$md" \
+            || { cat "$md"; fail "审计报告正文的合计行与 .summary 不符"; }
+          # 反引号写在双引号里并转义：放单引号里会被 shellcheck 当成命令替换（SC2016），
+          # 而这段文本里的反引号是 Markdown 的字面内容
+          grep -qF "另有 5 条被 \`--filter\` / \`--exclude\` 排除" "$md" \
+            || { cat "$md"; fail "审计报告正文的排除条数与 .summary.excluded 不符"; }
+
+          # ③ records 与 summary 同源：五类状态各出现对应条数。只断 summary 的话，
+          # 「summary 对了但 records 漏了几条」仍会绿，而下游常按 records 逐条消费
+          got="$(jq -r '[.records[].state] | group_by(.) | map({(.[0]): length}) | add | to_entries | sort_by(.key) | map("\(.key)=\(.value)") | join(" ")' "$json" || true)"
+          [[ "$got" == "current=1 excluded=5 missing=3 stale=2 unknown=4" ]] \
+            || fail "audit-report.json 的 records 与 summary 不一致：${got}"
+          echo "✓ summary、正文合计行、records 三处数字一致（1/2/3/4/5）"
       - name: 验证 -h / --help 的退出码
         run: |
           #!/usr/bin/env bash
@@ -2269,6 +2675,77 @@ jobs:
             exit 1
           fi
           echo "✓ 空平台列表不会触发 unbound variable"
+
+      - name: 验证失效参数的告警方向（--platforms / --skip-existing / --tls-verify）
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 三条「参数被接受却不起作用」的告警，门禁**各不相同**，必须各按各的环境
+          # 跑一遍。曾有 issue 把这组统称为「需要 regctl 的组」，而 --platforms 的门禁
+          # 恰好相反（`STRIP_ATTESTATION != "true"`，即 **skopeo** 路径）——把它塞进
+          # --strip-attestation 的调用里，告警永远不会出现，断言就写成了恒真：
+          # 一段永远匹配不上的检查，读起来却像在防着静默失效。
+          #
+          # 三个门禁（都在 sync.sh 的启动校验区）：
+          #   --platforms         STRIP_ATTESTATION != true   → 管的却是 skopeo 路径
+          #   --skip-existing     STRIP_ATTESTATION == true   → regctl 路径
+          #   --tls-verify false  regctl_path_active == true  → regctl 路径
+          fail() { echo "::error::$1"; exit 1; }
+
+          # 带 --platforms 但**不带** --strip-attestation：skopeo 用 --all 推全部平台，
+          # 显式指定的平台列表被吃掉。静默失效的后果是推送量与体积远超预期，
+          # 却没有报错、退出码也是 0。
+          out="$(./scripts/sync.sh --src nginx:1.27 --dest r.example.com/x \
+            --platforms linux/amd64 --dry-run 2>&1)"
+          if [[ "$out" != *"--platforms 仅在 --strip-attestation 模式下生效，本次将忽略"* ]]; then
+            printf '%s\n' "$out"
+            fail "skopeo 路径下显式传入 --platforms 时应告警（含参数名与「本次将忽略」）"
+          fi
+          # 与告警配对的正面证据：计划里确实写着 skopeo --all —— 告警说的「会忽略」
+          # 不是空话，而是这条路径的真实行为
+          if [[ "$out" != *"执行路径：skopeo copy --all"* ]]; then
+            printf '%s\n' "$out"
+            fail "skopeo 路径的计划未如实说明走 --all（告警与实际行为必须一致）"
+          fi
+          echo "✓ skopeo 路径下 --platforms 有告警，且计划确实是 --all"
+
+          # 负面（与上面成对）：开了 --strip-attestation 后 --platforms **真的生效**，
+          # 不该再出现那条告警。只断「没有某句」是恒真的，所以同时断平台确实进了
+          # 命令——两句合起来才说明「不告警」是因为参数生效，而不是调用根本没跑起来。
+          out="$(./scripts/sync.sh --src nginx:1.27 --dest r.example.com/x \
+            --strip-attestation --platforms linux/amd64 --dry-run 2>&1)"
+          if [[ "$out" == *"--platforms 仅在 --strip-attestation 模式下生效"* ]]; then
+            printf '%s\n' "$out"
+            fail "regctl 路径下 --platforms 真的生效，不该再告警"
+          fi
+          if [[ "$out" != *"平台 linux/amd64"* ]]; then
+            printf '%s\n' "$out"
+            fail "regctl 路径下 --platforms 未进入命令（无法证明「不告警」是因为参数生效）"
+          fi
+          echo "✓ regctl 路径下 --platforms 无告警且确实生效"
+
+          # --skip-existing 的门禁与 --platforms 相反：索引会被 regctl 重建，digest
+          # 必然不同，拿 digest 做的增量跳过在这条路径上没有意义
+          out="$(./scripts/sync.sh --src nginx:1.27 --dest r.example.com/x \
+            --strip-attestation --skip-existing --dry-run 2>&1)"
+          if [[ "$out" != *"--skip-existing 在 --strip-attestation 模式下不可用（索引会被重建，digest 必然不同），本次将忽略"* ]]; then
+            printf '%s\n' "$out"
+            fail "regctl 路径下 --skip-existing 应告警（含参数名与「本次将忽略」）"
+          fi
+          echo "✓ regctl 路径下 --skip-existing 有告警"
+
+          # --tls-verify false 在 regctl 路径下映射为明文 HTTP。自签 HTTPS 仓库走这条
+          # 路时的**唯一指路线索**：丢了它，使用者会去反复检查证书，而真正要改的是
+          # ~/.regctl/config.json 里的 cacert。
+          out="$(./scripts/sync.sh --src nginx:1.27 --dest r.example.com/x \
+            --strip-attestation --tls-verify false --dry-run 2>&1)"
+          if [[ "$out" != *"regctl 路径下 --tls-verify false 映射为明文 HTTP"* ]] \
+            || [[ "$out" != *"~/.regctl/config.json 里为它配 cacert"* ]]; then
+            printf '%s\n' "$out"
+            fail "regctl 路径下 --tls-verify false 应告警并指向 cacert 配置"
+          fi
+          echo "✓ regctl 路径下 --tls-verify false 有告警且指向 cacert"
 
       - name: 验证重试参数的作用范围
         run: |
@@ -4855,6 +5332,118 @@ jobs:
             exit 1
           fi
           echo "✓ 全绿时按 --notify-on failure 保持安静"
+
+      - name: 验证同步模式的 --notify-on failure 门禁（真实推送）
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 「要不要发通知」有两个**不同的判据**，分居两处实现：
+          #   send_check_notification 判 attention（检查模式：存在落后 / 缺失 / 无法判定）
+          #   send_notification       判 fail     （同步模式：失败数）
+          # 检查模式那一处已在「体检结果的通知真的发得出去」里端到端测过；同步模式这一处
+          # 此前**一次都没跑过**——而它是全部断言里唯一一条「该响的时候不响」：条件写反，
+          # 失败的运行会彻底静默，没有任何人收到通知，而 CI 依旧全绿。
+          #
+          # 三个用例，前两个之间只差**一个变量**（--notify-on）：
+          #   ① 对照：真实全绿 + always   → 必须收到（证明这条通路此刻是活的）
+          #   ② (a)：真实全绿 + failure   → 必须安静
+          #   ③ (b)：真实失败 + failure   → 必须收到
+          # ① 是给 ② 用的：没有它，「没收到」与「根本没接通」长得一模一样——正是本仓库
+          # 记过的「负向判据几乎总是恒真」。
+          #
+          # ③ 不能加 --dry-run：干跑不发送通知（它没真的搬过任何东西），那会让「必须响」
+          # 这条永远落在「本来就不发」上，断言等于没写。
+          fail() { echo "::error::$1"; exit 1; }
+
+          # 端口是 job 内共享的资源：8899 已被「体检结果的通知真的发得出去」占用，这里另起 8898
+          hook_port=8898
+          payload=/tmp/sync-notify-payload.json
+          sync_out=/tmp/sync-notify-out.txt
+
+          cat > /tmp/sync-notify-hook.py <<'PY'
+          import os
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+          class H(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  n = int(self.headers.get('Content-Length', 0))
+                  with open(os.environ['HOOK_PAYLOAD'], 'wb') as f:
+                      f.write(self.rfile.read(n))
+                  self.send_response(200)
+                  self.end_headers()
+
+              def log_message(self, *a):
+                  pass
+
+
+          HTTPServer(('127.0.0.1', int(os.environ['HOOK_PORT'])), H).serve_forever()
+          PY
+
+          HOOK_PAYLOAD="$payload" HOOK_PORT="$hook_port" python3 /tmp/sync-notify-hook.py &
+          hook_pid=$!
+          trap 'kill "$hook_pid" 2>/dev/null || true' EXIT
+
+          tries=0
+          while [[ "$tries" -lt 20 ]]; do
+            if curl -sS -o /dev/null --max-time 1 "http://127.0.0.1:${hook_port}/hook" 2>/dev/null; then
+              break
+            fi
+            tries=$((tries + 1))
+            sleep 0.25
+          done
+          [[ "$tries" -lt 20 ]] || fail "假 webhook 没起来（端口 ${hook_port}）"
+
+          # 每次运行前清掉上一份——否则「这一次没发」会被上一份文件冒充成「发了」，
+          # 而下面几条断言看的正是那个文件
+          run_sync() {
+            rm -f "$payload"
+            set +e
+            ./scripts/sync.sh "$@" \
+              --notify-webhook "http://127.0.0.1:${hook_port}/hook" --notify-type generic \
+              > "$sync_out" 2>&1
+            sync_rc=$?
+            set -e
+          }
+          sync_rc=0
+
+          # --- ① 对照：真实全绿 + --notify-on always（默认）→ 必须收到 ---
+          run_sync --src localhost:5000/source/hello:latest --dest localhost:5000/dest-notify-a \
+            --tls-verify false --notify-on always
+          [[ "$sync_rc" -eq 0 ]] || { cat "$sync_out"; fail "对照用例的同步本身没成功（退出码 ${sync_rc}）"; }
+          grep -qF '同步完成：共 1 个镜像，成功 1 个，跳过 0 个，失败 0 个' "$sync_out" \
+            || { cat "$sync_out"; fail "对照用例不是一次全绿的同步（正文与判据不符）"; }
+          [[ -s "$payload" ]] || { cat "$sync_out"; fail "全绿 + always 未收到通知（通路根本没接通，下面两条就都失去意义了）"; }
+          jq -e '(.text | contains("共 **1** 个镜像 ｜ 成功 1 ｜ 跳过 0 ｜ 失败 0"))' "$payload" >/dev/null \
+            || { cat "$payload"; fail "全绿的通知正文与运行结果不符"; }
+          echo "✓ ① 全绿 + always → 收到通知，通路是活的"
+
+          # --- ② (a)：真实全绿 + --notify-on failure → 必须安静 ---
+          run_sync --src localhost:5000/source/hello:latest --dest localhost:5000/dest-notify-a \
+            --tls-verify false --notify-on failure
+          # 先正向钉住「这次真的跑成了一次全绿运行」：只断「没收到」时，一次没跑起来的
+          # 调用（参数被拒、源没了）同样不发送，负向判据照样绿
+          [[ "$sync_rc" -eq 0 ]] || { cat "$sync_out"; fail "全绿用例的同步没成功（退出码 ${sync_rc}）"; }
+          grep -qF '同步完成：共 1 个镜像，成功 1 个，跳过 0 个，失败 0 个' "$sync_out" \
+            || { cat "$sync_out"; fail "全绿用例的实际结果不是全绿（正文与判据不符）"; }
+          [[ ! -e "$payload" ]] \
+            || { cat "$payload"; fail "全绿时按 --notify-on failure 不该发送，却收到了通知"; }
+          echo "✓ ② 全绿 + --notify-on failure → 保持安静"
+
+          # --- ③ (b)：真实失败 + --notify-on failure → 必须收到 ---
+          # 源在真实 registry 上不存在：这是 registry 明确回答的 404，不是网络故障
+          run_sync --src localhost:5000/nope/nothing:latest --dest localhost:5000/dest-notify-b \
+            --tls-verify false --notify-on failure
+          [[ "$sync_rc" -eq 2 ]] || { cat "$sync_out"; fail "失败用例的退出码应为 2，实际 ${sync_rc}"; }
+          grep -qF '同步完成：共 1 个镜像，成功 0 个，跳过 0 个，失败 1 个' "$sync_out" \
+            || { cat "$sync_out"; fail "失败用例的实际结果不是「失败 1 个」（正文与判据不符）"; }
+          [[ -s "$payload" ]] \
+            || { cat "$sync_out"; fail "有失败却按 --notify-on failure 静默了——这正是「该响的时候不响」的缺陷形态"; }
+          jq -e '(.text | contains("共 **1** 个镜像 ｜ 成功 0 ｜ 跳过 0 ｜ 失败 1"))
+                    and (.text | contains("### 失败详情"))' "$payload" >/dev/null \
+            || { cat "$payload"; fail "失败通知的正文里没有失败详情"; }
+          echo "✓ ③ 失败 + --notify-on failure → 发出通知，且正文含失败详情"
 
       # -----------------------------------------------------------------------
       # 私有源：走到认证这条真实路径上
