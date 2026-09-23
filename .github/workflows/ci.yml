@@ -3292,7 +3292,11 @@ jobs:
             echo "::error::非 git 目录下 actionlint 又去依赖 .git 了（#138 回归）"
             exit 1
           fi
-          section="$(sed -n '/▶ actionlint（工作流静态检查）/,/^$/p' <<<"$out")"
+          # 以**下一个 `▶ ` 行**为界，不以空行为界：`▶ ` 是 lint.sh 自己的分隔符，
+          # 而空行取决于 actionlint 的输出格式——它今天不在错误块之间夹空行，但那是
+          # 第三方行为，改以空行为界会在它变化时把 section 截断、误报成「失败的不是
+          # actionlint 那一项」
+          section="$(sed -n '/▶ actionlint（工作流静态检查）/,/^▶ /p' <<<"$out")"
           if [[ -z "$section" ]]; then
             echo "::error::输出里没有 actionlint 那一项，这条断言无从判断"
             exit 1
@@ -3338,7 +3342,11 @@ jobs:
           fi
           # 红了还不够——要确认**红的原因就是 actionlint 那一项**，
           # 否则这条断言可能在「别的项恰好也失败」时通过
-          section="$(sed -n '/▶ actionlint（工作流静态检查）/,/^$/p' <<<"$out")"
+          # 以**下一个 `▶ ` 行**为界，不以空行为界：`▶ ` 是 lint.sh 自己的分隔符，
+          # 而空行取决于 actionlint 的输出格式——它今天不在错误块之间夹空行，但那是
+          # 第三方行为，改以空行为界会在它变化时把 section 截断、误报成「失败的不是
+          # actionlint 那一项」
+          section="$(sed -n '/▶ actionlint（工作流静态检查）/,/^▶ /p' <<<"$out")"
           if ! grep -qF '✗ 失败' <<<"$section"; then
             printf '%s\n' "$section"
             echo "::error::lint.sh 红了，但失败的不是 actionlint 那一项——断言指向了别的东西"
