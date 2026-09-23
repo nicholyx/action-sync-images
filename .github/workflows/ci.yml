@@ -2894,7 +2894,7 @@ jobs:
           done
           echo "✓ regctl 下载重试正确（首败次成 / 两次全败如实报错且不留残缺 / 一次成功不误报重试）"
 
-      - name: 验证凭证映射文件
+      - name: 验证凭证映射、环境变量通路与多仓库告警
         run: |
           #!/usr/bin/env bash
           set -euo pipefail
@@ -2952,6 +2952,109 @@ jobs:
           grep -q '凭证已装载（2 个仓库）' <<<"$output" \
             || { echo "::error::SYNC_SRC_CREDENTIALS 未生效"; exit 1; }
           echo "✓ 环境变量注入（Secret 场景）可用"
+
+          # ---- 源凭证的环境变量兜底与多仓库告警（Issue #136）----
+          # usage 要求 CI 等自动化场景走环境变量：命令行参数既对同机进程可见（ps aux），
+          # 又会被调用方的日志原样打印（工作流里就有一句「执行：./scripts/sync.sh ...」）。
+          # 这条通路此前零覆盖，其中最要紧的是 SYNC_SRC_REGISTRY——它丢失时脚本会自动
+          # 从镜像列表推导 host，于是凭证被发往使用者未指定的仓库。
+          # 判据是「凭证发给了谁与预期一致」，不是「有没有装载」：只断「有装载日志」
+          # 在 host 推导错时照样通过。
+          assert_no_leak() {
+            if grep -qF 'alice' <<<"$1" || grep -qF 's3cret' <<<"$1"; then
+              echo "::error::凭证（用户名或密码）出现在输出里"
+              exit 1
+            fi
+          }
+
+          # 1) SYNC_SRC_USERNAME / SYNC_SRC_PASSWORD：host 由镜像列表推导
+          #    下面每处 $(...) 都接一个 || 兜底：sync.sh 自己非 0 退出时，set -e 会在
+          #    任何 grep 之前终止本步，而 2>&1 已把原因收进了 $output——不打出来就
+          #    只剩「exit code 1」，看不到为什么
+          output="$(SYNC_SRC_USERNAME=alice SYNC_SRC_PASSWORD=s3cret \
+            ./scripts/sync.sh --src harbor.internal.example.com/lib/nginx:1.27 \
+            --dest r.example.com/x --dry-run 2>&1)" \
+            || { echo "$output"; echo "::error::环境变量通路用例：sync.sh 本身未以 0 退出"; exit 1; }
+          echo "$output"
+          grep -qF '源仓库凭证已装载（1 个仓库）：harbor.internal.example.com' <<<"$output" \
+            || { echo "::error::环境变量用户名/密码未生效，或推导出的 host 不是镜像所在的仓库"; exit 1; }
+          assert_no_leak "$output"
+          echo "✓ 环境变量用户名/密码生效，host 由镜像推导"
+
+          # 2) 同一通路的另一个 host：host 若被写死，上一条照样绿——这条堵住它
+          output="$(SYNC_SRC_USERNAME=alice SYNC_SRC_PASSWORD=s3cret \
+            ./scripts/sync.sh --src quay.io/foo/bar:1 --dest r.example.com/x --dry-run 2>&1)" \
+            || { echo "$output"; echo "::error::环境变量通路第二个 host 用例：sync.sh 本身未以 0 退出"; exit 1; }
+          grep -qF '源仓库凭证已装载（1 个仓库）：quay.io' <<<"$output" \
+            || { echo "::error::环境变量通路推导出的 host 不是 quay.io"; exit 1; }
+          assert_no_leak "$output"
+          echo "✓ 环境变量通路对第二个 host 同样推导正确"
+
+          # 3) SYNC_SRC_REGISTRY 未设 + 多个源仓库：凭证会被发往推导出的每一个 host。
+          #    告警是「凭证发了出去但发错了地方」的唯一提示
+          output="$(./scripts/sync.sh --src 'nginx:1.27,quay.io/foo/bar:1' \
+            --dest r.example.com/x --src-username alice --src-password s3cret --dry-run 2>&1)" \
+            || { echo "$output"; echo "::error::多源仓库用例：sync.sh 本身未以 0 退出"; exit 1; }
+          echo "$output"
+          grep -qF '源仓库凭证已装载（2 个仓库）：docker.io quay.io' <<<"$output" \
+            || { echo "::error::未指定 --src-registry 时应装载全部推导出的 host"; exit 1; }
+          grep -qF '凭证被应用到多个源仓库。若不希望如此，请用 --src-registry 指定其中之一，或改用 --src-credentials 按仓库映射' <<<"$output" \
+            || { echo "::error::多源仓库且未指定 --src-registry 时应出现「凭证被应用到多个源仓库」告警"; exit 1; }
+          assert_no_leak "$output"
+          echo "✓ 未设 SYNC_SRC_REGISTRY 时凭证装载到全部推导 host，并告警"
+
+          # 4) SYNC_SRC_REGISTRY 设了：只发给它指定的那一个，告警随之消失。
+          #    与上一条互为对照——只测一侧无法区分「生效」与「恰好只有一个源」
+          output="$(SYNC_SRC_REGISTRY=docker.io ./scripts/sync.sh \
+            --src 'nginx:1.27,quay.io/foo/bar:1' --dest r.example.com/x \
+            --src-username alice --src-password s3cret --dry-run 2>&1)" \
+            || { echo "$output"; echo "::error::SYNC_SRC_REGISTRY 用例：sync.sh 本身未以 0 退出"; exit 1; }
+          echo "$output"
+          if grep -qF '凭证被应用到多个源仓库' <<<"$output"; then
+            echo "::error::设了 SYNC_SRC_REGISTRY 却仍告警「凭证被应用到多个源仓库」"
+            exit 1
+          fi
+          grep -qF '源仓库凭证已装载（1 个仓库）：docker.io' <<<"$output" \
+            || { echo "::error::SYNC_SRC_REGISTRY 未生效：装载的不是且仅是它指定的 host"; exit 1; }
+          assert_no_leak "$output"
+          echo "✓ 设了 SYNC_SRC_REGISTRY 后只装载该 host，多仓库告警消失"
+
+          # 4b) 上一条用的 docker.io 恰好能从 nginx:1.27 推导出来——若实现改成
+          #     「忽略 SYNC_SRC_REGISTRY、恒用 docker.io」，它照样绿。换一个**推导不出**
+          #     的 host 才是「设了它就真的只发那一个」的决定性证据
+          output="$(SYNC_SRC_REGISTRY=harbor.internal.example.com ./scripts/sync.sh \
+            --src 'nginx:1.27,quay.io/foo/bar:1' --dest r.example.com/x \
+            --src-username alice --src-password s3cret --dry-run 2>&1)" \
+            || { echo "$output"; echo "::error::4b 用例：sync.sh 本身未以 0 退出"; exit 1; }
+          echo "$output"
+          grep -qF '源仓库凭证已装载（1 个仓库）：harbor.internal.example.com' <<<"$output" \
+            || { echo "::error::SYNC_SRC_REGISTRY 未生效：装载的不是它指定的、镜像列表里也没有的 host"; exit 1; }
+          assert_no_leak "$output"
+          echo "✓ SYNC_SRC_REGISTRY 指定的 host 逐字生效（该 host 推导不出来）"
+
+          # 5) 两条参数校验。断文案而非只断退出码——退出码 1 可能来自任何一条 die
+          set +e
+          output="$(./scripts/sync.sh --src nginx:1.27 --dest r.example.com/x \
+            --src-username alice --dry-run 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 1 ]] || { echo "::error::只给 --src-username 应退出码 1，实际 ${code}"; exit 1; }
+          grep -qF -- '--src-username 与 --src-password 必须同时提供（当前只给了一个）' <<<"$output" \
+            || { echo "::error::未点明「必须同时提供」"; echo "$output"; exit 1; }
+          assert_no_leak "$output"
+          echo "✓ 只给 --src-username 被拒，文案点明必须同时提供"
+
+          set +e
+          output="$(./scripts/sync.sh --src nginx:1.27 --dest r.example.com/x \
+            --src-registry foo.example.com --dry-run 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 1 ]] || { echo "::error::只给 --src-registry 应退出码 1，实际 ${code}"; exit 1; }
+          grep -qF -- '--src-registry 需要与 --src-username / --src-password 一起使用' <<<"$output" \
+            || { echo "::error::未点明 --src-registry 需与凭证一起使用"; echo "$output"; exit 1; }
+          # 这一条不查「凭证不落输出」：它的命令行上根本没有凭证，
+          # 查了也是恒真——恒真的断言比没有断言更糟
+          echo "✓ 只给 --src-registry 被拒，文案点明需与凭证一起使用"
 
       - name: 验证提交信息的区间校验区分「区间无效」与「区间为空」
         run: |

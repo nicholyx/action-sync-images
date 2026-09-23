@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/engine/index.md", "reason": "断言可信度：恒真的断言比没有断言更糟（「只断有装载日志」正会踩这个）、变异要精确到单点；本任务的三条 AC5 变异必须单点可观测"}
+{"file": ".trellis/spec/maintenance/index.md", "reason": "「改动 CI 步骤」一节：新增前先搜 job 里已有什么、容器名与端口是共享资源（此前真实撞过一次）；以及收尾的文档与 CHANGELOG 锚点校验"}
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "断言脚本本身也是 bash：`if cmd | tail -1` 判的是 tail 的退出码（断 die 文案时极易踩）、固定字符串用 grep -qF、空数组 + set -u"}
