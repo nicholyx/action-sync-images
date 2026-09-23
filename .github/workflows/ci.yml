@@ -782,6 +782,224 @@ jobs:
 
           echo "✓ 同步失败的通知带出了失败原因"
 
+      - name: 验证 --history-artifact 的取值真的来自命令行
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # --history-artifact 的**本体**（坏报告分类、干跑报告不进历史、连续失败
+          # 计数不被干跑清零）已由「验证连续失败计数与失败原因渲染的判定逻辑」覆盖，
+          # 缺的只是 CLI 值有没有真的传进全局变量。
+          #
+          # 这个缺口的后果是一笔**静默错账**：值没传进去时下载的是默认的
+          # sync-report-aliyuncs，连续失败计数就在**错误的历史集合**上计算——
+          # 次数偏小，把该响的告警压掉，而且没有任何一条日志会提到这件事。
+          # 所以断的必须是「告警文案里带出的那个名字」，不是「跑通了」。
+          #
+          # 与默认值**对照**是实现上唯一能证伪的方式：只断「文案里有这段」的话，
+          # 一个丢掉 CLI 值的实现照样绿——默认值恰好也在文案里。
+          fail() { echo "::error::$1"; exit 1; }
+
+          # mock gh：run list 给一个运行 id（好走到下载那一步）、下载一律失败 →
+          # fetch_sync_history 返回非零，既不联网也不 sleep。要断的那句告警正好
+          # 打印在「拿不到历史」之后。
+          #
+          # 参数记进日志：断「CLI 的值真的传到了 gh run download -n 上」——
+          # 那才是决定「在哪个历史集合上算连续失败」的那一处。只断告警文案的话，
+          # 一个「文案用 CLI 值、下载却仍用默认值」的实现照样绿。
+          mock_dir="$(mktemp -d)"
+          gh_calls="${mock_dir}/gh-calls.log"
+          : > "$gh_calls"
+          cat > "${mock_dir}/gh" <<'MOCK'
+          #!/usr/bin/env bash
+          printf '%s\n' "$*" >> "$GH_CALL_LOG"
+          if [[ "$1" == "run" && "$2" == "list" ]]; then
+            printf '111\n'
+            exit 0
+          fi
+          exit 1
+          MOCK
+          chmod +x "${mock_dir}/gh"
+          PATH="${mock_dir}:$PATH"
+          GH_CALL_LOG="$gh_calls"
+          export PATH GH_CALL_LOG
+
+          # 非法引用造出一次确定的失败：同步真的失败了，才会走到失败通知的历史查询。
+          # **不能加 --dry-run**——干跑不发通知（没有「已发生的事」可通知），
+          # 加了就连这条告警都不会有。
+          run_with_history_artifact() {
+            local out
+            # 每次先清空日志，让下面只看到本次收到的参数
+            : > "$gh_calls"
+            set +e
+            out="$(./scripts/sync.sh --src 'https://bad.example.com/x:1' --dest r.example.com/x \
+              --notify-webhook http://127.0.0.1:8897/hook \
+              --notify-after-failures 2 "$@" 2>&1)"
+            set -e
+            printf '%s\n' "$out"
+          }
+
+          custom="$(run_with_history_artifact --history-artifact my-custom-artifact)"
+          want='无法获取历史报告（--history-artifact「my-custom-artifact」），无法判断连续失败次数，本次不发送失败通知'
+          if ! grep -qF -- "$want" <<<"$custom"; then
+            printf '%s\n' "$custom"
+            fail "--history-artifact 的 CLI 值没有落到全局变量上（期望告警整句：「${want}」）"
+          fi
+          if ! grep -qF -- '-n my-custom-artifact' "$gh_calls"; then
+            cat "$gh_calls"
+            fail "CLI 的值没传到 gh run download -n 上——历史集合仍是默认的那个"
+          fi
+          echo "✓ 传 --history-artifact 时，告警与下载参数用的都是 CLI 给的名字"
+
+          # 正对照：不传时带出默认值。它同时堵死「夹具自己没生效」——mock 没挡住、
+          # 引用没失败、告警根本没打印出来时，这一条会与上面那条**一起**红，
+          # 而不是让上面那句静默变绿。
+          defaulted="$(run_with_history_artifact)"
+          want_default='无法获取历史报告（--history-artifact「sync-report-aliyuncs」），无法判断连续失败次数，本次不发送失败通知'
+          if ! grep -qF -- "$want_default" <<<"$defaulted"; then
+            printf '%s\n' "$defaulted"
+            fail "不传 --history-artifact 时未带出默认值（期望告警整句：「${want_default}」）"
+          fi
+          if ! grep -qF -- '-n sync-report-aliyuncs' "$gh_calls"; then
+            cat "$gh_calls"
+            fail "不传 --history-artifact 时下载参数不是默认值"
+          fi
+          echo "✓ 正对照：不传时告警与下载参数都是默认值 sync-report-aliyuncs"
+
+      - name: 验证 --notify-type 的类型识别与包装格式
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # CI 里另外 5 处 --notify-type 全是 generic，于是两件事从没被跑过：
+          # URL → 平台的识别，以及 dingtalk / feishu 的外层包装。这两处坏了都是
+          # 静默的——通知照样「发出去了（HTTP 200）」，只是发错平台或格式不合规。
+          fail() { echo "::error::$1"; exit 1; }
+
+          # ---- ① detect_notify_type：四类 URL 各一条 ----
+          # 纯字符串匹配，不需要 webhook。整段抽出生产函数（CI 里已有这个做法，
+          # 见「验证重跑指引」那一步）。
+          sed -n '/^detect_notify_type()/,/^}/p' scripts/sync.sh > /tmp/detect-notify-type-fn.sh
+          [[ -s /tmp/detect-notify-type-fn.sh ]] || fail "没能从 sync.sh 抽出 detect_notify_type（函数改名了？）"
+          # shellcheck disable=SC1091
+          source /tmp/detect-notify-type-fn.sh
+
+          # 断言用**等值**：只断「非空」的话，函数被改成恒返回某一个平台也照样绿。
+          # 判据是「这个判据能区分几种形态」——四类平台加兜底 generic 共五种，
+          # 逐条比对才分得开。
+          expect_type() {
+            local url="$1" want="$2" got
+            got="$(detect_notify_type "$url")"
+            if [[ "$got" != "$want" ]]; then
+              fail "URL「${url}」应识别为 ${want}，实际 ${got}"
+            fi
+            echo "✓ ${url} → ${got}"
+          }
+
+          expect_type 'https://oapi.dingtalk.com/robot/send?access_token=abc' dingtalk
+          expect_type 'https://open.feishu.cn/open-apis/bot/v2/hook/xxx' feishu
+          expect_type 'https://open.larksuite.com/open-apis/bot/v2/hook/xxx' feishu
+          expect_type 'https://hooks.slack.com/services/T000/B000/xxx' slack
+          expect_type 'https://hooks.example.com/services/xxx' generic
+
+          # ---- ② 包装格式：用本机 webhook 真发一次 ----
+          # 不能加 --dry-run（干跑不发通知）；用非法引用造失败，不需要 registry。
+          cat > /tmp/hook-notify-type.py <<'PY'
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+          class H(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  n = int(self.headers.get('Content-Length', 0))
+                  with open('/tmp/hook-notify-type-payload.json', 'wb') as f:
+                      f.write(self.rfile.read(n))
+                  self.send_response(200)
+                  self.end_headers()
+                  self.wfile.write(b'ok')
+
+              def log_message(self, *a):
+                  pass
+
+
+          HTTPServer(('127.0.0.1', 8896), H).serve_forever()
+          PY
+          rm -f /tmp/hook-notify-type-payload.json
+          python3 /tmp/hook-notify-type.py &
+          hook_pid=$!
+          trap 'kill "$hook_pid" 2>/dev/null || true' EXIT
+          sleep 2
+
+          # 每次调用前清掉上一份 payload——否则「这一次没发」会被上一份文件
+          # 冒充成「发了」，而下面几条断言看的正是那个文件
+          send_to_hook() {
+            local out
+            rm -f /tmp/hook-notify-type-payload.json
+            set +e
+            out="$(./scripts/sync.sh --src 'https://bad.example.com/x:1' --dest r.example.com/x \
+              "$@" 2>&1)"
+            set -e
+            printf '%s\n' "$out"
+          }
+
+          payload=/tmp/hook-notify-type-payload.json
+
+          # dingtalk：msgtype=markdown + markdown{title,text}
+          out="$(send_to_hook --notify-webhook http://127.0.0.1:8896/hook --notify-type dingtalk)"
+          if [[ ! -s "$payload" ]]; then
+            printf '%s\n' "$out"
+            fail "dingtalk 通知没发出去（假 webhook 没收到 POST）"
+          fi
+          if ! jq -e '(.msgtype == "markdown")
+                 and (.markdown | keys == ["text","title"])
+                 and (.markdown.title == "镜像同步完成")
+                 and (.markdown.text | contains("### 失败详情"))' \
+               "$payload" >/dev/null; then
+            cat "$payload"
+            fail "dingtalk 的包装应为 msgtype=markdown + markdown{title,text}，且正文与通用版同源"
+          fi
+          echo "✓ dingtalk 包装正确，且正文共用了同一份"
+
+          # feishu：msg_type=text + content.text
+          out="$(send_to_hook --notify-webhook http://127.0.0.1:8896/hook --notify-type feishu)"
+          if [[ ! -s "$payload" ]]; then
+            printf '%s\n' "$out"
+            fail "feishu 通知没发出去（假 webhook 没收到 POST）"
+          fi
+          if ! jq -e '(.msg_type == "text")
+                 and (.content | keys == ["text"])
+                 and (.content.text | contains("### 失败详情"))' \
+               "$payload" >/dev/null; then
+            cat "$payload"
+            fail "feishu 的包装应为 msg_type=text + content.text，且正文与通用版同源"
+          fi
+          echo "✓ feishu 包装正确，且正文共用了同一份"
+
+          # 不传 --notify-type（默认 auto）+ 不匹配任何平台的 URL → generic。
+          # 这条同时覆盖 auto 这条通路：识别不出平台时才落到兜底包装。
+          out="$(send_to_hook --notify-webhook http://127.0.0.1:8896/hook)"
+          if [[ ! -s "$payload" ]]; then
+            printf '%s\n' "$out"
+            fail "auto 类型下通知没发出去（假 webhook 没收到 POST）"
+          fi
+          if ! jq -e 'keys == ["text"] and (.text | contains("### 失败详情"))' "$payload" >/dev/null; then
+            cat "$payload"
+            fail "auto + 非平台 URL 的包装应为顶层 text（且只有这一个键）"
+          fi
+          echo "✓ auto 识别为 generic，包装为顶层 text"
+
+          # 未知类型：只告警、不发送——静默当成某个平台发出去比一次可见的失败更糟
+          out="$(send_to_hook --notify-webhook http://127.0.0.1:8896/hook --notify-type bogus)"
+          want='未知的通知类型：bogus（可选：dingtalk / feishu / slack / generic）'
+          if ! grep -qF -- "$want" <<<"$out"; then
+            printf '%s\n' "$out"
+            fail "未知类型未按「未知的通知类型」告警（期望：「${want}」）"
+          fi
+          if [[ -e "$payload" ]]; then
+            cat "$payload"
+            fail "未知类型被静默当成某个平台发出去了"
+          fi
+          echo "✓ 未知类型只告警、不发送"
+
       - name: 验证非法镜像引用会被拦下
         run: |
           #!/usr/bin/env bash
@@ -1193,6 +1411,251 @@ jobs:
             fail "夹具里只该取到上传步骤自己的「夹具名」，实际取到上面这些（want 未按步骤边界复位，或取法根本没跑起来）"
           fi
           echo "✓ artifact 名只取自上传步骤自己的 name，不捎带无关步骤的属性行"
+
+      - name: 验证 history.sh 的参数取值与可选参数的特例分支
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 这一组断的是 history.sh 四个参数的**取值**，不是「跑通了」。
+          # 四者坏了都是静默的：
+          #   --limit        决定趋势的**窗口大小**——窗口是 history.sh 的核心语义
+          #                  （大量断言围绕「窗口内全绿 → 退出码 0」构建），
+          #                  唯独窗口大小的来源从没测过
+          #   --top-failures 有一条特例分支（后面跟另一个选项或已到结尾时退回默认值），
+          #                  坏掉就是悄悄用默认值
+          #   --report-name / --workflow 决定去哪个 Artifact、哪个工作流里找报告，
+          #                  坏了的表现是「一份报告都捞不到」——看起来像「历史里没有数据」
+          fail() { echo "::error::$1"; exit 1; }
+
+          # mock gh：把每次收到的参数记进日志，之后直接断**参数本身**。
+          # run list 默认输出空列表（history.sh 以「没有取到任何运行记录」结束，
+          # 不联网、也不 sleep——只有下载失败的重试才 sleep 5）；GH_LIST_OUT=one
+          # 时给出一个运行 id，好走到下载那一步。
+          mock_dir="$(mktemp -d)"
+          call_log="${mock_dir}/gh-calls.log"
+          : > "$call_log"
+          cat > "${mock_dir}/gh" <<'MOCK'
+          #!/usr/bin/env bash
+          printf '%s\n' "$*" >> "$GH_CALL_LOG"
+          if [[ "$1" == "run" && "$2" == "list" ]]; then
+            if [[ "${GH_LIST_OUT:-}" == "one" ]]; then
+              printf '111\n'
+            fi
+            exit 0
+          fi
+          if [[ "$1" == "run" && "$2" == "download" ]]; then
+            # 这条文案会被 classify_download_failure 归到 no-artifact：静默跳过，
+            # 不进那轮 sleep 5 的重试
+            printf 'no valid artifacts found\n' >&2
+            exit 1
+          fi
+          exit 1
+          MOCK
+          chmod +x "${mock_dir}/gh"
+          PATH="${mock_dir}:$PATH"
+          GH_CALL_LOG="$call_log"
+          export PATH GH_CALL_LOG
+
+          # 取某个选项在日志里的取值。用 awk 定位而不是 grep 固定子串：参数顺序是
+          # 无害的细节，断「--limit 后面跟的是几」才既准确又不会因为一次重排而假红。
+          # 只打印**第一个**匹配，末尾不接 `head -1`——pipefail 下那会有 SIGPIPE
+          # 假红的可能，而假红和恒真一样不可信。
+          arg_value() {
+            local subcmd="$1" flag="$2"
+            awk -v cmd="$subcmd" -v flag="$flag" '
+              found { next }
+              index($0, cmd " ") == 1 {
+                for (i = 1; i < NF; i++) {
+                  if ($i == flag) { print $(i+1); found = 1; break }
+                }
+              }' "$call_log"
+          }
+
+          # 每次跑之前清空日志，让 arg_value 只看到本次收到的参数
+          run_history() {
+            local out
+            : > "$call_log"
+            set +e
+            out="$("$@" 2>&1)"
+            set -e
+            printf '%s\n' "$out"
+          }
+
+          # ---- 窗口大小：--limit 必须落到 gh run list 的参数上 ----
+          # 「跑通了」证明不了窗口大小对：把 --limit 写死成 20 的实现照样跑通。
+          out="$(run_history ./scripts/history.sh --limit 3)"
+          if [[ "$out" != *'没有取到任何运行记录'* ]]; then
+            printf '%s\n' "$out"
+            fail "--limit 3 时没有走到运行列表这条路（mock 没生效？）"
+          fi
+          lim="$(arg_value 'run list' --limit)"
+          if [[ "$lim" != "3" ]]; then
+            cat "$call_log"
+            fail "--limit 3 没传到 gh run list 上，窗口大小成了 ${lim}"
+          fi
+          echo "✓ --limit 3 落到了 gh run list 的窗口参数上"
+
+          # 正对照：不传时窗口是默认的 20。没有它，上面那条在「窗口被写死成 3」
+          # 的实现上也会绿。
+          run_history ./scripts/history.sh >/dev/null
+          lim="$(arg_value 'run list' --limit)"
+          if [[ "$lim" != "20" ]]; then
+            cat "$call_log"
+            fail "不传 --limit 时窗口应为默认 20，实际 ${lim}"
+          fi
+          echo "✓ 正对照：不传 --limit 时窗口为默认 20"
+
+          # ---- --workflow ----
+          run_history ./scripts/history.sh --workflow Release >/dev/null
+          wf="$(arg_value 'run list' --workflow)"
+          if [[ "$wf" != "Release" ]]; then
+            cat "$call_log"
+            fail "--workflow Release 没传到 gh run list 上，实际「${wf}」"
+          fi
+          echo "✓ --workflow 落到了 gh run list 上"
+
+          # --check 模式下**默认**只看体检工作流（窗口不被 CI 等高频运行挤占）。
+          # 写成正向等值断言：取值必须是 Check-Registry，而不只是「有值」。
+          run_history ./scripts/history.sh --check audit >/dev/null
+          wf="$(arg_value 'run list' --workflow)"
+          if [[ "$wf" != "Check-Registry" ]]; then
+            cat "$call_log"
+            fail "--check 模式下的默认工作流应为 Check-Registry，实际「${wf}」"
+          fi
+          echo "✓ --check 模式下默认只看 Check-Registry"
+
+          # ---- --report-name ----
+          # 走到下载那一步，断两处：报错文案里的附件名、gh 实际收到的 -n。
+          GH_LIST_OUT=one
+          export GH_LIST_OUT
+          out="$(run_history ./scripts/history.sh --report-name my-custom-report)"
+          want='这 1 次运行里没有任何「my-custom-report」附件'
+          if [[ "$out" != *"$want"* ]]; then
+            printf '%s\n' "$out"
+            fail "--report-name 没落到取值上（期望文案含「${want}」）"
+          fi
+          name="$(arg_value 'run download' -n)"
+          if [[ "$name" != "my-custom-report" ]]; then
+            cat "$call_log"
+            fail "--report-name 没传到 gh run download -n 上，实际「${name}」"
+          fi
+          echo "✓ --report-name 落到了下载参数与报错文案上"
+
+          # 正对照：不传时是默认的 sync-report-aliyuncs
+          out="$(run_history ./scripts/history.sh)"
+          want='这 1 次运行里没有任何「sync-report-aliyuncs」附件'
+          if [[ "$out" != *"$want"* ]]; then
+            printf '%s\n' "$out"
+            fail "不传 --report-name 时未使用默认值（期望文案含「${want}」）"
+          fi
+          name="$(arg_value 'run download' -n)"
+          if [[ "$name" != "sync-report-aliyuncs" ]]; then
+            cat "$call_log"
+            fail "不传 --report-name 时下载参数应为默认值，实际「${name}」"
+          fi
+          GH_LIST_OUT=""
+          echo "✓ 正对照：不传 --report-name 时为默认 sync-report-aliyuncs"
+
+          # ---- --top-failures 的特例分支：两条路径都要断 ----
+          # 「可选参数」最容易被改坏，而坏掉是静默的（悄悄用默认值）。观察点是
+          # --report-dir 落盘报告里的 query 字段——这几个取值唯一的机器可读出口。
+          work="$(mktemp -d)"
+          cat > "${work}/sync-report.json" <<'JSON'
+          {"generated_at": "2026-09-01T01:00:00Z", "dry_run": false,
+           "total": 2, "success": 1, "skipped": 0, "failed": 1, "excluded": 0,
+           "images": [
+            {"source": "nginx:1.27", "dest": "r.example.com/x/nginx:1.27", "status": "success",
+             "platforms": "linux/amd64", "source_digest": "sha256:aaa", "dest_digest": "sha256:aaa",
+             "seconds": 3, "note": ""},
+            {"source": "https://bad.example.com/x:1", "dest": "r.example.com/x/x:1", "status": "failed",
+             "platforms": "", "source_digest": "", "dest_digest": "", "seconds": 1,
+             "note": "镜像引用格式错误"}
+           ]}
+          JSON
+
+          # 报告没落盘时给出可诊断的失败，而不是让 jq 报「无法打开文件」——
+          # 那读起来像脚本坏了，实际是夹具没被消费。
+          #
+          # 它只在命令替换里被调用，所以**不能用 fail**：命令替换只吸走 stdout，
+          # 「::error::哪条断言」会被吞进变量里，CI 上只剩一句「退出码 1」。
+          # 这里直接把注解打到 stderr —— 它不进命令替换，一定会出现在日志里。
+          query_field() {
+            local out_dir="$1" field="$2" desc="$3"
+            if [[ ! -f "${out_dir}/sync-trend-report.json" ]]; then
+              printf '::error::%s：--report-dir 没落盘趋势报告（夹具没被读进去？）\n' "$desc" >&2
+              exit 1
+            fi
+            jq -r "$field" "${out_dir}/sync-trend-report.json"
+          }
+
+          # 夹具里有一条失败记录，退出码是 2，不是错误
+          trend_run() {
+            local out_dir="$1"; shift
+            set +e
+            ./scripts/history.sh --dir "$work" --report-dir "$out_dir" "$@" >/dev/null 2>&1
+            set -e
+          }
+
+          d1="$(mktemp -d)"
+          trend_run "$d1" --top-failures 3
+          rows="$(query_field "$d1" '.rows | length' '--top-failures 3')"
+          top="$(query_field "$d1" '.query.top_failures' '--top-failures 3')"
+          # 正对照：夹具确实被读了（两个源镜像 → 两行）。没有它，「行数为 0」
+          # 也能让下面那条 top 断言看起来像是通过了。
+          [[ "$rows" == "2" ]] || fail "夹具没被读进去：rows 应为 2，实际 ${rows}"
+          [[ "$top" == "3" ]] || fail "--top-failures 3 时取值应为 3，实际 ${top}"
+          echo "✓ --top-failures 带值时取该值（3）"
+
+          # 不带值、后面跟另一个选项：退回默认 10，**且不能吃掉后面那个选项**
+          d2="$(mktemp -d)"
+          trend_run "$d2" --top-failures --limit 5
+          top="$(query_field "$d2" '.query.top_failures' '--top-failures 后跟 --limit 5')"
+          lim="$(query_field "$d2" '.query.limit' '--top-failures 后跟 --limit 5')"
+          [[ "$top" == "10" ]] || fail "「--top-failures 后跟另一个选项」时应退回默认 10，实际 ${top}"
+          # 这一条才是特例分支的关键：把 shift 2 写成 shift 1 时，--top-failures
+          # 会把 --limit 当成自己的值（那会先撞上正整数校验），而退回默认值时
+          # 若顺手多 shift 一次，--limit 就消失了——两条路径都在这里见红
+          [[ "$lim" == "5" ]] || fail "特例分支吃掉了后面的 --limit：limit 应为 5，实际 ${lim}"
+          echo "✓ --top-failures 后跟选项时退回默认 10，且没吃掉 --limit"
+
+          # 不带值、已在结尾：同样退回默认 10
+          d3="$(mktemp -d)"
+          trend_run "$d3" --top-failures
+          top="$(query_field "$d3" '.query.top_failures' '--top-failures 在结尾')"
+          [[ "$top" == "10" ]] || fail "「--top-failures 在结尾」时应退回默认 10，实际 ${top}"
+          echo "✓ --top-failures 在结尾时退回默认 10"
+
+          # ---- 四个校验错误各一条 ----
+          # 校验失败的默认形态是「静默用默认值」或「跑到一半才炸」，所以断的是
+          # 退出码 + **报错文案**：只断退出码的话，1 可能来自任何一条 die，
+          # 「这条被拒绝」与「别的 die 先炸了」区分不开。
+          check_reject() {
+            local desc="$1" expect="$2"; shift 2
+            local out code
+            set +e
+            out="$("$@" 2>&1)"
+            code=$?
+            set -e
+            if [[ "$code" -ne 1 ]]; then
+              printf '%s\n' "$out"
+              fail "${desc}：期望退出码 1，实际 ${code}"
+            fi
+            if [[ "$out" != *"$expect"* ]]; then
+              printf '%s\n' "$out"
+              fail "${desc}：报错文案里没有「${expect}」——退出码对，但炸的不是这条"
+            fi
+            echo "✓ 已拒绝：${desc}"
+          }
+
+          check_reject "--check 未知类型" "--check 的类型必须是 audit 或 lock-audit，当前为「bogus」" \
+            ./scripts/history.sh --check bogus
+          check_reject "--limit 为 0" "--limit 必须是正整数，当前为「0」" \
+            ./scripts/history.sh --limit 0
+          check_reject "--top-failures 为 0" "--top-failures 必须是正整数，当前为「0」" \
+            ./scripts/history.sh --top-failures 0
+          check_reject "--slowest 非数字" "--slowest 必须是正整数，当前为「abc」" \
+            ./scripts/history.sh --slowest abc
 
       - name: 验证镜像筛选
         run: |
