@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/engine/index.md", "reason": "断言口径：恒真的断言比没有断言更糟、变异要精确到单点、负向判据几乎总是恒真、比 JSON 要用 jq -S、夹具计数要互不相同——本任务四条都要按这个口径写"}
+{"file": ".trellis/spec/workflows/index.md", "reason": "在 ci.yml 的既有步骤里插入断言：run 块缩进、端口/固定路径是 job 共享、加步骤前先核实既有环境"}
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "夹具与 stub 用 bash 写；本机 bash 3.2、交互 shell 是 zsh（取字符用 cut -c），跨解释器写法"}

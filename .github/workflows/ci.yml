@@ -1112,6 +1112,38 @@ jobs:
           check "generic 200 + 空体（自建 webhook 的常态）" generic 200 '' accepted '该类型无统一回执'
           check "generic 200 + 任意响应体" generic 200 '{"whatever":true}' accepted '该类型无统一回执'
 
+          # ---- 两条保守边界：形态「说不清」时，宁可说判不了，也绝不猜成成功 ----
+          # 下面两条钉的是**刻意的现状**，不是缺陷。写清「为什么这个方向可接受」，
+          # 是因为它们看起来都「不够聪明」——下一个读到这里的人很可能顺手去「修」，
+          # 而每一次「修」的方向都是把保守换成乐观，代价是假报成功。
+          #
+          # ① Slack 回执只差一个尾随空白（`ok `）：判定只去 CR/LF、不去尾随空白，
+          #    于是它既不等于字面量 ok，又因为含空白而不像一枚回执 token → undetermined。
+          #    可接受：一个「ok 后面还有空白」的响应体与「被代理改写过 / 不是 Slack 的原样
+          #    回执」无法区分，而错判 confirmed 就是**假报已送达**（使用者据此以为告警链路
+          #    正常，出事时才发现根本没发出去）。反方向同样不能走：它也不是平台拒收的
+          #    证据，报 rejected 会把排查方向带偏到机器人配置上。
+          check "Slack 200 + ok 带尾随空白（保守：判不了就不猜）" slack 200 'ok ' \
+            undetermined '响应体不是 Slack 的预期回执（ok ）'
+          # 值域只有 {confirmed, rejected, undetermined} 三种，逐个枚举。
+          # 「不是 confirmed」单独写是**恒真**的（跳过、没跑成、输出为空都不含这个词），
+          # 所以三条一起写：一条正面 + 两条显式排除，才算把值域钉死。
+          [[ "$NOTIFY_VERDICT" == "undetermined" ]] \
+            || fail "Slack「ok 」应落 undetermined，实际「${NOTIFY_VERDICT}」"
+          [[ "$NOTIFY_VERDICT" != "confirmed" ]] \
+            || fail "Slack「ok 」被判成 confirmed —— 这是假报「已送达」"
+          [[ "$NOTIFY_VERDICT" != "rejected" ]] \
+            || fail "Slack「ok 」被判成 rejected —— 它不是平台拒收的证据"
+
+          # ② JSON Lines 多值回执（`{"code":0}` 换行后跟 `{"code":310000}`）：
+          #    jq 会**逐值**输出，code 被拼成 "0\n310000"，与 "0" 的比较失败 → rejected。
+          #    可接受：多值本身说明响应体不是一份正常的单值回执（代理拼接、平台改了
+          #    回执格式都可能），此时保守方向是拒收；若改成「取第一个值」，那条随后
+          #    跟来的报错会被静默丢掉——正是这一整步要消灭的假成功。
+          #    详情里的换行由函数统一压成空格（详情要进 GitHub 注解，注解按行解析）。
+          check "飞书 200 + JSON Lines 多值（0 之后跟一条报错）" feishu 200 \
+            $'{"code":0}\n{"code":310000}' rejected 'code=0 310000'
+
           echo "NOTIFY-VERDICT-OK"
 
       - name: 验证通知送达判定的端到端行为
@@ -1867,6 +1899,121 @@ jobs:
           grep -qxF '    v10 v6 v5 v4 v3' <<<"$out" \
             || fail "默认 limit（5）：应恰好列出 5 个"
           echo "✓ 默认 limit（5）：总数仍是 6，列出 5 个——limit 只影响展示"
+
+          # 边界的另一侧：缺失数**不超过** limit 时，文案必须换成「全部列出如下」。
+          # 它的作用正是防止误读——写「版本序最大的 5 个」却只列出 2 条，看的人会以为
+          # 还有没显示出来的。所以这句话错了也最难被察觉：总数对、退出码对、列出的内容
+          # 也确实是全部，只有那半句措辞在骗人。
+          #
+          # 与下面那次运行成对：**limit 同为 5**，两次只差「缺失数落在边界哪一侧」。
+          srcs5="mock-a.local/app:v1,mock-a.local/app:v2,mock-a.local/app:v3"
+          srcs5="${srcs5},mock-a.local/app:v4,mock-a.local/app:v5"
+          set +e
+          out="$(./scripts/sync.sh --src "$srcs5" --check-updates --updates-limit 5 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 2 ]] || fail "缺失 2 个（≤ limit）：期望退出码 2，实际 ${code}"
+          grep -qF '上游共 7 个 tag，其中 2 个不在清单中，全部列出如下' <<<"$out" \
+            || fail "缺失 2 个 ≤ limit 5 时应说「全部列出如下」"
+          # 说了「全部」就必须真的全列出来：只改措辞而仍按 limit 截断，
+          # 会让「全部」两个字变成假话——这是本步唯一一处断言列出内容的场合
+          grep -qxF '    v10 v6' <<<"$out" \
+            || fail "说了「全部列出如下」就必须列出全部 2 个（v10 v6）"
+          echo "✓ 缺失 2 个 ≤ limit 5：文案为「全部列出如下」且列出全部 2 个"
+
+          # 对照：limit 仍是 5，缺失数 6 > 5 → 必须说「版本序最大的 5 个」。
+          # 一条 run 里断不了两侧，所以两侧各跑一次、互为对照——只有两次都得偿所愿，
+          # 才能说明文案是随「缺失数与 limit 的大小关系」切换的，而不是恒为某一句话
+          set +e
+          out="$(./scripts/sync.sh --src mock-a.local/app:v1 --check-updates --updates-limit 5 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 2 ]] || fail "缺失 6 个（> limit）：期望退出码 2，实际 ${code}"
+          grep -qF '上游共 7 个 tag，其中 6 个不在清单中，版本序最大的 5 个' <<<"$out" \
+            || fail "缺失 6 个 > limit 5 时应说「版本序最大的 5 个」"
+          # 与上面那句正面断言成对：只断「该出现哪句」时，一个把两句话都打出来的实现
+          # 照样绿——而它同样是误导（列出了 5 条却在旁边写「全部列出如下」）
+          if grep -qF '全部列出如下' <<<"$out"; then
+            fail "缺失 6 个 > limit 5 时不该说「全部列出如下」（只列出了 5 条）"
+          fi
+          echo "✓ 对照：缺失 6 个 > limit 5：文案为「版本序最大的 5 个」，且不含「全部列出如下」"
+
+      - name: 验证 --check-updates 按仓库分组去重（stub skopeo）
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # group_repos_from_manifest 把清单按**源仓库**分组：同一个仓库的多个 tag
+          # 只查一次上游（k8s 那十几个组件否则会把同一个仓库查十几遍），结果写进
+          # UPD_REPOS / UPD_KNOWN_TAGS 两个**下标对齐**的并行数组。
+          #
+          # 此前所有 check-updates 用例的清单里都只有一个 tag，也就是**每个仓库一组**，
+          # 并行数组的下标恰好一一对应——于是「分组」这件事等于没被测过。它坏掉的方式
+          # 是**静默少算**：要么同一个仓库被列成两行（检查数翻倍、上游被查两遍），
+          # 要么「清单中」那列只留下第一个 tag、后面的被丢掉——不报错、退出码照旧是 2。
+          #
+          # 夹具放三个仓库：一个带两个 tag（验「合起来」）、一个带一个 tag（验「没有把
+          # 不相干的仓库也合进来」，只断前者时「全都合成一组」的实现照样绿）、一个带齐
+          # 上游全部 tag（已覆盖，用来把汇总行的计数拉开，理由见夹具那段的注释）。
+          fail() { echo "::error::$1"; exit 1; }
+
+          # stub skopeo 由前面「准备 stub skopeo 夹具」那一步放在固定路径上。
+          # 注意 stub 的 list-tags 对**任何**仓库都返回同一组 tag，所以本用例要造的
+          # 「同仓库多 tag」现场在**清单侧**，与 stub 无关。
+          PATH="/tmp/stub-skopeo:$PATH"
+          export PATH
+
+          # 清单里放三个仓库：app 两个 tag（合起来）、other 一个（不混进来）、
+          # full 七个（把上游全带上，也就是**已覆盖**）。
+          # full 不是凑数：汇总行有四个计数，「计数值若相等，串位在等值断言下是隐形的」
+          # 是本仓库记过的夹具自证陷阱（#158）。只有 app 与 other 时 checked 与
+          # with_updates 都是 2，把这两个数字对调，输出一字不差、断言全绿——实测如此。
+          # 抬进一个已覆盖的仓库后，四个计数是 3 / 2 / 11 / 0，互不相同。
+          srcs="mock-a.local/app:v1,mock-a.local/app:v2,mock-b.local/other:v1"
+          srcs="${srcs},mock-c.local/full:v1,mock-c.local/full:v2,mock-c.local/full:v3"
+          srcs="${srcs},mock-c.local/full:v4,mock-c.local/full:v5,mock-c.local/full:v6"
+          srcs="${srcs},mock-c.local/full:v10"
+          set +e
+          out="$(./scripts/sync.sh --src "$srcs" --check-updates --updates-limit 5 2>&1)"
+          code=$?
+          set -e
+          printf '%s\n' "$out"
+          [[ "$code" -eq 2 ]] || fail "有未收录的 tag，期望退出码 2，实际 ${code}"
+
+          # ① 去重的**直接**证据：源仓库数。10 个 tag 属于三个仓库，查的就该是三个。
+          # 不去重时这里是 10（同一个仓库被查两遍，上游多挨一次网络请求）
+          grep -qF '检查 3 个源仓库的上游 tag 列表' <<<"$out" \
+            || fail "同仓库的两个 tag 应合成一组：应检查 3 个源仓库（不去重时是 10）"
+
+          # ② 仓库名在输出里**只出现一次**。用它而不是只数「检查 N 个」：分组表是
+          # 逐行渲染的，同一个仓库被列成两行时，看报告的人会以为清单里有两个仓库
+          n_app="$(grep -cxF 'mock-a.local/app' <<<"$out" || true)"
+          [[ "$n_app" -eq 1 ]] || fail "mock-a.local/app 应只出现一次（表头行），实际 ${n_app} 次"
+
+          # ③ 两个 tag 都在**同一组**的「清单中」里。这是「合并」的正对照：
+          # 只断①时，一个「合成了组但只记住第一个 tag」的实现能过——它会漏掉 v2，
+          # 于是 v2 被报成「上游新增」，使用者以为自己漏收录了
+          grep -qxF '  清单中：v1 v2' <<<"$out" \
+            || fail "同仓库的两个 tag 应列在同一组的「清单中」里（v1 v2）"
+
+          # ④ 另一个仓库独立成一组：防止「全都合成一组」也能满足上面几条
+          n_other="$(grep -cxF 'mock-b.local/other' <<<"$out" || true)"
+          [[ "$n_other" -eq 1 ]] || fail "mock-b.local/other 应自成一组且只出现一次，实际 ${n_other} 次"
+          grep -qxF '  清单中：v1' <<<"$out" \
+            || fail "mock-b.local/other 的「清单中」应只有它自己的 v1"
+
+          # ⑤ 汇总里的四个计数互不相同（3 / 2 / 11 / 0），且都对得上分组结果：
+          # 仓库 3 个（app、other、full，其中 full 已覆盖）、有未收录的 2 个、
+          # 缺失合计 5（app 少 v3 v4 v5 v6 v10）+ 6（other 少 v2…v10）= 11。
+          grep -qF '检查完成：3 个源仓库，2 个有未收录的 tag（共 11 个），0 个查询失败' <<<"$out" \
+            || fail "分组去重后汇总计数应为 3 个仓库（其中一个已覆盖）/ 2 个有更新 / 共 11 个缺失"
+
+          # full 的「已覆盖」既是 ① 里那个 3 的来源，也顺带钉住一件事：**混合场景**
+          # （同一批里既有已覆盖、又有未收录）下「已覆盖」分支的渲染。此前的用例里
+          # 这两种状态从不同时出现，只跑过其中一条分支
+          grep -qxF '  清单已覆盖上游现有 tag（上游共 7 个）' <<<"$out" \
+            || fail "mock-c.local/full 的清单带齐了上游全部 tag，应报「清单已覆盖上游现有 tag」"
+          echo "✓ 同仓库的两个 tag 合成一组（仓库只列一次、清单中两个 tag），另一个仓库独立成组"
 
       - name: 验证 check-updates / lock-audit 的报告落盘（stub skopeo）
         run: |
@@ -2746,6 +2893,29 @@ jobs:
             fail "regctl 路径下 --tls-verify false 应告警并指向 cacert 配置"
           fi
           echo "✓ regctl 路径下 --tls-verify false 有告警且指向 cacert"
+
+          # 负面（与上面成对）：**skopeo** 路径下绝不能出现上面那句。它是给 regctl
+          # 路径写的——在 skopeo 路径下 --tls-verify=false 是真生效的（「HTTPS 但跳过
+          # 证书校验」），此时说「映射为明文 HTTP，自签证书请改 ~/.regctl/config.json」
+          # 是**错话**，会把使用者引去改一个与本次同步无关的文件。
+          #
+          # 只断「没有某句」是恒真的，所以同一次运行里再断该参数确实进了 skopeo 命令：
+          # 没有后半句，「不告警」既可能是路径对，也可能是这次调用压根没跑起来。
+          out="$(./scripts/sync.sh --src nginx:1.27 --dest r.example.com/x \
+            --tls-verify false --dry-run 2>&1)"
+          if [[ "$out" == *"regctl 路径下 --tls-verify false 映射为明文 HTTP"* ]]; then
+            printf '%s\n' "$out"
+            fail "skopeo 路径下不该出现 regctl 专属的 --tls-verify 告警（那句话在这条路径上是错的）"
+          fi
+          if [[ "$out" != *"执行路径：skopeo copy --all"* ]]; then
+            printf '%s\n' "$out"
+            fail "本用例要断的是 skopeo 路径（不带 --strip-attestation），计划却没走 skopeo"
+          fi
+          if [[ "$out" != *"--src-tls-verify=false --dest-tls-verify=false"* ]]; then
+            printf '%s\n' "$out"
+            fail "skopeo 路径下 --tls-verify false 未进入命令（无法证明「不告警」是因为参数真的生效）"
+          fi
+          echo "✓ skopeo 路径下 --tls-verify false 无 regctl 告警，且参数确实进了命令"
 
       - name: 验证重试参数的作用范围
         run: |
