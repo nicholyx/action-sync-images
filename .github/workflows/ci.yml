@@ -1120,15 +1120,25 @@ jobs:
           }
 
           # Artifact 名可能出现在多个上传步骤里，全收进来再逐行比对，
-          # 免得将来加一个附件就变成误判
-          uploaded_artifacts="$(
+          # 免得将来加一个附件就变成误判。
+          #
+          # **`want` 必须在步骤边界复位（Issue #141）。** 它一旦置位就悬着，若某个上传步骤省略了
+          # `name:`，会一路撞上后面**任意一行** `name:`——可能是完全无关的步骤里的
+          # 属性行。最坏的情形是那行恰好等于真值：断言不但失效，还会恰好「通过」
+          # （已实测：夹具里把属性行写成 check-report 时，旧写法原样把它当成了 artifact）。
+          # YAML 里每个步骤都是一个列表项，所以「新列表项」就是步骤边界。
+          # 复位那行放在 uses 之前：`- uses: …` 同时匹配两者，先清零再置位才对。
+          artifact_names() {
             awk '
+              /^[[:space:]]*-[[:space:]]/ { want = 0 }
               /uses: actions\/upload-artifact/ { want = 1; next }
               want && /^[[:space:]]*name:/ {
                 s = $0; sub(/^[[:space:]]*name:[[:space:]]*/, "", s); print s; want = 0
               }
-            ' .github/workflows/check-registry.yml
-          )"
+            ' "$1"
+          }
+
+          uploaded_artifacts="$(artifact_names .github/workflows/check-registry.yml)"
 
           hist_report="$(check_mode_const REPORT_NAME)"
           hist_workflow="$(check_mode_const WORKFLOW_FILTER)"
@@ -1147,6 +1157,42 @@ jobs:
             fail "history.sh --check 下载的 Artifact 是「${hist_report}」，体检工作流上传的却是上面这些"
           fi
           echo "✓ history.sh 的常量与 check-registry.yml 一致（工作流「${wf_name}」、Artifact「${hist_report}」）"
+
+          # 上面那条只证明「真文件下取到的值对」，证明不了「不会取到别的东西」——
+          # 今天的 check-registry.yml 恰好只有一个上传步骤且带 name，那个隐患够不着。
+          # 这里用夹具把它摆出来：一个**带 name 的**上传步骤（正对照，证明取法本身有效）、
+          # 一个**省略了 name 的**上传步骤，再紧跟一个带 `name:` 属性行的普通步骤，
+          # 而那行的值**恰好等于真值**（最坏情形：旧写法会原样把它当成 artifact 而静默通过）。
+          #
+          # 断言比的是**等值**，不是「非空」：只断非空的话，夹具被写坏（printf 漏行、
+          # mktemp 异常等）导致输出为空时会照样变绿——那又把断言变回了恒真。
+          # 正对照同时堵死这一类：输出为空一样不等于期望值，会红。
+          artifact_fixture="$(mktemp)"
+          trap 'rm -f "$artifact_fixture"' EXIT
+          # 逐行 printf 而不是 heredoc：heredoc 的内容必须跟着 block scalar 缩进
+          # （否则 YAML 解析坏掉），而缩进后的内容写进文件又会变成顶层缩进。
+          # printf 一次绕开这两个坑（见 .trellis/spec/workflows/index.md）。
+          printf '%s\n' \
+            'jobs:' \
+            '  a:' \
+            '    steps:' \
+            '      - uses: actions/upload-artifact@abc' \
+            '        with:' \
+            '          name: 夹具名' \
+            '          path: x' \
+            '      - uses: actions/upload-artifact@def' \
+            '        with:' \
+            '          path: y' \
+            '      - name: 第三步' \
+            '        with:' \
+            '          name: check-report' \
+            > "$artifact_fixture"
+          fixture_artifacts="$(artifact_names "$artifact_fixture")"
+          if [[ "$fixture_artifacts" != "夹具名" ]]; then
+            printf '%s\n' "$fixture_artifacts"
+            fail "夹具里只该取到上传步骤自己的「夹具名」，实际取到上面这些（want 未按步骤边界复位，或取法根本没跑起来）"
+          fi
+          echo "✓ artifact 名只取自上传步骤自己的 name，不捎带无关步骤的属性行"
 
       - name: 验证镜像筛选
         run: |
