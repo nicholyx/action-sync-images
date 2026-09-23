@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/workflows/index.md", "reason": "要在 ci.yml 的多个 job 里加步骤：run 块缩进、端口/容器名是 job 共享、加步骤前先核实已有环境、断言不要 grep 恒真的状态词"}
+{"file": ".trellis/spec/maintenance/index.md", "reason": "改动 CI 步骤的既有教训（起同名容器/同端口会让既有用例红；自己补写的那句话最危险）"}
+{"file": ".trellis/spec/engine/index.md", "reason": "断言口径：恒真的断言比没有断言更糟、变异要精确到单点、负向判据几乎总是恒真——本任务每组都要按这个口径写"}
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "stub 脚本与夹具都用 bash 写；本机 bash 3.2、交互 shell 是 zsh（数组 1-based，取字符用 cut -c）"}
