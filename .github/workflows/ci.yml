@@ -1626,6 +1626,86 @@ jobs:
           [[ "$top" == "10" ]] || fail "「--top-failures 在结尾」时应退回默认 10，实际 ${top}"
           echo "✓ --top-failures 在结尾时退回默认 10"
 
+          # ---- 切片的**效果**：最多显示 N 条 ----
+          # 上面几条断的是「CLI 值 → 变量 → 报告的 query 字段」这条通路，而
+          # --top-failures 的**语义**是「最多显示几条」——那是切片那一步的事。
+          # 实测：把切片写死成 [:10]（忽略变量、永远显示 10 条），上面几条全都不红。
+          #
+          # 两条边界都要断，且要**恰好**：夹具 5 条失败记录时，「--top-failures 2」
+          # 应恰好 2 行，「10」应 5 行都在。写成「不超过 N」会把「少显示了」放过。
+          #
+          # 切片只作用于**渲染出的 Markdown**：报告 JSON 里的 .rows 是完整数据
+          # （query.top_failures 只是记下「本来要显示几条」）。所以这里数 Markdown。
+          #
+          # 既有夹具只有 1 条失败记录——[:2] 与 [:10] 的输出长度会相同，断言就恒真了。
+          # 所以另造一个 5 条失败的，让它能区分「切了」与「没切」。
+          #
+          # 里面**另外放 2 条成功记录**，这不是凑数：切片表达式是
+          # `select(.fail > 0) | [:N]` 两段，只有全是失败记录时，
+          # 把 `select(.fail > 0)` 放宽成 `select(.fail >= 0)` 输出条数不变，
+          # 那一段就成了没断言的。有了这 2 条，「--top-failures 10」应 5 行
+          # 而不是 7 行——过滤那一段也就被钉住了。
+          #
+          # 计数放在**顶层**（与 sync.sh 落盘的 sync-report 同构），不是嵌套在
+          # summary 里：summary 是 --check 报告的形态。放错层时 history.sh 的
+          # 总览段会读到 null、打印「累计 0 次 / 失败 0」，而表格里却有 5 行失败，
+          # 夹具自相矛盾。
+          work2="$(mktemp -d)"
+          cat > "${work2}/many-failures.json" <<'JSON'
+          {"generated_at": "2026-09-24T00:00:00Z", "dry_run": false,
+           "total": 7, "success": 2, "skipped": 0, "failed": 5, "excluded": 0,
+           "images": [
+            {"source": "a.example.com/a:1", "dest": "r.example.com/x/a:1", "status": "failed",
+             "platforms": "", "source_digest": "", "dest_digest": "", "seconds": 1, "note": "e1"},
+            {"source": "b.example.com/b:1", "dest": "r.example.com/x/b:1", "status": "failed",
+             "platforms": "", "source_digest": "", "dest_digest": "", "seconds": 1, "note": "e2"},
+            {"source": "c.example.com/c:1", "dest": "r.example.com/x/c:1", "status": "failed",
+             "platforms": "", "source_digest": "", "dest_digest": "", "seconds": 1, "note": "e3"},
+            {"source": "d.example.com/d:1", "dest": "r.example.com/x/d:1", "status": "failed",
+             "platforms": "", "source_digest": "", "dest_digest": "", "seconds": 1, "note": "e4"},
+            {"source": "e.example.com/e:1", "dest": "r.example.com/x/e:1", "status": "failed",
+             "platforms": "", "source_digest": "", "dest_digest": "", "seconds": 1, "note": "e5"},
+            {"source": "f.example.com/f:1", "dest": "r.example.com/x/f:1", "status": "success",
+             "platforms": "", "source_digest": "", "dest_digest": "", "seconds": 1, "note": ""},
+            {"source": "g.example.com/g:1", "dest": "r.example.com/x/g:1", "status": "success",
+             "platforms": "", "source_digest": "", "dest_digest": "", "seconds": 1, "note": ""}
+           ]}
+          JSON
+
+          # 表格的数据行数 = 首格带反引号的行数（镜像名渲染成 `xxx`，只有数据行这样）。
+          #
+          # **不写成「含 "| " 的行数减 2」**：那个 2 把「表头 + 分隔行」写死在里面，
+          # 于是数法绑定了「这份报告里有且只有一张表、且表头恰好两行」。实测：
+          # 表头多一行 → 数成 3；报告里多出一张小表 → 数成 6。两种都让**正确的**
+          # 实现被判红（虽然方向是响亮报错、不会静默放行，但那是维护陷阱）。
+          # 按数据行的形状数，就不关心表头有几行——剩下唯一的失准路径是
+          # 「同一份报告里再出现一张首格也带反引号的表」，那要靠断言具体是哪几行
+          # 才彻底解决（属于「顺序」的范畴，另开）。
+          md_rows() {
+            local n
+            n="$(grep -cE '^\| `' "$1" || true)"
+            printf '%d' "$n"
+          }
+          trend_run2() {
+            local out_dir="$1"; shift
+            set +e
+            ./scripts/history.sh --dir "$work2" --report-dir "$out_dir" "$@" >/dev/null 2>&1
+            set -e
+          }
+
+          d4="$(mktemp -d)"
+          trend_run2 "$d4" --top-failures 2
+          shown="$(md_rows "${d4}/sync-trend-report.md")"
+          [[ "$shown" -eq 2 ]] || fail "--top-failures 2 时表格应恰好 2 行（夹具 5 条失败记录），实际 ${shown}"
+          echo "✓ --top-failures 2 时表格恰好 2 行（该夹具 5 条失败，切片确实生效）"
+
+          # 另一侧：N 大于失败数时全部都要在——切片不该把不足的量也截掉
+          d5="$(mktemp -d)"
+          trend_run2 "$d5" --top-failures 10
+          shown="$(md_rows "${d5}/sync-trend-report.md")"
+          [[ "$shown" -eq 5 ]] || fail "--top-failures 10 时表格应有 5 行（夹具全部失败记录），实际 ${shown}"
+          echo "✓ --top-failures 10 时 5 条失败记录都在（切片不会截掉不足的量）"
+
           # ---- 四个校验错误各一条 ----
           # 校验失败的默认形态是「静默用默认值」或「跑到一半才炸」，所以断的是
           # 退出码 + **报错文案**：只断退出码的话，1 可能来自任何一条 die，
