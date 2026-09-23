@@ -104,7 +104,7 @@ GitHub 要求**先在网页端创建首个页面**，才会初始化 Wiki 的 gi
 
 - ✅ Require a pull request before merging
 - ✅ Require status checks to pass → 选择 **CI 总览**（`ci-summary`）
-  - 这个汇总检查覆盖了 actionlint、yamllint、shellcheck、zizmor、冒烟测试、集成测试、提交信息规范
+  - 这个汇总检查覆盖了 actionlint、yamllint、shellcheck、zizmor、lint.sh 自测、冒烟测试、集成测试、提交信息规范
   - 只需要勾这一个，新增检查项时不用回来改设置
 - ✅ Require conversation resolution before merging
 - ⬜ Require approvals —— **单人维护时不要开**，否则你自己没法合并自己的 PR

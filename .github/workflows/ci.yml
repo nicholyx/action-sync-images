@@ -3226,6 +3226,127 @@ jobs:
             ghcr.io/zizmorcore/zizmor:1.30.1 /repo --no-online-audits
 
   # ---------------------------------------------------------------------------
+  # lint.sh 自测
+  #
+  # `scripts/lint.sh` 是 CI 里**被调用为零**的脚本——CI 自己跑 actionlint /
+  # yamllint / shellcheck / zizmor 各有独立 job，lint.sh 只是给贡献者在本地用的
+  # 入口。而它的职责恰恰是「**本地过 = CI 过**」：这条保证的上游一直没有保障。
+  # 近两轮修的 #138（本地根本跑不起来）与 #133（本地太宽松）都出在它身上。
+  #
+  # 两条断言的方向**相反**，正对应那两个缺口：
+  #   1. 非 git 目录下 actionlint 项不失败 —— 防「本地太严」
+  #   2. 引入真实告警时会红      —— 防「本地太松」
+  #
+  # **不并入 smoke-test**：lint.sh 的 zizmor 那一项要 docker（与 CI 同一条命令），
+  # 而 smoke-test 的设计前提是**不启容器**——那是那个 job 的性质，不该为一组新
+  # 断言破坏它。
+  # ---------------------------------------------------------------------------
+  lint-selftest:
+    name: lint.sh 自测
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Repos
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # 只读检查用不到 git 凭证，不持久化
+          persist-credentials: false
+
+      - name: 安装 actionlint
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          # 版本取 workflow 级的 ACTIONLINT_VERSION——与 actionlint job 同源，
+          # 不另写一份（写死会漂移）
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL "$url" | tar -xz actionlint
+          mkdir -p "$HOME/.local/bin"
+          mv actionlint "$HOME/.local/bin/"
+          # 后续步骤靠 PATH 找它。当前步骤看不到这个改动，所以先验证再放行
+          "$HOME/.local/bin/actionlint" --version
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: 非 git 目录下 lint.sh 仍能跑（#138 回归）
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 不含 .git 的副本 == GitHub 的 source tarball 解压出来的样子。
+          # 此前 actionlint 裸跑要靠 .git 定位项目根，在这里必然报
+          # 「no project was found」——使用者什么都没改，第一项就红。
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          tar -cf - --exclude=.git . | (cd "$work" && tar -xf -)
+          [[ ! -d "$work/.git" ]] || { echo "::error::副本里还有 .git，用例无效"; exit 1; }
+
+          set +e
+          out="$(cd "$work" && ./scripts/lint.sh 2>&1)"
+          set -e
+          printf '%s\n' "$out"
+
+          # **只断 actionlint 那一项，不断 lint.sh 的整体退出码。** 本 job 里
+          # yamllint 未装、zizmor 要拉镜像，整体 rc 会随环境波动——拿它当判据
+          # 会变成「对正确实现假报错」，与恒真断言一样不可信。
+          if grep -qF 'no project was found' <<<"$out"; then
+            echo "::error::非 git 目录下 actionlint 又去依赖 .git 了（#138 回归）"
+            exit 1
+          fi
+          section="$(sed -n '/▶ actionlint（工作流静态检查）/,/^$/p' <<<"$out")"
+          if [[ -z "$section" ]]; then
+            echo "::error::输出里没有 actionlint 那一项，这条断言无从判断"
+            exit 1
+          fi
+          # 正向要求「通过」，不是「没有失败」：这一项被跳过时打的是「⚠ 已跳过」，
+          # 否定式判据会把「actionlint 根本没跑成」也算过——接口断了却显示绿的。
+          if ! grep -qF '✓ 通过' <<<"$section"; then
+            printf '%s\n' "$section"
+            echo "::error::非 git 目录下 actionlint 项没有通过（#138 回归，或该项被跳过没跑成）"
+            exit 1
+          fi
+          echo "✓ 非 git 目录下 actionlint 项通过（不再依赖 .git）"
+
+      - name: 引入真实告警时 lint.sh 会红（#133 回归）
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # 在**副本**里精确引入一个真实告警，不动工作区。
+          # 用 actionlint 原生的表达式检查（而不是 SC2086）——后者要过 shellcheck，
+          # 那是另一个工具的版本行为；前者是这个 job 里 actionlint 自己的判断。
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          tar -cf - --exclude=.git . | (cd "$work" && tar -xf -)
+
+          target="$work/.github/workflows/history-trend.yml"
+          # 用 -i.bak 而不是裸 -i：GNU sed 与 BSD sed 对裸 -i 的后续参数理解不同
+          sed -i.bak 's/github\.actor/github.actr/' "$target"
+          if ! grep -qF 'github.actr' "$target"; then
+            echo "::error::变异没有生效，这条用例什么也没测"
+            exit 1
+          fi
+
+          set +e
+          out="$(cd "$work" && ./scripts/lint.sh 2>&1)"
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+
+          if [[ "$rc" -eq 0 ]]; then
+            echo "::error::工作流里有真实告警，lint.sh 却绿了（#133 回归）"
+            exit 1
+          fi
+          # 红了还不够——要确认**红的原因就是 actionlint 那一项**，
+          # 否则这条断言可能在「别的项恰好也失败」时通过
+          section="$(sed -n '/▶ actionlint（工作流静态检查）/,/^$/p' <<<"$out")"
+          if ! grep -qF '✗ 失败' <<<"$section"; then
+            printf '%s\n' "$section"
+            echo "::error::lint.sh 红了，但失败的不是 actionlint 那一项——断言指向了别的东西"
+            exit 1
+          fi
+          echo "✓ 引入真实告警后 actionlint 项确实失败"
+
+  # ---------------------------------------------------------------------------
   # 真实同步集成测试
   #
   # 与冒烟测试的关键区别：这里**真的会推送镜像**。
@@ -3998,7 +4119,7 @@ jobs:
   ci-summary:
     name: CI 总览
     runs-on: ubuntu-latest
-    needs: [actionlint, yamllint, shellcheck, zizmor, smoke-test, integration-test, commit-messages]
+    needs: [actionlint, yamllint, shellcheck, zizmor, lint-selftest, smoke-test, integration-test, commit-messages]
     if: always()
     steps:
       - name: 汇总各检查结果
@@ -4007,6 +4128,7 @@ jobs:
           R_YAMLLINT: ${{ needs.yamllint.result }}
           R_SHELLCHECK: ${{ needs.shellcheck.result }}
           R_ZIZMOR: ${{ needs.zizmor.result }}
+          R_LINTSELFTEST: ${{ needs.lint-selftest.result }}
           R_SMOKE: ${{ needs.smoke-test.result }}
           R_INTEGRATION: ${{ needs.integration-test.result }}
           R_COMMITS: ${{ needs.commit-messages.result }}
@@ -4014,8 +4136,25 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
 
-          declare -a names=(工作流静态检查 YAML风格检查 Shell脚本检查 工作流安全扫描 冒烟测试 集成测试 提交信息规范)
-          declare -a results=("$R_ACTIONLINT" "$R_YAMLLINT" "$R_SHELLCHECK" "$R_ZIZMOR" "$R_SMOKE" "$R_INTEGRATION" "$R_COMMITS")
+          # names 与 results 靠下标对齐：增删一项必须两边同时改，且与上面
+          # 的 needs 顺序一致（否则那一项的失败不会让本 job 变红——CI 总览
+          # 是分支保护唯一勾选的检查，漏一项等于它失败了也能合并）。
+          declare -a names=(工作流静态检查 YAML风格检查 Shell脚本检查 工作流安全扫描 "lint.sh 自测" 冒烟测试 集成测试 提交信息规范)
+          declare -a results=("$R_ACTIONLINT" "$R_YAMLLINT" "$R_SHELLCHECK" "$R_ZIZMOR" "$R_LINTSELFTEST" "$R_SMOKE" "$R_INTEGRATION" "$R_COMMITS")
+
+          # names 与 results 必须一一对应。这不是防御性编程——加 lint-selftest 时
+          # 真实漏过：只往 needs 里加了那一项，names / results 两处都没加，于是它
+          # **不进判据**，而 CI 总览是分支保护唯一勾选的检查——漏一项就等于那一项
+          # 失败了也能合并，且界面上完全看不出来（汇总表少一行而已）。
+          #
+          # **只断这两个数组**，不去读 ci.yml 校验 needs：本 job 没有 checkout
+          # （它只读 needs.*.result，不需要仓库文件），一读就是 No such file。
+          # needs 与它们的对应关系靠上面那行注释约束——那是「改一处」的清单，
+          # 而这里兜住的是「改了 needs 却忘了改数组」这个真实发生过的形态。
+          if [[ ${#names[@]} -ne ${#results[@]} ]]; then
+            echo "::error::names（${#names[@]} 项）与 results（${#results[@]} 项）长度不一致——有检查项不会进判据"
+            exit 1
+          fi
 
           failed=0
 

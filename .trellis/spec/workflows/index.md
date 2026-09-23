@@ -36,12 +36,16 @@ zizmor 在 CI 里盯着，但它不是万能的。
 
 ## CI 结构（ci.yml）
 
-- 检查项：actionlint / yamllint / shellcheck / zizmor / 冒烟 / **真实同步集成测试** / 提交信息校验
+- 检查项：actionlint / yamllint / shellcheck / zizmor / **lint.sh 自测** / 冒烟 / **真实同步集成测试** / 提交信息校验
 - **ci-summary 汇总 job**：`needs: [全部]` + `if: always()`——分支保护只盯「CI 总览」这一个 check，增删检查项不用改保护规则
+- **新增检查项时要改三处，不是一处**：`needs`、汇总步骤里的 `names` 数组、`results` 数组。三者靠**下标对齐**，只改 `needs` 时那一项**不进判据**——它失败了本 job 仍绿，而界面上只表现为汇总表少一行（2026-09-24 加 lint-selftest 时真实踩到，且当时以为「加了 needs 就完事」）。汇总步骤里已加一条**长度一致性自断言**兜住这个坑；`names` 里的名字**含空格必须加引号**，否则会被拆成两个元素、后面全部错位
 - **集成测试用本地 `registry:2` 容器真推送**：dry-run 覆盖不到真实路径，v1.1.0 的三个缺陷全部发生在那里。新功能必须在这里补真实路径断言
 - 断言写法：**不要 grep 状态词本身**——汇总行里状态词永远在（如「缺失 0」），等于断言恒真。匹配带图标的正文行（`✗ 缺失`）或断言具体数值
 - 「故意要失败的命令」必须包在 `set +e` / `set -e` 之间，否则 errexit 会在断言前中断步骤
 - 跨步骤复用文件用 `/tmp` 固定路径——每个 `run:` 是独立 shell，变量不延续
+- **加自断言前先确认那个 job 有没有 checkout**。`ci-summary` 就**没有**——它只读 `needs.*.result`，跑在自己的空工作目录里。2026-09-24 真实踩到：给它加了「读 `ci.yml` 数 `needs` 项数」的自断言，CI 上直接报
+  `grep: .github/workflows/ci.yml: No such file or directory` → `needs（0 项）与 names（8 项）数量不一致`，
+  把一个全绿的 PR 拖红。**没有 checkout 的 job，断言只能基于环境变量与 `needs.*`**
 
 ## Quality Check
 
