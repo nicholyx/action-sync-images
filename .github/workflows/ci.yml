@@ -1706,6 +1706,76 @@ jobs:
           [[ "$shown" -eq 5 ]] || fail "--top-failures 10 时表格应有 5 行（夹具全部失败记录），实际 ${shown}"
           echo "✓ --top-failures 10 时 5 条失败记录都在（切片不会截掉不足的量）"
 
+          # ---- 排序的**顺序**：前 N 行必须是 fail 最高的那 N 个 ----
+          # 上面断的是「显示几条」，而 --top-failures 的语义是「失败**最多**的前 N 个」
+          # ——「最多」那一半是排序。**行数断不出顺序**：把 sort_by(-.fail) 的负号
+          # 去掉（改成升序），显示的行数一模一样，而拿到的变成了「失败最少的几个」。
+          # 所以这里**按镜像名断**——除了「几行」，还要看是「哪几行」。
+          order_dir="$(mktemp -d)"
+          # 第 i 份报告里有 i 条记录（都是失败），记录里的镜像名按下面的字母串取；
+          # 于是每个镜像的 fail 就是「它出现过的报告数」＝字母串里的**位置**决定：
+          # 第 1 位 5 次、第 2 位 4 次……第 5 位 1 次。
+          #
+          # 字母串是**乱序**的（caebd 而不是 abcde）——这一条很要紧：写成 abcde 时
+          # 「按名字排」与「按失败数排」结果**恰好相同**，于是排序写错也看不出来。
+          # 实测（改动前）：把 sort_by(-.fail) 换成 sort_by(.source)，或者把切片
+          # 挪到排序之前，整套断言**全绿**，而报告显示的是 fail 只有 4 与 2 的两行。
+          # 错开后，fail 最高的两个是 c(5) 与 a(4)，与名字序的 a、b 不同。
+          #
+          # 取字母用 `cut -c` 而不是数组下标——数组下标在 bash 与 zsh 下**起点不同**
+          # （zsh 是 1-based），而断言的本地验证未必跑在 bash 里。
+          for i in 1 2 3 4 5; do
+            {
+              printf '{"generated_at":"2026-09-2%dT00:00:00Z","dry_run":false,' "$i"
+              printf '"total":%d,"success":0,"skipped":0,"failed":%d,"excluded":0,"images":[' "$i" "$i"
+              sep=""
+              k=1
+              while [[ "$k" -le "$i" ]]; do
+                l="$(printf 'caebd' | cut -c "$k")"
+                printf '%s{"source":"%s.example.com/%s:1","dest":"r.example.com/x/%s:1","status":"failed","platforms":"","source_digest":"","dest_digest":"","seconds":1,"note":""}' \
+                  "$sep" "$l" "$l" "$l"
+                sep=","
+                k=$((k + 1))
+              done
+              printf ']}\n'
+            } > "${order_dir}/r${i}.json"
+          done
+
+          order_out="$(mktemp -d)"
+          set +e
+          ./scripts/history.sh --dir "$order_dir" --report-dir "$order_out" --top-failures 2 >/dev/null 2>&1
+          set -e
+
+          # 正对照：夹具真被读进去了、fail 聚合也对（5/4/3/2/1）。没有它，
+          # 下面那条在「夹具没生效、表格为空」时也会通过。
+          #
+          # 走本步前面定义的 query_field，而不是直接 jq：报告没落盘时它把
+          # 「夹具没被读进去」这条注解打到 stderr，而不是让 jq 抛一句
+          # 「Could not open file」——那读起来像脚本坏了，实际是夹具没被消费。
+          fails="$(query_field "$order_out" '[.rows[].fail] | sort | reverse | join(",")' '--top-failures 的排序夹具')"
+          [[ "$fails" == "5,4,3,2,1" ]] || fail "夹具没被读进去或 fail 聚合不对：应为 5,4,3,2,1，实际 ${fails}"
+
+          # 前 2 行必须是 fail 最高的两个（c 与 a）。无论排序反了、按名字排、
+          # 还是先切片后排序，行数都还是 2——所以这一条是**顺序**唯一的捕获者。
+          #
+          # 反引号写成双引号里的转义（\`）、再拼进变量：直接写进**单引号**会让
+          # actionlint 里的 shellcheck 报 SC2016，scripts/lint.sh 因此变红。
+          tick="\`"
+          top2="$(grep -oE "${tick}[a-e]\.example\.com/[a-e]:1${tick}" "${order_out}/sync-trend-report.md" | head -n 2 | tr '\n' ' ')"
+          want="${tick}c.example.com/c:1${tick} ${tick}a.example.com/a:1${tick} "
+          if [[ "$top2" != "$want" ]]; then
+            printf '实际前两行：%s\n' "$top2"
+            fail "--top-failures 2 应显示 fail 最高的两个（c、a），实际不是（排序反了、按名字排了，或切片取错了那一端）"
+          fi
+          echo "✓ --top-failures 2 显示的是 fail 最高的两个（c、a），不是名字序或失败最少的"
+
+          # `sort_by(-.fail, .source)` 的第二键**有意不断**：夹具里 fail 两两不同，
+          # 并列时才有它说话的机会。实测（另造 a=3、b=2、c=2 的并列夹具）：把它改成
+          # 降序，表格第二行从 b 变成 c——看着像「没断到」，但去掉它与留着它的输出
+          # **一模一样**（group_by(.source) 已按名字排好，而 jq 的 sort_by 是稳定
+          # 排序），所以它是在给一个「并列取谁」的口径加确定性，不是正确性不变量。
+          # 为一处不影响对不对的细节造并列夹具，成本大于收益。
+
           # ---- 四个校验错误各一条 ----
           # 校验失败的默认形态是「静默用默认值」或「跑到一半才炸」，所以断的是
           # 退出码 + **报错文案**：只断退出码的话，1 可能来自任何一条 die，

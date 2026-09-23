@@ -2,6 +2,12 @@
 
 兼容 macOS 自带 bash 3.2。CI 是 bash 5，**所以违反这些规则的缺陷只在本地暴露**——CI 绿不代表没问题。
 
+> ⚠️ **本地验证时先确认 shell 是哪一个**。脚本的 shebang 是 `#!/usr/bin/env bash`，CI 也是 bash，但**交互 shell 可能是 zsh**（macOS 默认）。两者有一处会直接影响验证结果：**数组下标起点**——bash 从 0 开始，zsh 从 1 开始。于是 `letters=(a b c d e); "${letters[0]}"` 在 zsh 下是**空串**，在 bash 下是 `a`。
+>
+> 2026-09-24 真实踩到：在交互 shell 里拼夹具时字母全部偏移，一度以为是自己的逻辑写错了。**根因是验证环境而非被测代码**。
+>
+> 自检：`echo "$BASH_VERSION"`（空则不是 bash）；要跑脚本一律 `bash script.sh`，不要在交互 shell 里直接跑片段。**需要跨 shell 一致时避开数组下标**——取第 k 个字符用 `printf 'abcde' | cut -c "$k"` 这种纯 POSIX 写法。
+
 ## 语言禁忌（bash 3.2 没有）
 
 - 禁 `declare -A`（关联数组）、`mapfile` / `read -a`、`wait -n`、`tac`
