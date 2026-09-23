@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/engine/index.md", "reason": "断言可信度为最高优先级：本任务的三类断言（参数通路、可选参数的特例分支、URL 匹配）都属于「坏了是静默的」，而 spec 里已有三条同族教训——恒真断言、对正确实现假报错、夹具要双向可信（含「两个变异叠加」才能暴露的形态）"}
+{"file": ".trellis/spec/maintenance/index.md", "reason": "「改动 CI 步骤」一节：新增前先搜 job 里已有什么、容器名与端口是共享资源（此前真实撞过一次）；以及收尾的文档同步与 CHANGELOG 锚点校验"}
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "断言脚本本身也是 bash：`if cmd | tail -1` 判的是 tail 的退出码（断 die 文案时极易踩）、固定字符串用 grep -qF、空数组 + set -u；以及「git checkout <文件> 会丢弃未提交改动」——变异恢复要用 cp 备份"}
+{"file": ".trellis/spec/workflows/index.md", "reason": "CI 结构与断言写法（不要 grep 状态词本身、故意要失败的命令包在 set +e/-e 之间、跨步骤复用文件用 /tmp）；以及 run: 块里插多行内容要保持同一缩进（含注释）"}
