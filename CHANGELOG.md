@@ -9,6 +9,8 @@
 
 ## [Unreleased]
 
+## [1.19.6] - 2026-09-24
+
 ### 变更
 
 - **CI 新增 `lint.sh 自测` job**（[#148](https://github.com/nicholyx/action-sync-images/issues/148)）。`scripts/lint.sh` 此前是 CI 里**被调用为零**的脚本——它自己的职责恰恰是「本地过 = CI 过」，而这条保证的上游一直没有保障：近两轮修的 #138（非 git 目录下根本跑不起来）与 #133（比 CI 宽松）**都出在它身上**。新 job 的两条断言方向相反，正对应那两个缺口：非 git 目录下 actionlint 项不失败、引入真实告警时会红。
