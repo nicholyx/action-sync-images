@@ -197,8 +197,10 @@ bash 里「值」和「状态」跨过进程边界时的流向，必须与进程
   `gh pr close <N> && gh pr reopen <N>` 重新触发即可恢复。
 - **分支保护拒绝合并、提示 not up to date**：`git rebase main` 后
   `git push --force-with-lease`。合并远端分支前先 `git fetch --prune`。
-- **`gh pr merge --auto` 报 Auto merge is not allowed**：仓库未开启该功能，
-  改为等待检查完成后再合并。
+- **`gh pr merge --auto` 报 Auto merge is not allowed**：仓库未开启 auto-merge。
+  **本仓库已于 2026-09-24 开启该设置**，正常不会再遇到。若再次出现，先去
+  `Settings` → `General` → `Pull Requests` 确认开关状态，**而不是找绕过办法** ——
+  它是一个没打开的配置，不是需要绕过的故障。
 - **`gh run view --log` 的输出混着源码行**：过滤 `[36;1m`（ANSI 回显）再看实际输出。
 - **日志只显示 `exit code 2` 没有任何输出**：多半是 `set -e` 下某条命令失败导致整个步骤中断。
   「故意要失败的命令」（造失败数据）必须包在 `set +e` / `set -e` 之间。
