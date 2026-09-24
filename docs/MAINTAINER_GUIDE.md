@@ -72,13 +72,42 @@
 | --- | :---: | --- |
 | Issues | ✅ 已启用 | 反馈主入口，配合 `.github/ISSUE_TEMPLATE/` 的表单使用 |
 | Discussions | ✅ 已启用 | 承接使用提问，避免 Issue 列表被问答淹没 |
-| Wiki | ⚠️ 待初始化 | 作为 GitHub 上的入口页，文档正文仍在 `docs/`（初始化方式见下） |
+| Wiki | ❌ **已关闭** | 见下 —— 文档正文在 `docs/`，留着空 Wiki 只会让访客点进一个空页面 |
 | Projects | ✅ 已启用 | 单人维护时收益有限，可随时关闭 |
 | Secret scanning | ✅ 已启用 | 持续扫描仓库中的凭证泄露 |
 | Push protection | ✅ 已启用 | 推送含凭证的内容时直接拦截 |
-| Dependabot 告警 | ✅ 已启用 | 与自动安全更新一同开启 |
+| Dependabot 告警 | ✅ 已启用 | 依赖存在已知漏洞时告警 |
+| Dependabot 安全更新 | ✅ 已启用 | 有补丁版本时自动提 PR |
+| **Private vulnerability reporting** | ✅ **已启用** | `SECURITY.md` 与 `ISSUE_TEMPLATE/config.yml` 都指向 `security/advisories/new`。**不开的话那个入口是不存在的**，文档里的安全报告渠道就是死的 |
+| 合并后自动删分支 | ✅ 已启用 | 见下 |
+| 允许自动合并（auto-merge） | ✅ 已启用 | 见下 |
 | Topics | ✅ 已配置 | `docker` / `kubernetes` / `skopeo` 等 10 个主题标签 |
 | 分支保护 | ✅ 已配置 | 见上一节 |
+
+#### 关于「合并后自动删分支」与「允许自动合并」
+
+这两项在 2026-09-24 之前都是关闭的，各自造成了一处本可避免的摩擦：
+
+- **合并后自动删分支（`delete_branch_on_merge`）**：此前必须每次手动带上
+  `gh pr merge --delete-branch`，忘了就留下一个已合并分支。**开这个设置不等于可以不带**
+  —— 手动带上是幂等的，养成习惯仍有益处；但设置开着，忘带也不会留下垃圾。
+- **允许自动合并（`allow_auto_merge`）**：此前 `gh pr merge --auto` 会报
+  `Auto merge is not allowed`，本文档还因此把它当作「已知故障」记了绕过办法
+  （改成等检查跑完再手动合并）。**开这个设置之后那个「故障」就不存在了** ——
+  它本来就不是故障，是一个没打开的开关。
+
+> 教训：**把「某个开关没开」记成「已知故障」，会让后来者去找根本不存在的 bug。**
+> 遇到反复出现的操作摩擦时，先问一句「这是行为问题，还是配置问题」。
+
+#### 为什么不启用 Wiki
+
+Wiki 是**独立的 git 仓库**，改代码时很容易忘记同步；而 `docs/` 里的文档会随 PR
+一起被 review（CODEOWNERS 也覆盖了该目录），不会出现文档与代码脱节。
+
+此前 Wiki 处于「已启用但从未初始化」的状态：仓库页面上留着一个
+「Create the first page」的入口，点进去是空页面 —— **对访客来说这比没有 Wiki 更糟**。
+现已关闭。真要重新启用时：GitHub 要求**先在网页端创建首个页面**才会初始化它的
+git 仓库（这一步没有 API），之后再 `git clone https://github.com/nicholyx/action-sync-images.wiki.git`。
 
 #### 初始化 Wiki
 
