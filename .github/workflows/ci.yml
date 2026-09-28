@@ -1678,10 +1678,14 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
 
-          # 三个只读模式（--check-updates / --audit / --audit-lock）都会把「传了
-          # 但这次用不上」的参数合并成**一条**告警、一次列全。这类告警是使用者
-          # 唯一能察觉「参数被吃掉了」的出口，所以断两件事：出现过，以及**只有
-          # 一条**——拆成每项一行同样是静默失效，淹没在输出里就没人看得见。
+          # 四个模式（--check-updates / --audit / --audit-lock 三个只读模式，以及
+          # ④ 的同步模式）都会把「传了但这次用不上」的参数合并成**一条**告警、
+          # 一次列全。这类告警是使用者唯一能察觉「参数被吃掉了」的出口，所以断两件
+          # 事：出现过，以及**只有一条**——拆成每项一行同样是静默失效，淹没在输出
+          # 里就没人看得见。
+          #
+          # 同步模式不是只读模式，但同属这条规矩；它也不能并进下面那条只在
+          # --dry-run 下打印的 dry_noop 告警（不带 --dry-run 的同步就没人提醒了）
           fail() { echo "::error::$1"; exit 1; }
 
           # 断言：该模式的告警恰好一行，且这一行里列全了所有预期参数名。
@@ -1735,30 +1739,54 @@ jobs:
           # ① --check-updates：并发与超时是**与硬编码默认值直接比较**才进列表的
           #    （源码里写死 `CONCURRENCY != "1"` / `TIMEOUT != "600"`），默认值
           #    一改这两项就静默消失。所以两个都要传非默认值过来钉住。
+          #
+          #    --write-updates 与它们相反：它是**这个模式自己的产物通道**，在这里
+          #    生效，所以必须**不**出现在不生效列表里——「只在 --check-updates 下
+          #    生效」这句话的另一半就是这条，只断另外三个模式会漏掉它
           set +e
           out="$(./scripts/sync.sh --src 'nginx:1.27' --check-updates --dry-run \
             --write-lock "${mock_dir}/never-written.lock" \
+            --write-updates "${mock_dir}/upd.txt" \
             --concurrency 4 --timeout 900 2>&1)"
           set -e
           assert_merged_ignored "--check-updates" "--check-updates 只查上游，以下参数本次不生效" "$out" \
             "本次不生效" "--dry-run" "--write-lock" "--concurrency" "--timeout"
+          # 与上面那条正面断言成对：合并告警里混进 --write-updates 同样是错的
+          # （使用者会以为文件没写出来，而其实写了）
+          if printf '%s\n' "$out" | grep -q '以下参数本次不生效.*--write-updates'; then
+            printf '%s\n' "$out"
+            fail "--check-updates 下 --write-updates 是生效的，不该进不生效列表"
+          fi
 
           # ② --audit
           set +e
           out="$(./scripts/sync.sh --src 'nginx:1.27' --dest r.example.com/x --audit \
             --dry-run --write-lock "${mock_dir}/never-written.lock" \
+            --write-updates "${mock_dir}/upd.txt" \
             --verify --skip-existing 2>&1)"
           set -e
           assert_merged_ignored "--audit" "--audit 是只读检查，以下参数本次不生效" "$out" \
-            "本次不生效" "--dry-run" "--write-lock" "--verify" "--skip-existing"
+            "本次不生效" "--dry-run" "--write-lock" "--write-updates" "--verify" "--skip-existing"
 
           # ③ --audit-lock：--filter 与目标地址都列在同一条里
           set +e
           out="$(./scripts/sync.sh --audit-lock "$lock_file" --dry-run --filter 'kube-' \
+            --write-updates "${mock_dir}/upd.txt" \
             --dest r.example.com/x 2>&1)"
           set -e
           assert_merged_ignored "--audit-lock" "--audit-lock 只校验锁文件，以下参数本次不生效" "$out" \
-            "本次不生效" "--dry-run" "--filter / --exclude" "目标地址（--dest / --dest-keep-path）"
+            "本次不生效" "--filter / --exclude" "--write-updates" "目标地址（--dest / --dest-keep-path）"
+
+          # ④ 同步模式（默认模式）。它此前没有任何「不生效」列表——只在 --dry-run
+          #    下才有一条。--write-updates 在这条路径上是**无论有没有 --dry-run**
+          #    都不生效的，因此它必须有自己的告警，而不是并进那条 dry-run 告警
+          #    （并进去的话，不带 --dry-run 的同步就只剩静默了）
+          set +e
+          out="$(./scripts/sync.sh --src 'nginx:1.27' --dest r.example.com/x \
+            --write-updates "${mock_dir}/upd.txt" 2>&1)"
+          set -e
+          assert_merged_ignored "同步模式" "同步模式不做上游版本检查，以下参数本次不生效" "$out" \
+            "本次不生效" "--write-updates"
 
       - name: 准备 stub skopeo 夹具（检查模式用例共用）
         run: |
@@ -1937,6 +1965,218 @@ jobs:
             fail "缺失 6 个 > limit 5 时不该说「全部列出如下」（只列出了 5 条）"
           fi
           echo "✓ 对照：缺失 6 个 > limit 5：文案为「版本序最大的 5 个」，且不含「全部列出如下」"
+
+      - name: 验证 --write-updates 导出的清单片段（stub skopeo）
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # --write-updates 是 --check-updates 的产物通道：把报出的未收录 tag 写成
+          # 一份可直接粘贴、也能被 --file 读回的清单片段。
+          #
+          # 它坏掉的方式方向相反，必须各断一次：
+          #   ① 用被 --updates-limit 截断过的 shown 写文件——文件少几行，而它
+          #      **看起来是完整的**，照着它更新清单就会漏掉几个 tag（错误的信息
+          #      比没有信息更糟）；
+          #   ② 顺带写动了原清单——生成的是建议、清单怎么改是人的决定，这是本任务
+          #      的红线。所以用前后 cmp 钉住，而不是「看起来没变」。
+          #
+          # 另外几条：分组注释 + 组内升序（降序也含这几个 tag，只断内容会假绿）、
+          # 日志条数与文件一致、清单已覆盖时仍写出文件并注明、生成的文件喂回
+          # --file 能被**完整**解析。
+          fail() { echo "::error::$1"; exit 1; }
+
+          # stub skopeo 由前面「准备 stub skopeo 夹具」那一步放在固定路径上。
+          # 它对本用例的两个仓库都返回 v1 v2 v3 v4 v5 v6 v10。
+          PATH="/tmp/stub-skopeo:$PATH"
+          export PATH
+
+          work="$(mktemp -d)"
+          manifest="${work}/images.lock.txt"
+          printf '# 夹具清单\nmock-a.local/app:v1\nmock-b.local/other:v2\n' > "$manifest"
+          cp "$manifest" "${work}/manifest.orig"
+          frag="${work}/updates.txt"
+
+          set +e
+          out="$(./scripts/sync.sh --file "$manifest" --check-updates --updates-limit 3 \
+            --write-updates "$frag" 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 2 ]] || fail "--check-updates 期望退出码 2，实际 ${code}"
+          # 正对照：清单确实被读进去了。少了它，「原清单没被改」在脚本压根没打开
+          # 这个文件时也会绿
+          grep -qF '清单中：v1' <<<"$out" || { printf '%s\n' "$out"; fail "夹具清单没被读进检查（清单中的 tag 没出现）"; }
+
+          # ① 文件里是**全部**未收录 tag，不是屏幕上那 3 条。2 个仓库 × 6 个 = 12。
+          #    数据行 = 非注释非空行；头部全是 '#' 注释，不计入
+          [[ -f "$frag" ]] || fail "--write-updates 没有写出文件：${frag}"
+          tags="$(grep -vcE '^[[:space:]]*(#|$)' "$frag" || true)"
+          [[ "$tags" -eq 12 ]] \
+            || fail "片段里应有全部 12 个未收录 tag（2 个仓库 × 6 个），实际 ${tags}——用 --updates-limit 截断过的数据写文件时这里会变成 6"
+          for t in v2 v3 v4 v5 v6 v10; do
+            grep -qxF "mock-a.local/app:${t}" "$frag" \
+              || fail "片段里缺少 mock-a.local/app:${t}（--updates-limit 3 只该影响屏幕）"
+          done
+          # 与上一条配对，且必须**在同一个 run 里**：文件写全部的同时，屏幕那一侧
+          # 仍受 --updates-limit 约束（各列 3 条）。只断文件侧等于只断了一半——
+          # 「既然文件写全部，屏幕也放开」这样的改动文件侧照样过，而 limit 的口径
+          # 当场变了。屏幕那句是降序取前 3，两个仓库各一行，所以恰好 2 行
+          [[ "$(grep -cxF '    v10 v6 v5' <<<"$out")" -eq 2 ]] \
+            || { printf '%s\n' "$out"; fail "--updates-limit 3：屏幕上应各列 3 条（v10 v6 v5，共 2 行）；文件写全部不该把屏幕也放开"; }
+          echo "✓ ① 片段含全部 12 个 tag：--updates-limit 3 只截断屏幕（各 3 条），不截断文件"
+
+          # ② 分组注释 + 组内**升序**。断言比的是顺序而不是「含这几个 tag」：
+          #    降序同样含这几个，方向抄错时只断内容照样绿（屏幕上那句就是降序的）
+          for r in mock-a.local/app mock-b.local/other; do
+            grep -qxF "# ${r}" "$frag" || fail "片段里缺少分组注释「# ${r}」"
+          done
+          [[ "$(grep -A1 -xF '# mock-a.local/app' "$frag" | tail -n 1)" == "mock-a.local/app:v2" ]] \
+            || fail "分组注释后面应紧跟组内升序的第一个 tag（mock-a.local/app:v2）"
+          order_got="$(grep '^mock-a.local/app:' "$frag")"
+          order_want="$(printf 'mock-a.local/app:%s\n' v2 v3 v4 v5 v6 v10 | sort -V)"
+          [[ "$order_got" == "$order_want" ]] \
+            || { printf '%s\n' "$order_got"; fail "组内应按版本序升序（sort -V）排列，屏幕上的降序抄错了"; }
+          echo "✓ ② 按仓库分组，组内版本序升序"
+
+          # ③ 红线：原清单字节不变。生成的是建议，合并仍由人做
+          if ! cmp -s "$manifest" "${work}/manifest.orig"; then
+            diff -u "${work}/manifest.orig" "$manifest" | head -20 || true
+            fail "原清单被改动了（--write-updates 只该写一个新文件）"
+          fi
+          # 与上一条配对：夹具自己得先没被动过，cmp 才有意义
+          [[ "$(wc -l < "$manifest")" -eq 3 ]] \
+            || fail "夹具清单的行数不是 3，上面的 cmp 结论不成立"
+
+          # cmp 只证明「内容相同」，不证明「没被写过」——一个把清单**原样重写**一遍
+          # 的实现照样过 cmp。所以再判一次 mtime：读文件不会动它，写文件一定会动。
+          # 用 find -newer 而不是 stat：BSD 的 `stat -f %m` 与 GNU 的 `stat -c %Y`
+          # 写法不同，而 CI 与本机正是两个系统。判据是**输出为空**，不是 find 的
+          # 退出码——它的退出码只表示「遍历成功」，与有没有匹配无关。
+          #
+          # 时间戳**钉到 2000 年**，而不是拿「刚才那一秒」当参照：文件系统给 mtime
+          # 的分辨率不是无穷的（实测 debian:bookworm-slim 的 overlayfs 上，两次相隔
+          # 毫秒级的写会拿到**逐纳秒相同**的时间戳），若清单的重写恰好落在参照文件
+          # 同一个 tick 里，find -newer 会判「没有更新」而**漏掉**。拆开 26 年之后，
+          # 任何一次写入都必然比参照新，判据不再依赖两次操作之间的时间差有多大。
+          touch -t 200001010000 "$manifest" "${work}/sentinel"
+          set +e
+          ./scripts/sync.sh --file "$manifest" --check-updates \
+            --write-updates "${work}/rewrite-frag.txt" >/dev/null 2>&1
+          rw_code=$?
+          set -e
+          [[ "$rw_code" -eq 2 ]] || fail "复跑的退出码应为 2，实际 ${rw_code}"
+          [[ -z "$(find "$manifest" -newer "${work}/sentinel")" ]] \
+            || fail "原清单的 mtime 变了：它被写过（cmp 抓不到「原样重写」这种写法）"
+          echo "✓ ③ 原清单字节不变（cmp 通过），mtime 也没变（没被打开写过）"
+
+          # ④ 日志的条数与文件一致；屏幕与文件条数不同时必须说明——否则使用者
+          #    会以为上游只有 3 个新 tag
+          logged="$(sed -n 's/.*已写入 .*（\([0-9][0-9]*\) 行 tag）.*/\1/p' <<<"$out")"
+          [[ -n "$logged" ]] || { printf '%s\n' "$out"; fail "日志里没有「已写入 …（N 行 tag）」"; }
+          [[ "$logged" -eq "$tags" ]] \
+            || fail "日志报 ${logged} 行，文件里是 ${tags} 行——两处口径必须一致"
+          grep -qF '文件里是全部 12 个未收录的 tag' <<<"$out" \
+            || { printf '%s\n' "$out"; fail "屏幕列 3 条、文件写 12 条，日志应说明这个差异"; }
+          echo "✓ ④ 日志「已写入 …（${logged} 行 tag）」与文件一致，并说明了与屏幕的差异"
+
+          # ⑤ 清单已覆盖上游时**仍然写出文件**并在头部注明：「文件不存在」与
+          #    「没有要加的」不能混成一种
+          covered="${work}/covered.lock.txt"
+          printf 'mock-a.local/app:v1\nmock-a.local/app:v2\nmock-a.local/app:v3\n' > "$covered"
+          printf 'mock-a.local/app:v4\nmock-a.local/app:v5\nmock-a.local/app:v6\nmock-a.local/app:v10\n' >> "$covered"
+          frag2="${work}/covered-updates.txt"
+          set +e
+          out2="$(./scripts/sync.sh --file "$covered" --check-updates --write-updates "$frag2" 2>&1)"
+          code2=$?
+          set -e
+          [[ "$code2" -eq 0 ]] || { printf '%s\n' "$out2"; fail "清单已覆盖上游时期望退出码 0，实际 ${code2}"; }
+          [[ -f "$frag2" ]] \
+            || { printf '%s\n' "$out2"; fail "清单已覆盖上游时也必须写出文件（不能与「文件不存在」混成一种）"; }
+          grep -qF '本次没有需要补充的 tag' "$frag2" \
+            || { printf '%s\n' "$out2"; fail "头部应注明「本次没有需要补充的 tag」"; }
+          [[ "$(grep -vcE '^[[:space:]]*(#|$)' "$frag2" || true)" -eq 0 ]] \
+            || fail "没有未收录 tag 时不该有数据行"
+          echo "✓ ⑤ 没有未收录 tag 时仍写出文件并在头部注明"
+
+          # ⑥ 生成的文件能直接喂回 --file。只断「跑得起来」不够：少解析几行照样
+          #    跑得动，所以断它读出的是**两个仓库各 6 个 tag**（共 12 个镜像）
+          set +e
+          out3="$(./scripts/sync.sh --file "$frag" --check-updates 2>&1)"
+          set -e
+          grep -qF '待检查镜像 12 个' <<<"$out3" \
+            || { printf '%s\n' "$out3"; fail "生成的文件应被解析出 12 个镜像"; }
+          grep -qF '清单中：v2 v3 v4 v5 v6 v10' <<<"$out3" \
+            || { printf '%s\n' "$out3"; fail "生成的文件没能被 --file 完整解析（app 的 6 个 tag 应全部出现在「清单中」）"; }
+          grep -qF '清单中：v1 v3 v4 v5 v6 v10' <<<"$out3" \
+            || { printf '%s\n' "$out3"; fail "生成的文件没能被 --file 完整解析（other 的 6 个 tag 应全部出现在「清单中」）"; }
+          echo "✓ ⑥ 生成的文件可直接用作 --file（12 个镜像、两仓库各 6 个 tag 全部解析出来）"
+
+          # ⑦ 查询失败时**不能**写成「清单已覆盖上游」——那是一个「无法判定」
+          #    冒充了「正常」，正是本项目最忌讳的混淆。stub 的 list-tags 永远成功，
+          #    造不出这个现场，所以另建一个只会失败的 skopeo。这里用的是自己的路径，
+          #    与别处的夹具互不干扰（要测「夹具自己坏了」得改它实际读的那份）
+          mkdir -p "${work}/bin"
+          printf '#!/usr/bin/env bash\nexit 1\n' > "${work}/bin/skopeo"
+          chmod +x "${work}/bin/skopeo"
+          frag3="${work}/failed-updates.txt"
+          set +e
+          PATH="${work}/bin:$PATH" ./scripts/sync.sh --file "$manifest" --check-updates \
+            --write-updates "$frag3" >/dev/null 2>&1
+          code3=$?
+          set -e
+          [[ "$code3" -eq 2 ]] || fail "有仓库查询失败时期望退出码 2，实际 ${code3}"
+          [[ -f "$frag3" ]] || fail "有仓库查询失败时也应写出文件（头部要说明无法判定）"
+          grep -qF '无法判定' "$frag3" || fail "查询失败时头部应说明「无法判定」"
+          # 与上一条配对：只断「含无法判定」时，一个两句话都写的实现照样绿——
+          # 而它同样误导（一边说无法判定、一边说清单已覆盖）
+          if grep -qF '清单已覆盖上游现有 tag' "$frag3"; then
+            cat "$frag3"
+            fail "有仓库查询失败时不能说「清单已覆盖上游现有 tag」（无法判定冒充正常）"
+          fi
+          echo "✓ ⑦ 查询失败时头部报「无法判定」，不说「清单已覆盖上游」"
+
+          # ⑧ --check-updates 下的 --dry-run 本身是**不生效**的（它在本模式的不生效
+          #    列表里，见「验证只读模式的不生效参数告警」），所以它也不该让文件写不出来。
+          #    缺了这条，一个「dry-run 一律不落盘」的实现会让带 --dry-run 的使用者
+          #    手里没有文件，而日志里没有任何异常
+          frag4="${work}/dryrun-updates.txt"
+          set +e
+          ./scripts/sync.sh --file "$manifest" --check-updates --dry-run \
+            --write-updates "$frag4" >/dev/null 2>&1
+          dry_code=$?
+          set -e
+          [[ "$dry_code" -eq 2 ]] || fail "带 --dry-run 的 --check-updates 期望退出码 2，实际 ${dry_code}"
+          [[ -f "$frag4" ]] || fail "--check-updates 下 --dry-run 不生效，清单片段仍应写出"
+          echo "✓ ⑧ --check-updates 下 --dry-run 不影响清单片段写出"
+
+          # ⑨ 第三种形态：查询**成功**了，但上游一个 tag 都没返回（既不是⑦的失败，
+          #    也不是⑤的「清单覆盖了上游现有的 tag」）。它最容易被读成「上游没有新
+          #    版本」，而一份空片段被这样读正是同一个混淆换了个说法。带注释的头部
+          #    因此要单独说一句；这条断言钉的就是那句，以及它报出的仓库数
+          mkdir -p "${work}/bin-empty"
+          cat > "${work}/bin-empty/skopeo" <<'STUB'
+          #!/usr/bin/env bash
+          printf '%s\n' '{"Name":"stub","Tags":[]}'
+          exit 0
+          STUB
+          chmod +x "${work}/bin-empty/skopeo"
+          frag5="${work}/empty-updates.txt"
+          set +e
+          out5="$(PATH="${work}/bin-empty:$PATH" ./scripts/sync.sh --file "$manifest" --check-updates \
+            --write-updates "$frag5" 2>&1)"
+          code5=$?
+          set -e
+          # 「成功但空」不进退出码（与逐仓库报告里的 empty 状态一致）：它的退出码
+          # 仍是 0，所以这条断言顺带钉住了「别把空回答升级成失败」这个既有口径
+          [[ "$code5" -eq 0 ]] || { printf '%s\n' "$out5"; fail "上游返回空 tag 列表时期望退出码 0（成功但空，不是失败），实际 ${code5}"; }
+          [[ -f "$frag5" ]] || { printf '%s\n' "$out5"; fail "上游返回空 tag 列表时也应写出文件"; }
+          grep -qF '本次有 2 个仓库的上游返回了空 tag 列表' "$frag5" \
+            || { cat "$frag5"; fail "空 tag 列表这一形态应在头部单独说明，并报出仓库数（2 个）"; }
+          grep -qF '不等于「上游没有新版本」' "$frag5" \
+            || { cat "$frag5"; fail "头部应点明「没有可写的 tag」不等于「上游没有新版本」"; }
+          [[ "$(grep -vcE '^[[:space:]]*(#|$)' "$frag5" || true)" -eq 0 ]] \
+            || fail "上游返回空 tag 列表时不该有数据行"
+          echo "✓ ⑨ 上游返回空 tag 列表时：仍写出文件、头部单独说明（2 个仓库），退出码仍是 0"
 
       - name: 验证 --check-updates 按仓库分组去重（stub skopeo）
         run: |
