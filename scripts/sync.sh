@@ -62,6 +62,11 @@ CHECK_UPDATES="false"
 # 每个源仓库最多展示几条未收录的 tag（取版本序最大的若干条）。
 # 上游仓库动辄几百个 tag，全列出来等于没有输出。
 UPDATES_LIMIT="5"
+# 把 --check-updates 查出的未收录 tag 写成一份清单片段（--write-updates <路径>）。
+# 它只**生成建议**，不修改任何既有文件——与 --check-updates「只报告，不修改清单」
+# 的立场一致。与 --updates-limit 的分工是「展示口径 vs 数据口径」：屏幕最多列
+# UPDATES_LIMIT 条，文件里是**全部**（文件看起来完整而实际不完整，比没有文件更糟）。
+WRITE_UPDATES=""
 # 锁文件时效性校验（--audit-lock <文件>）：检查锁文件里每个「镜像@digest」
 # 的上游是否还是锁定的那份。--write-lock 只完成了「能复现」这半件事——
 # 上游完全可能重新构建并覆盖同名 tag，此时锁文件没有任何变化（它记录的
@@ -307,6 +312,12 @@ sync.sh —— 容器镜像同步引擎
                            tag，或有仓库没查成」
       --updates-limit <N>  每个仓库最多列出几条未收录的 tag，默认 5。
                            无论列出几条，总数都会给出
+      --write-updates <路径>
+                           把未收录的 tag 写成一份清单片段，可直接粘贴，
+                           也可直接用作 --file 的输入（格式与 --file 完全一致）。
+                           **不改动你的清单**——写出的是建议，合并由人决定。
+                           与 --updates-limit 无关：文件里是**全部**未收录的
+                           tag，屏幕才是按 limit 截断的（两者条数不同时日志会说明）
 
       --audit-lock <文件>  只读校验 --write-lock 生成的锁文件：锁文件里每个
                            「镜像@digest」的上游，现在还是不是锁定的那份。
@@ -424,6 +435,9 @@ sync.sh —— 容器镜像同步引擎
   # 只看状态不动手：清单里的镜像，目标仓库现在缺哪些、哪些落后了
   ./scripts/sync.sh --file images.lock.txt -d registry.cn-shenzhen.aliyuncs.com/nicholyx --audit
 
+  # 上游有哪些新 tag 没收录，顺带导成一份清单片段
+  ./scripts/sync.sh --file images.lock.txt --check-updates --write-updates updates.txt
+
   # 校验锁文件的时效性：上游的 tag 还是我锁定的那份 digest 吗
   ./scripts/sync.sh --audit-lock sync-2026-09.lock
 
@@ -477,6 +491,9 @@ parse_args() {
       --updates-limit)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         UPDATES_LIMIT="$2"; shift 2 ;;
+      --write-updates)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        WRITE_UPDATES="$2"; shift 2 ;;
       --audit-lock)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         AUDIT_LOCK_FILE="$2"; shift 2 ;;
@@ -2439,17 +2456,126 @@ group_repos_from_manifest() {
   done
 }
 
+# 把 --check-updates 未收录的 tag 写成一份清单片段（--write-updates）。
+#
+# 三处刻意的取舍，都写在代码里而不是留给下一个人猜：
+#
+# 1. **不修改任何既有文件**。写出的是建议，升到哪个版本是人的决定——这与
+#    --check-updates「只报告，不修改清单」的立场是同一件事。调用方只往
+#    $path 这一个新文件里写，清单文件在这条路径上从未被打开过。
+# 2. **写的是完整数据，不是展示数据**。body 由调用方从**完整**的 missing
+#    攒出（与 total_missing 同源），屏幕上的 --updates-limit 不参与。把 limit
+#    用在文件上会得到一份「看起来完整」的片段——错误的信息比没有信息更糟。
+# 3. **写失败只告警，不中断**。判断依据是它和 --check-updates 的关系更接近
+#    哪一对既有先例：--report-dir 的落盘失败会中断（报告**是**该模式的产物），
+#    --write-lock 的失败只告警（锁文件是同步之外的**附加物**）。--write-updates
+#    属于后者：检查的主产物是那份检查结果（屏幕 / 报告 / 通知都已经给出），
+#    文件是使用者额外要的一条通道。为它中断，会把一次已经跑完的检查判成失败，
+#    连「查出了未收录 tag」这个更重要的结论（退出码 2）一起吞掉——同一个形状的
+#    事故本仓库记过一次（#159：一次成功的同步因为通知这个附属动作以非零退出）。
+#    退成告警的同时**绝不打印「已写入」**：失败不伪造成功。
+#
+# 函数自包含（不读任何运行级全局，路径 / 数据 / 条数 / limit 与三个计数全部由参数
+# 传入）：CI 会把生产函数整段抽到独立上下文里执行，依赖 ${WORK_DIR} 那类全局会当场炸。
+write_updates_snippet() {
+  local path="$1" body="$2" line_count="$3" limit="$4" truncated="$5" failed="$6" empty="$7"
+  local dir generated
+
+  dir="$(dirname "$path")"
+  if [[ ! -d "$dir" ]]; then
+    mkdir -p "$dir" 2>/dev/null || {
+      log_warn "清单片段的目录不存在且创建失败：${dir}；本次未写出 ${path}（检查结果不受影响）"
+      return 0
+    }
+  fi
+
+  generated="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+  # 头部与 --file 的清单格式同一套规则：# 开头是注释、空行忽略、每行一个引用，
+  # 所以生成的文件可以直接喂回 --file（不是「差不多能用」，是解析器认这几种形态）。
+  # 末尾用 printf '%s' 原样吐出 body（它自己以换行收尾）——文件结尾不留多余空行，
+  # 也不缺结尾换行。
+  #
+  # 外面套一层子 shell 只为把重定向失败时 bash 自己那句带行号的诊断
+  # （`scripts/sync.sh: line N: /tmp: Is a directory`）一并吞掉：它对使用者没有
+  # 意义，而紧随其后的告警已经把「哪个路径、什么后果」说清楚了。子 shell 里只写
+  # 文件、不动任何变量，因此不影响外层状态。
+  if ! (
+    {
+      printf '# 由 scripts/sync.sh 生成于 %s\n' "$generated"
+      printf '#\n'
+      printf '# 这些是上游存在、而清单里没有的 tag。**本文件不会修改你的清单**——\n'
+      printf '# 升到哪个版本涉及兼容性判断，由你决定。\n'
+      printf '# 采用方式：把需要的行复制进清单文件，或直接用它当 --file 的输入。\n'
+      printf '#\n'
+      printf '# 注：屏幕上每个仓库最多显示 %s 条（--updates-limit），本文件列的是**全部**。\n' "$limit"
+      if [[ "$empty" -gt 0 ]]; then
+        # 第三种形态：查询**成功**了，但上游一个 tag 都没返回。它既不是「查询失败」
+        # （所以不进 failed、退出码也不变），也不能被读成「上游没有新版本」——
+        # 一份空片段最容易被这样读，而这两种含义天差地别。既有的屏幕与报告把这种
+        # 仓库单列成「上游返回空列表」，这里跟着说一句，措辞不与它冲突。
+        printf '# 注：本次有 %s 个仓库的上游返回了空 tag 列表（逐仓库见运行日志）——\n' "$empty"
+        printf '# 「没有可写的 tag」不等于「上游没有新版本」，这些仓库请自行核对。\n'
+      fi
+      if [[ "$line_count" -eq 0 ]]; then
+        # 「文件不存在」与「没有要加的」不能混成一种：清单已覆盖上游时照样写出文件，
+        # 并在头部注明，而不是让使用者对着一个不存在的路径猜发生了什么
+        printf '#\n'
+        if [[ "$failed" -gt 0 ]]; then
+          # 更要说清楚的一种：**没有可写的 tag 不等于清单已覆盖上游**——查不动的
+          # 仓库有没有新 tag 是「无法判定」，把它写成「已覆盖」正是本仓库最忌讳的
+          # 那类混淆（无法判定冒充正常）
+          printf '# 本次没有可写入的 tag：%s 个仓库查询失败，它们是否有新的 tag 无法判定——\n' "$failed"
+          printf '# 这不是「清单已覆盖上游」。\n'
+        else
+          printf '# 本次没有需要补充的 tag：清单已覆盖上游现有 tag。\n'
+        fi
+      else
+        if [[ "$failed" -gt 0 ]]; then
+          # 查不动的仓库不在文件里，而这**不代表**它们没有新 tag。这句注释只在
+          # 真有下面的列表时才出现——没有列表可指时说「不在下面的列表里」是废话
+          printf '# 注：本次有 %s 个仓库查询失败，它们不在下面的列表里——不代表它们没有新的 tag。\n' "$failed"
+        fi
+        printf '\n'
+        printf '%s' "$body"
+      fi
+    } > "$path"
+  ) 2>/dev/null; then
+    log_warn "清单片段写入失败：${path}（检查结果不受影响）"
+    return 0
+  fi
+
+  log_info "已写入 ${path}（${line_count} 行 tag）"
+  if [[ "$truncated" == "true" ]]; then
+    # 屏幕与文件的条数不同时**必须**说出来：不然使用者会以为上游只有 limit 个新 tag
+    log_dim "屏幕上每个仓库最多显示 ${limit} 条（--updates-limit），文件里是全部 ${line_count} 个未收录的 tag"
+  fi
+  return 0
+}
+
 check_updates_all() {
   local limit="$UPDATES_LIMIT"
   local idx repo known_tags raw rc upstream_sorted known_sorted missing missing_count shown
   local checked=0 with_updates=0 failed=0 total_missing=0
   local summary_rows=""
   local notify_detail=""
+  # --write-updates 的收集区：body 是在循环里逐仓库攒下的**同一份** missing
+  # （与报告、total_missing 同源，不重算），写出动作在循环之后。
+  # upd_empty 单列：「上游返回了空 tag 列表」与「查询失败」都是「这次没拿到东西」，
+  # 但不能并进 failed——它不进退出码、报告里另有 empty 这个状态，措辞上也不该把
+  # 一次「查到了、但一个 tag 都没有」的空回答称作失败。头部只需知道它不为 0。
+  local upd_body="" upd_written=0 upd_truncated="false" upd_tag upd_empty=0
 
   group_repos_from_manifest
 
   if [[ ${#UPD_REPOS[@]} -eq 0 ]]; then
     log_warn "没有可检查的镜像（全部被筛选排除）"
+    # 这里**不写** --write-updates 的文件：本次什么都没查成，写一份空片段会被
+    # 下游当成「上游没有新 tag」——「无法判定」冒充「正常」正是本仓库最忌讳的
+    # 那类混淆。不写，但必须说出来（显式传入却不产生文件，比报错更需要解释）。
+    if [[ -n "$WRITE_UPDATES" ]]; then
+      log_warn "本次没有任何仓库被检查，未写出 ${WRITE_UPDATES}（不代表上游没有新 tag）"
+    fi
     return 0
   fi
 
@@ -2495,6 +2621,10 @@ check_updates_all() {
 
     upstream_sorted="$(printf '%s' "$raw" | jq -r '.Tags[]?' 2>/dev/null | grep -v '^$' | sort -u || true)"
     if [[ -z "$upstream_sorted" ]]; then
+      # 这一条不计入 failed（它是一次**成功**的空回答，退出码与报告状态都不变），
+      # 但 --write-updates 的头部要知道有几个仓库是这种形态：一份空片段被读成
+      # 「上游没有新版本」，与「已覆盖」是同一族的混淆
+      upd_empty=$((upd_empty + 1))
       printf '  %s上游没有返回任何 tag%s\n' "$C_YELLOW" "$C_RESET" >&2
       summary_rows+="| \`${repo}\` | ${known_tags:-—} | — | 上游返回空列表 |"$'\n'
       jq -n --arg repo "$repo" --arg known "${known_tags}" \
@@ -2520,6 +2650,10 @@ check_updates_all() {
     with_updates=$((with_updates + 1))
     missing_count="$(printf '%s\n' "$missing" | grep -c .)"
     total_missing=$((total_missing + missing_count))
+    # 有截断时才需要说明屏幕与文件的差异（见下面的 log_dim），没有截断就不打扰
+    if [[ "$missing_count" -gt "$limit" ]]; then
+      upd_truncated="true"
+    fi
 
     # 缺失数少于上限时就说「全部列出」——写「版本序最大的 5 个」却只列出 3 条，
     # 看的人会以为还有没显示出来的
@@ -2536,6 +2670,24 @@ check_updates_all() {
     shown="$(printf '%s\n' "$missing" | sort -Vr | head -n "$limit" | tr '\n' ' ')"
     shown="${shown% }"
     printf '    %s\n' "$shown" >&2
+
+    # --write-updates：按仓库分组攒出清单片段，组内**版本序升序**。
+    # 与屏幕上那句的差别只有两处，都是有意的：
+    #   * 数据用**完整**的 missing，不是被 limit 截断的 shown（文件是数据口径）
+    #   * 方向用 sort -V（升序），屏幕用 sort -Vr（降序取前 N）——同一个版本序
+    #     比较、换了个方向，不另写一套比较（「同一个概念两份实现」是分家的种子）；
+    #     屏幕是给人快速扫一眼（最新的在最上面），文件是给人整段粘贴（升序读着顺）
+    if [[ -n "$WRITE_UPDATES" ]]; then
+      if [[ -n "$upd_body" ]]; then upd_body+=$'\n'; fi
+      upd_body+="# ${repo}"$'\n'
+      while IFS= read -r upd_tag; do
+        [[ -n "$upd_tag" ]] || continue
+        # repo 是 UPD_REPOS 里的**仓库**（split_image_ref 已剥掉 tag 与 digest），
+        # 所以这里只拼一次 tag，不会出现 :tag:tag 或带 @digest 的重复拼接
+        upd_body+="${repo}:${upd_tag}"$'\n'
+        upd_written=$((upd_written + 1))
+      done < <(printf '%s\n' "$missing" | sort -V)
+    fi
 
     summary_rows+="| \`${repo}\` | ${known_tags:-—} | ${missing_count} | ${shown} |"$'\n'
     notify_detail+="- \`${repo}\` 有 **${missing_count}** 个未收录：${shown}"$'\n'
@@ -2556,6 +2708,13 @@ check_updates_all() {
   if [[ "$with_updates" -gt 0 ]]; then
     # 说清楚边界：这是报告，不是升级建议，更不会替你改文件
     log_dim "以上只是「上游有这些 tag」，不是「应该升级到哪个版本」；清单需要时请手工编辑"
+  fi
+
+  # ---- 清单片段（--write-updates）----
+  # 放在汇总之后：头部与日志都要用到最终条数，写在循环里会拿到半份数据。
+  # 清单已覆盖上游（upd_written=0）时照样写出文件，由函数在头部注明。
+  if [[ -n "$WRITE_UPDATES" ]]; then
+    write_updates_snippet "$WRITE_UPDATES" "$upd_body" "$upd_written" "$limit" "$upd_truncated" "$failed" "$upd_empty"
   fi
 
   if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
@@ -4052,6 +4211,21 @@ main() {
   fi
   DEST_EXACT="${DEST_EXACT#docker://}"
 
+  # ---- 同步模式的参数约束 ----
+  # --write-updates 是 --check-updates 的产物通道：它写出的正是那份检查报出的
+  # 「上游有、清单没有」的 tag。同步模式不做这项检查，这份数据不存在，参数无处落地。
+  #
+  # 它有自己的列表、没有并进下面的 dry_noop：那条告警的条件是 --dry-run，而
+  # --write-updates 在同步模式下**无论有没有 --dry-run 都不生效**。并进去会让
+  # 「不带 --dry-run 的同步」少一次告警，而漏告警正是这条例外要堵的东西。
+  if [[ "$AUDIT" != "true" && "$CHECK_UPDATES" != "true" && -z "$AUDIT_LOCK_FILE" ]]; then
+    local -a sync_ignored=()
+    if [[ -n "$WRITE_UPDATES" ]]; then sync_ignored+=("--write-updates"); fi
+    if [[ ${#sync_ignored[@]} -gt 0 ]]; then
+      log_warn "同步模式不做上游版本检查，以下参数本次不生效：${sync_ignored[*]}（要生成清单片段请加 --check-updates）"
+    fi
+  fi
+
   # ---- 只读检查的参数约束 ----
   # 三个检查的对象不同（目标仓库 / 上游 tag 列表 / 锁文件时效），报告是三套，
   # 混着跑会互相淹没。都要的话跑三次就好——这类检查本来就该是随手能跑的命令。
@@ -4075,6 +4249,7 @@ main() {
     local -a upd_ignored=()
     if [[ "$DRY_RUN" == "true" ]]; then upd_ignored+=("--dry-run"); fi
     if [[ -n "$WRITE_LOCK" ]]; then upd_ignored+=("--write-lock"); fi
+    # --write-updates 不在此列：它就是这个模式的产物通道，在这里**生效**
     # --notify-webhook 在检查模式下是生效的（见 send_check_notification），
     # 但「连续失败次数」这个概念在检查里不存在，只有同步才有
     if [[ "$NOTIFY_AFTER_FAILURES_EXPLICIT" == "true" ]]; then
@@ -4107,6 +4282,8 @@ main() {
     local -a ignored=()
     if [[ "$DRY_RUN" == "true" ]]; then ignored+=("--dry-run"); fi
     if [[ -n "$WRITE_LOCK" ]]; then ignored+=("--write-lock"); fi
+    # 审计不做上游 tag 检查，--write-updates 没有数据可写
+    if [[ -n "$WRITE_UPDATES" ]]; then ignored+=("--write-updates"); fi
     # --notify-webhook 在审计模式下是生效的（见 send_check_notification）
     if [[ "$NOTIFY_AFTER_FAILURES_EXPLICIT" == "true" ]]; then
       ignored+=("--notify-after-failures")
@@ -4127,6 +4304,8 @@ main() {
     local -a lock_ignored=()
     if [[ "$DRY_RUN" == "true" ]]; then lock_ignored+=("--dry-run"); fi
     if [[ -n "$WRITE_LOCK" ]]; then lock_ignored+=("--write-lock"); fi
+    # 锁文件校验以锁文件为准，不查上游 tag 列表
+    if [[ -n "$WRITE_UPDATES" ]]; then lock_ignored+=("--write-updates"); fi
     if [[ "$NOTIFY_AFTER_FAILURES_EXPLICIT" == "true" ]]; then lock_ignored+=("--notify-after-failures"); fi
     if [[ "$VERIFY" == "true" ]]; then lock_ignored+=("--verify"); fi
     if [[ "$SKIP_EXISTING" == "true" ]]; then lock_ignored+=("--skip-existing"); fi

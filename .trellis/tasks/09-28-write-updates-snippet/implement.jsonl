@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "本任务是 bash 改动：bash 3.2 兼容、printf 收尾换行、空数组遍历、命令替换是子 shell、临时文件自己建自己删"}
+{"file": ".trellis/spec/engine/index.md", "reason": "断言口径：恒真断言比没有断言更糟、变异精确到单点、负向判据要成对、比 JSON 用 jq -S、夹具计数要互不相同"}
+{"file": ".trellis/spec/engine/modes.md", "reason": "四种模式的语义、退出码与互斥关系——新增参数要落进正确的模式与「不生效」告警列表"}
+{"file": ".trellis/spec/workflows/index.md", "reason": "在 ci.yml 的既有步骤里加断言：run 块缩进、端口/固定路径是 job 共享、断言不要匹配恒真的状态词"}
+{"file": ".trellis/spec/maintenance/index.md", "reason": "CHANGELOG 条目的锚点校验（历史踩过：条目插进了已发布版本段）；改动 CI 步骤的既有教训"}

@@ -389,7 +389,7 @@ registry.k8s.io/kube-apiserver
 
 **It reports, it never edits the manifest** — which version to move to is a compatibility judgement, and that call is yours. It also does **no semver reasoning and no prerelease filtering**: upstream tag naming is often irregular (`latest`, `1.27-alpine`, `v1.32.0-rc.1`), and semver comparison would return *wrong* answers. So seeing `latest` or a tag older than your manifest is normal — this is **not an upgrade recommendation**.
 
-Only the 5 highest-by-version tags are listed by default (`--updates-limit`), but the total count is always reported. No destination needed; multiple tags from one repository are fetched once. See [USAGE.md § scenario 13](docs/USAGE.md#场景十三发现上游的新版本) (Chinese).
+Only the 5 highest-by-version tags are listed by default (`--updates-limit`), but the total count is always reported. Add `--write-updates <path>` to write those tags out as a **paste-ready manifest fragment** (same format as `--file`, so the file can be fed straight back into the script) — it contains *all* missing tags regardless of `--updates-limit`, and it never touches your manifest. No destination needed; multiple tags from one repository are fetched once. See [USAGE.md § scenario 13](docs/USAGE.md#场景十三发现上游的新版本) (Chinese).
 
 </details>
 

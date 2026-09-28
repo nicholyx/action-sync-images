@@ -14,6 +14,7 @@
 | 状态值域 | success/skipped/failed/excluded | current/stale/missing/unknown/excluded | —（逐仓库报告） | match/drift/unknown/nodigest/marker |
 | 结果数组 | `R_*` | `A_*` | —（直接输出） | `L_*` |
 | 报告落盘 | `sync-report-*` | `audit-report-*` | `check-updates-report-*` | `lock-audit-report-*` |
+| 清单片段（`--write-updates`） | 不生效（告警） | 不生效（告警） | **生效**：写**全部**未收录 tag（不受 `--updates-limit` 影响，且不改任何既有文件） | 不生效（告警） |
 
 ## 互斥关系（全部 die，不告警后继续）
 
@@ -37,4 +38,6 @@
 
 ## 模式相关参数（显式传入不生效必须告警）
 
-每个模式有自己的「不生效」列表（`upd_ignored` / `ignored` / `lock_ignored`，在 `main()` 的参数约束区）。新增模式行为时同步维护——「参数被接受却不生效」比直接报错更危险。
+每个模式有自己的「不生效」列表（`sync_ignored` / `upd_ignored` / `ignored` / `lock_ignored`，在 `main()` 的参数约束区）。新增模式行为时同步维护——「参数被接受却不生效」比直接报错更危险。
+
+**同步模式那条（`sync_ignored`）与 `--dry-run` 无关**，别把它并进 `dry_run` 的 `dry_noop`：后者只在 `--dry-run` 下打印，并进去会让「不带 `--dry-run` 的同步」少一次提醒。
