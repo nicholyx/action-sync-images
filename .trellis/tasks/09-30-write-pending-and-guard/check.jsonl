@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "本任务是 bash 改动：空数组遍历、printf 收尾换行、临时文件、命令替换是子 shell、变量紧贴中文加花括号"}
+{"file": ".trellis/spec/engine/modes.md", "reason": "四种模式的语义/退出码/互斥关系——新参数要落进正确的模式与「不生效」告警列表；审计的四种状态也在这里"}
+{"file": ".trellis/spec/engine/index.md", "reason": "断言口径：恒真断言比没有断言更糟、变异精确到单点、负向判据成对、时序判据的隐含前提、新产物要列举所有「空内容」的原因"}
+{"file": ".trellis/spec/workflows/index.md", "reason": "在 ci.yml 既有步骤里加断言：run 块缩进、端口与固定路径是 job 共享、断言不要匹配恒真的状态词"}
+{"file": ".trellis/spec/maintenance/index.md", "reason": "CHANGELOG 条目的锚点校验；改动 CI 步骤的既有教训"}
