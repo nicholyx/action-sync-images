@@ -67,6 +67,12 @@ UPDATES_LIMIT="5"
 # 的立场一致。与 --updates-limit 的分工是「展示口径 vs 数据口径」：屏幕最多列
 # UPDATES_LIMIT 条，文件里是**全部**（文件看起来完整而实际不完整，比没有文件更糟）。
 WRITE_UPDATES=""
+# 把 --audit 查出的「落后 + 缺失」写成一份子集清单（--write-pending <路径>）。
+# 从体检到动手的那一跳：--audit 回答「差距有多大」，这份文件回答「要搬哪几个」。
+# 与 --write-updates 同一个立场：只生成建议，不修改任何既有文件——重新同步
+# 哪些是人的决定。「无法判定」的项不进正文（是否需要同步无从得知，与「需要
+# 同步」不能混成一种），个数写在文件头部。
+WRITE_PENDING=""
 # 锁文件时效性校验（--audit-lock <文件>）：检查锁文件里每个「镜像@digest」
 # 的上游是否还是锁定的那份。--write-lock 只完成了「能复现」这半件事——
 # 上游完全可能重新构建并覆盖同名 tag，此时锁文件没有任何变化（它记录的
@@ -319,6 +325,20 @@ sync.sh —— 容器镜像同步引擎
                            与 --updates-limit 无关：文件里是**全部**未收录的
                            tag，屏幕才是按 limit 截断的（两者条数不同时日志会说明）
 
+      --write-pending <路径>
+                           把 --audit 查出的「落后 / 缺失」写成一份子集清单，
+                           每行一个源引用，可直接用作 --file 的输入（格式与
+                           --file 完全一致）。**不改动任何既有文件**。
+                           与「去掉 --audit 重跑同一条命令」的分工：那条路
+                           要靠 --skip-existing 跳过已最新的镜像，而它在
+                           --strip-attestation（regctl 路径）下不可用——索引
+                           会被重建、目标 digest 必然不同；即便可用，它也要
+                           对每个镜像各做一次 inspect，大清单上是白跑。
+                           这份子集把「需要动手的那部分」直接列出来。
+                           「无法判定」的项不列入（是否需要同步无从得知），
+                           个数会写在文件头部。只在 --audit 下生效，其余模式
+                           显式传入时告警
+
       --audit-lock <文件>  只读校验 --write-lock 生成的锁文件：锁文件里每个
                            「镜像@digest」的上游，现在还是不是锁定的那份。
                            --write-lock 只完成了「能复现」这半件事——上游重新
@@ -494,6 +514,9 @@ parse_args() {
       --write-updates)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         WRITE_UPDATES="$2"; shift 2 ;;
+      --write-pending)
+        [[ -n "${2:-}" ]] || die "$1 需要一个参数"
+        WRITE_PENDING="$2"; shift 2 ;;
       --audit-lock)
         [[ -n "${2:-}" ]] || die "$1 需要一个参数"
         AUDIT_LOCK_FILE="$2"; shift 2 ;;
@@ -2372,6 +2395,55 @@ emit_audit_summary() {
     "$detail" \
     "$((stale + missing + unknown))"
 
+  # ---- 待同步子集（--write-pending）----
+  # 与报告同源：正文从同一批 A_SRC / A_STATE 攒出，不重算、不重新推导源引用。
+  # 放在汇总与通知之后：头部与日志要用到最终的统计值（unknown）。
+  if [[ -n "$WRITE_PENDING" ]]; then
+    local pending_lines="" pending_body="" p_refs=""
+    local ref pg known
+    local -a p_srcs=() p_repos=() p_order=()
+    for i in "${!A_STATE[@]}"; do
+      case "${A_STATE[$i]}" in
+        # 只有「落后 / 缺失」进正文：current 不需要同步；excluded 是使用者
+        # 有意排除的，不该被重新建议；unknown 是「无从得知」，个数由
+        # write_pending_snippet 写进头部，不与「需要同步」混成一种
+        stale|missing) pending_lines+="${A_SRC[$i]}"$'\n' ;;
+      esac
+    done
+    if [[ -n "$pending_lines" ]]; then
+      # 同一个源只出现一次：审计记录是「源 × 目标」一条，多目标时同一个源
+      # 有多条记录，喂回 --file 的子集里它只需要一行（awk 去重保序）。
+      pending_lines="$(printf '%s' "$pending_lines" | awk '!seen[$0]++')"
+      while IFS= read -r ref; do
+        [[ -n "$ref" ]] || continue
+        split_image_ref "$ref"
+        p_srcs+=("$ref")
+        p_repos+=("$REF_REPO")
+        known=0
+        for pg in "${!p_order[@]}"; do
+          if [[ "${p_order[pg]}" == "$REF_REPO" ]]; then known=1; break; fi
+        done
+        if [[ "$known" -eq 0 ]]; then p_order+=("$REF_REPO"); fi
+      done <<< "$pending_lines"
+    fi
+    if [[ ${#p_order[@]} -gt 0 ]]; then
+      # 按仓库分组攒正文：组按清单里首次出现的顺序，组内版本序升序——
+      # 与 --write-updates 同一个方向、同一个理由（给人整段粘贴）。
+      for pg in "${!p_order[@]}"; do
+        if [[ -n "$pending_body" ]]; then pending_body+=$'\n'; fi
+        pending_body+="# ${p_order[pg]}"$'\n'
+        p_refs=""
+        for i in "${!p_srcs[@]}"; do
+          if [[ "${p_repos[i]}" == "${p_order[pg]}" ]]; then
+            p_refs+="${p_srcs[i]}"$'\n'
+          fi
+        done
+        pending_body+="$(printf '%s' "$p_refs" | sort -V)"$'\n'
+      done
+    fi
+    write_pending_snippet "$WRITE_PENDING" "$pending_body" "${#p_srcs[@]}" "$unknown"
+  fi
+
   # 「没查完」与「查出差异」都返回 2：让 CI 门禁不至于在检查本身都没做完时
   # 就报绿。究竟属于哪一种，报告正文里分得很清楚。
   if [[ "$stale" -gt 0 || "$missing" -gt 0 || "$unknown" -gt 0 ]]; then
@@ -2454,6 +2526,53 @@ group_repos_from_manifest() {
       UPD_KNOWN_TAGS+=("$tag")
     fi
   done
+}
+
+# 输出路径守卫：写出参数的目标路径，不得与本次读入的任何文件是同一个文件。
+#
+# `--write-updates images.lock.txt` 会把清单覆盖成片段，而生成的文件头部还写着
+# 「本文件不会修改你的清单」——声明与行为自相矛盾（#172）。宁可当场拒绝，
+# 也不让使用者的清单毁于一次参数顺序的手滑。
+#
+# 判据用 -ef（inode + device）而不是字符串比较：`./images.lock.txt`、
+# `images.lock.txt`、指向它的软链接是三个不同的字符串、同一个文件，字符串比较
+# 这三种会漏掉两种。`-ef` 要求两侧都存在：输出路径尚不存在（正常情形）时为假，
+# 正是想要的；输入侧的存在性由各自的校验保证（清单在 collect_images、
+# 锁文件在下面的启动校验区），不存在时本来就写不出。
+#
+# 一处实现、三个写出参数共用：同一个洞在三个参数上各修一遍是「改一处漏一处」
+# 的温床。新增写出参数时只需在下面的 for 列表里注册一行，不改判据。
+guard_output_paths() {
+  local spec out_name out_path in_path
+  local -a inputs=()
+  # SOURCE_FILES 可能为空：bash 3.2 + set -u 下空数组的 "${arr[@]}" 会抛
+  # unbound variable，遍历前先判长度（见 .trellis/spec/engine/bash-rules.md）
+  if [[ ${#SOURCE_FILES[@]} -gt 0 ]]; then
+    for in_path in "${SOURCE_FILES[@]}"; do
+      inputs+=("$in_path")
+    done
+  fi
+  if [[ -n "$SRC_CREDENTIALS_FILE" ]]; then
+    inputs+=("$SRC_CREDENTIALS_FILE")
+  fi
+  if [[ -n "$AUDIT_LOCK_FILE" ]]; then
+    inputs+=("$AUDIT_LOCK_FILE")
+  fi
+  if [[ ${#inputs[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  for spec in "write-updates:$WRITE_UPDATES" "write-pending:$WRITE_PENDING" "write-lock:$WRITE_LOCK"; do
+    out_name="${spec%%:*}"
+    out_path="${spec#*:}"
+    [[ -n "$out_path" ]] || continue
+    for in_path in "${inputs[@]}"; do
+      if [[ "$out_path" -ef "$in_path" ]]; then
+        die "--${out_name} 的输出路径与本次读入的文件相同：${out_path}（直接写出会把它覆盖掉，拒绝执行）"
+      fi
+    done
+  done
+  return 0
 }
 
 # 把 --check-updates 未收录的 tag 写成一份清单片段（--write-updates）。
@@ -2550,6 +2669,80 @@ write_updates_snippet() {
     # 屏幕与文件的条数不同时**必须**说出来：不然使用者会以为上游只有 limit 个新 tag
     log_dim "屏幕上每个仓库最多显示 ${limit} 条（--updates-limit），文件里是全部 ${line_count} 个未收录的 tag"
   fi
+  return 0
+}
+
+# 把 --audit 查出的「落后 + 缺失」写成一份子集清单（--write-pending）。
+#
+# 与 write_updates_snippet 同一套立场与同形输出：按仓库分组、组内版本序升序、
+# 头部写明「不会修改你的清单」。两条刻意的取舍：
+#
+# 1. **「无法判定」不进正文，但个数必须在头部显式出现**。它是「无从得知」
+#    而不是「需要同步」——按这份文件去重新同步，落后的补上了，无法判定的
+#    什么也不会发生；把它列进去是「无从得知」冒充「需要同步」，不提它则
+#    一份缺少它们的文件会被读成「没有别的差距」。两种混淆比没有文件更糟。
+#    （--audit 的退出码把三类都算 2，但处置方式不同：正文里的去搬、
+#    无法判定的先修查询。）
+# 2. **写失败只告警，不中断**：与 --write-updates 同一口径——审计的主产物
+#    是那份审计结果（屏幕 / 报告 / 通知都已经给出），文件是使用者额外要的
+#    一条通道，为它中断会把已经跑完的审计连同退出码 2 的结论一起吞掉。
+#    失败时绝不打印「已写入」。
+#
+# 函数自包含（不读任何运行级全局，路径 / 数据 / 条数 / 计数全部由参数传入），
+# 写出动作在 emit_audit_summary 的统计与渲染之后：头部与日志要用最终条数。
+write_pending_snippet() {
+  local path="$1" body="$2" line_count="$3" unknown="$4"
+  local dir generated
+
+  dir="$(dirname "$path")"
+  if [[ ! -d "$dir" ]]; then
+    mkdir -p "$dir" 2>/dev/null || {
+      log_warn "待同步子集的目录不存在且创建失败：${dir}；本次未写出 ${path}（审计结果不受影响）"
+      return 0
+    }
+  fi
+
+  generated="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+  # 与 write_updates_snippet 同一套规则：# 开头是注释、空行忽略、每行一个引用，
+  # 所以生成的文件可以直接喂回 --file。外面套一层子 shell 只为把重定向失败时
+  # bash 自己那句带行号的诊断一并吞掉——紧随其后的告警已把「哪个路径、什么
+  # 后果」说清楚。子 shell 里只写文件、不动任何变量，因此不影响外层状态。
+  if ! (
+    {
+      printf '# 由 scripts/sync.sh 生成于 %s\n' "$generated"
+      printf '#\n'
+      printf '# 这些是清单与目标仓库存在差距的项（落后 / 缺失），需要重新同步。\n'
+      printf '# **本文件不会修改你的清单**——它只是一份可直接喂回 --file 的子集。\n'
+      printf '# 用法：./scripts/sync.sh --file <本文件> --dest <前缀>\n'
+      printf '#\n'
+      if [[ "$unknown" -gt 0 ]]; then
+        printf '# 注：另有 %s 个「无法判定」未列入——它们是否需要同步无从得知，\n' "$unknown"
+        printf '#     见报告正文与运行日志。\n'
+      fi
+      if [[ "$line_count" -eq 0 ]]; then
+        # 「文件不存在」与「没有差距」不能混成一种：清单与目标一致时照样
+        # 写出文件，并在头部注明——与 --write-updates 的既有口径一致。
+        if [[ "$unknown" -gt 0 ]]; then
+          printf '#\n'
+          # 更要说清楚的一种：没有列出待同步项**不等于**清单与目标一致，
+          # 无法判定的项有没有差距还悬着。「一致」两个字在这里是假话。
+          printf '# 本次没有列出需要同步的项，但这不是「清单与目标仓库一致」：\n'
+          printf '# 另有无法判定的项（见上），它们是否存在差距尚无从得知。\n'
+        else
+          printf '# 本次没有需要同步的项：清单与目标仓库一致。\n'
+        fi
+      else
+        printf '\n'
+        printf '%s' "$body"
+      fi
+    } > "$path"
+  ) 2>/dev/null; then
+    log_warn "待同步子集写入失败：${path}（审计结果不受影响）"
+    return 0
+  fi
+
+  log_info "已写入 ${path}（${line_count} 行）"
   return 0
 }
 
@@ -4221,6 +4414,7 @@ main() {
   if [[ "$AUDIT" != "true" && "$CHECK_UPDATES" != "true" && -z "$AUDIT_LOCK_FILE" ]]; then
     local -a sync_ignored=()
     if [[ -n "$WRITE_UPDATES" ]]; then sync_ignored+=("--write-updates"); fi
+    if [[ -n "$WRITE_PENDING" ]]; then sync_ignored+=("--write-pending"); fi
     if [[ ${#sync_ignored[@]} -gt 0 ]]; then
       log_warn "同步模式不做上游版本检查，以下参数本次不生效：${sync_ignored[*]}（要生成清单片段请加 --check-updates）"
     fi
@@ -4245,10 +4439,16 @@ main() {
     die "--audit-lock 自带校验清单，不要再同时使用 --src / --file"
   fi
 
+  # 输出路径守卫：写出参数不得与读入的文件是同一个。放在互斥判定之后
+  # （模式已定型）与一切工具调用、网络请求、写出之前——--write-lock 的写出
+  # 发生在同步循环之后，但守卫必须在参数校验阶段就拦住它（#172）。
+  guard_output_paths
+
   if [[ "$CHECK_UPDATES" == "true" ]]; then
     local -a upd_ignored=()
     if [[ "$DRY_RUN" == "true" ]]; then upd_ignored+=("--dry-run"); fi
     if [[ -n "$WRITE_LOCK" ]]; then upd_ignored+=("--write-lock"); fi
+    if [[ -n "$WRITE_PENDING" ]]; then upd_ignored+=("--write-pending"); fi
     # --write-updates 不在此列：它就是这个模式的产物通道，在这里**生效**
     # --notify-webhook 在检查模式下是生效的（见 send_check_notification），
     # 但「连续失败次数」这个概念在检查里不存在，只有同步才有
@@ -4306,6 +4506,7 @@ main() {
     if [[ -n "$WRITE_LOCK" ]]; then lock_ignored+=("--write-lock"); fi
     # 锁文件校验以锁文件为准，不查上游 tag 列表
     if [[ -n "$WRITE_UPDATES" ]]; then lock_ignored+=("--write-updates"); fi
+    if [[ -n "$WRITE_PENDING" ]]; then lock_ignored+=("--write-pending"); fi
     if [[ "$NOTIFY_AFTER_FAILURES_EXPLICIT" == "true" ]]; then lock_ignored+=("--notify-after-failures"); fi
     if [[ "$VERIFY" == "true" ]]; then lock_ignored+=("--verify"); fi
     if [[ "$SKIP_EXISTING" == "true" ]]; then lock_ignored+=("--skip-existing"); fi

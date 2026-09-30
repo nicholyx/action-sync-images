@@ -377,7 +377,7 @@ ALIYUNCS_REGISTRY = registry.cn-hangzhou.aliyuncs.com/your-namespace
 
 退出码 `2` 表示「未得出全部最新」（含「没查完」），可以直接接进 CI 做定期体检——审计是只读的，不违反「同步必须显式触发」这条红线。
 
-看完全去掉 `--audit` 重跑同一条命令即可补齐，已是最新的会被 `--skip-existing` 自动跳过。详见[场景十二](docs/USAGE.md#场景十二审计清单与目标仓库的差距)。
+看完去掉 `--audit` 重跑同一条命令即可补齐，已是最新的会被 `--skip-existing` 自动跳过（它在 `--strip-attestation` 的 regctl 路径下不可用，且要对每个镜像各做一次 inspect——这两个场景加 `--write-pending <路径>`，把「落后 + 缺失」直接导成一份可喂回 `--file` 的子集清单，只同步有差距的那部分）。详见[场景十二](docs/USAGE.md#场景十二审计清单与目标仓库的差距)。
 
 </details>
 

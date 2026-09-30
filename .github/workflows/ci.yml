@@ -1673,6 +1673,86 @@ jobs:
           check_reject "--audit 与 --strip-attestation 互斥" "--audit 与 --strip-attestation 不能同时使用" \
             ./scripts/sync.sh --src "nginx:1.27" --dest r.example.com/x --audit --strip-attestation
 
+      - name: 验证输出路径守卫（写出参数不得覆盖读入的文件）
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # --write-updates images.lock.txt 会把清单覆盖成片段，而生成的文件头部
+          # 还写着「本文件不会修改你的清单」——声明与行为自相矛盾（#172）。守卫
+          # 在启动校验区、任何网络请求与写出之前，用 [[ A -ef B ]]（inode 比较）
+          # 拦住它。判据不能是字符串比较：./x 与 x、软链接与目标，是三个不同的
+          # 字符串、同一个文件——三种写法都要试。
+          #
+          # 光断退出码不够（启动校验区里有将近二十条 die，退出码 1 可能来自任何
+          # 一条），必须再断报错文案；断完还要核对清单字节不变——「拒绝了」与
+          # 「没写坏」是两回事。输出到别处的正常路径不被误伤，由后面的
+          # 「验证 --write-pending 导出的待同步子集」整步覆盖（那里的审计全部
+          # 正常跑完并写出文件）。
+          fail() { echo "::error::$1"; exit 1; }
+
+          work="$(mktemp -d)"
+          manifest="${work}/images.lock.txt"
+          printf 'mock-a.local/cur0:v1\n' > "$manifest"
+          cp "$manifest" "${work}/manifest.orig"
+
+          assert_guard() {
+            local desc="$1" expect_param="$2"; shift 2
+            local out code
+            set +e
+            out="$("$@" 2>&1)"
+            code=$?
+            set -e
+            if [[ "$code" -ne 1 ]]; then
+              printf '%s\n' "$out"
+              fail "${desc}：期望退出码 1，实际 ${code}——守卫没有拦住"
+            fi
+            if [[ "$out" != *"输出路径与本次读入的文件相同"* ]]; then
+              printf '%s\n' "$out"
+              # 本步骤没有 mock skopeo：退出码 1 也可能来自「未安装 skopeo」
+              # 之类的别的校验，所以文案才是「炸的是守卫」的关键证据
+              fail "${desc}：报错文案不对，炸的不是守卫"
+            fi
+            if [[ "$out" != *"--${expect_param}"* ]]; then
+              printf '%s\n' "$out"
+              fail "${desc}：文案里没有指认是哪个参数（--${expect_param}）"
+            fi
+            if ! cmp -s "$manifest" "${work}/manifest.orig"; then
+              fail "${desc}：退出码与文案都对，但清单字节变了"
+            fi
+            echo "✓ 已拒绝：${desc}"
+          }
+
+          # 三个写出参数各断一条：判据是一处实现，但注册漏掉哪个，哪个就漏
+          assert_guard "--write-updates 写到清单本身" "write-updates" \
+            ./scripts/sync.sh --file "$manifest" --dest r.example.com/x --audit \
+              --write-updates "$manifest"
+          assert_guard "--write-pending 写到清单本身" "write-pending" \
+            ./scripts/sync.sh --file "$manifest" --dest r.example.com/x --audit \
+              --write-pending "$manifest"
+          # --write-lock 的真正写出发生在同步循环之后——这里能以退出码 1 秒拒，
+          # 正是守卫跑在任何同步与写出之前的证据
+          assert_guard "--write-lock 写到清单本身（同步模式）" "write-lock" \
+            ./scripts/sync.sh --file "$manifest" --dest r.example.com/x \
+              --write-lock "$manifest"
+
+          # 同一文件的另外两种写法：字符串比较在这两种上会漏。
+          # 「./ 前缀」必须让两个路径**都是相对的**（cwd 进 work 目录）——
+          # 给绝对路径拼 ./ 得到的是另一个并不存在的路径，不是同一文件，
+          # 那条断言就什么都没测（实测会红在「未安装 skopeo」上）
+          repo_root="$PWD"
+          (
+            cd "$work"
+            cp manifest.orig images.lock.txt
+            assert_guard "./ 前缀的同一文件" "write-pending" \
+              "${repo_root}/scripts/sync.sh" --file images.lock.txt \
+                --dest r.example.com/x --audit --write-pending ./images.lock.txt
+          )
+          ln -sf "$manifest" "${work}/manifest.link"
+          assert_guard "软链接指向的同一文件" "write-updates" \
+            ./scripts/sync.sh --file "$manifest" --dest r.example.com/x --audit \
+              --write-updates "${work}/manifest.link"
+
       - name: 验证只读模式的不生效参数告警
         run: |
           #!/usr/bin/env bash
@@ -1747,10 +1827,11 @@ jobs:
           out="$(./scripts/sync.sh --src 'nginx:1.27' --check-updates --dry-run \
             --write-lock "${mock_dir}/never-written.lock" \
             --write-updates "${mock_dir}/upd.txt" \
+            --write-pending "${mock_dir}/pending.txt" \
             --concurrency 4 --timeout 900 2>&1)"
           set -e
           assert_merged_ignored "--check-updates" "--check-updates 只查上游，以下参数本次不生效" "$out" \
-            "本次不生效" "--dry-run" "--write-lock" "--concurrency" "--timeout"
+            "本次不生效" "--dry-run" "--write-lock" "--write-pending" "--concurrency" "--timeout"
           # 与上面那条正面断言成对：合并告警里混进 --write-updates 同样是错的
           # （使用者会以为文件没写出来，而其实写了）
           if printf '%s\n' "$out" | grep -q '以下参数本次不生效.*--write-updates'; then
@@ -1763,19 +1844,27 @@ jobs:
           out="$(./scripts/sync.sh --src 'nginx:1.27' --dest r.example.com/x --audit \
             --dry-run --write-lock "${mock_dir}/never-written.lock" \
             --write-updates "${mock_dir}/upd.txt" \
+            --write-pending "${mock_dir}/pending-audit.txt" \
             --verify --skip-existing 2>&1)"
           set -e
           assert_merged_ignored "--audit" "--audit 是只读检查，以下参数本次不生效" "$out" \
             "本次不生效" "--dry-run" "--write-lock" "--write-updates" "--verify" "--skip-existing"
+          # --write-pending 在 --audit 下**生效**（它是审计自己的产物通道），与
+          # --write-updates 之于 --check-updates 同理：混进不生效列表同样是错的
+          if printf '%s\n' "$out" | grep -q '以下参数本次不生效.*--write-pending'; then
+            printf '%s\n' "$out"
+            fail "--audit 下 --write-pending 是生效的，不该进不生效列表"
+          fi
 
           # ③ --audit-lock：--filter 与目标地址都列在同一条里
           set +e
           out="$(./scripts/sync.sh --audit-lock "$lock_file" --dry-run --filter 'kube-' \
             --write-updates "${mock_dir}/upd.txt" \
+            --write-pending "${mock_dir}/pending-lock.txt" \
             --dest r.example.com/x 2>&1)"
           set -e
           assert_merged_ignored "--audit-lock" "--audit-lock 只校验锁文件，以下参数本次不生效" "$out" \
-            "本次不生效" "--filter / --exclude" "--write-updates" "目标地址（--dest / --dest-keep-path）"
+            "本次不生效" "--filter / --exclude" "--write-updates" "--write-pending" "目标地址（--dest / --dest-keep-path）"
 
           # ④ 同步模式（默认模式）。它此前没有任何「不生效」列表——只在 --dry-run
           #    下才有一条。--write-updates 在这条路径上是**无论有没有 --dry-run**
@@ -1783,10 +1872,11 @@ jobs:
           #    （并进去的话，不带 --dry-run 的同步就只剩静默了）
           set +e
           out="$(./scripts/sync.sh --src 'nginx:1.27' --dest r.example.com/x \
-            --write-updates "${mock_dir}/upd.txt" 2>&1)"
+            --write-updates "${mock_dir}/upd.txt" \
+            --write-pending "${mock_dir}/pending-sync.txt" 2>&1)"
           set -e
           assert_merged_ignored "同步模式" "同步模式不做上游版本检查，以下参数本次不生效" "$out" \
-            "本次不生效" "--write-updates"
+            "本次不生效" "--write-updates" "--write-pending"
 
       - name: 准备 stub skopeo 夹具（检查模式用例共用）
         run: |
@@ -2391,6 +2481,203 @@ jobs:
           [[ "$got" == "current=1 excluded=5 missing=3 stale=2 unknown=4" ]] \
             || fail "audit-report.json 的 records 与 summary 不一致：${got}"
           echo "✓ summary、正文合计行、records 三处数字一致（1/2/3/4/5）"
+
+      - name: 验证 --write-pending 导出的待同步子集（stub skopeo）
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # --write-pending 是 --audit 的产物通道：把「落后 + 缺失」的源引用写成
+          # 一份可直接喂回 --file 的子集。它坏掉的方式各有各的误导，必须分开断：
+          #   ① 漏掉 missing / 混入 unknown / 混入 excluded——正文的每一行都必须
+          #      等值核对（漏是「要搬的没列」，混是「不该搬的列进来」，比漏更糟）；
+          #      miss 系刻意做成**同一仓库的三个乱序 tag**：分组注释恰好一次、
+          #      组内版本序 v1 v2 v10——照抄清单顺序与按字典序排的实现在这里都红；
+          #   ② 同一个源 × 多个目标时记录有多条，正文里它只能出现一次；
+          #   ③ 顺带写动了原清单——红线，cmp 钉字节、mtime 钉「没被打开写过」；
+          #   ④ 没有待同步项时仍写出文件并注明，且「无法判定」非零时**不能**
+          #      说「清单与目标仓库一致」——无从得知冒充正常，正是本仓库最忌讳
+          #      的那类混淆。
+          #
+          # 夹具的五个计数（current 1 / stale 2 / missing 3 / unknown 4 / excluded 5）
+          # 互不相同：计数值若相等，「正文把 stale 渲染成 missing」这类串位在等值
+          # 断言下是隐形的（#158 记过的夹具自证陷阱）。
+          fail() { echo "::error::$1"; exit 1; }
+
+          # stub skopeo 由前面「准备 stub skopeo 夹具」那一步放在固定路径上
+          PATH="/tmp/stub-skopeo:$PATH"
+          export PATH
+
+          work="$(mktemp -d)"
+          manifest="${work}/images.lock.txt"
+          {
+            printf 'mock-a.local/cur0:v1\n'
+            printf 'mock-a.local/stale0:v1\n'
+            printf 'mock-a.local/stale1:v1\n'
+            printf 'mock-a.local/miss:v10\n'
+            printf 'mock-a.local/miss:v2\n'
+            printf 'mock-a.local/miss:v1\n'
+            printf 'mock-a.local/unreach0:v1\n'
+            printf 'mock-a.local/unreach1:v1\n'
+            printf 'mock-a.local/unreach2:v1\n'
+            printf 'mock-a.local/unreach3:v1\n'
+            printf 'mock-a.local/excl0:v1\n'
+            printf 'mock-a.local/excl1:v1\n'
+            printf 'mock-a.local/excl2:v1\n'
+            printf 'mock-a.local/excl3:v1\n'
+            printf 'mock-a.local/excl4:v1\n'
+          } > "$manifest"
+          cp "$manifest" "${work}/manifest.orig"
+          pending="${work}/pending.txt"
+
+          set +e
+          out="$(./scripts/sync.sh --file "$manifest" --dest mock-b.local/x --exclude 'excl' \
+            --audit --write-pending "$pending" 2>&1)"
+          code=$?
+          set -e
+          printf '%s\n' "$out" | tail -4
+          # 有落后/缺失项 → 退出码 2（审计的既有约定）。先钉住它，是为了把
+          # 「检查跑完了」与「脚本半路死在别的校验上」区分开
+          [[ "$code" -eq 2 ]] || fail "--audit 期望退出码 2，实际 ${code}"
+          # 正对照：夹具清单确实被读进去了（15 个里 5 个被排除，参与审计 10 个）。
+          # 少了它，「原清单没被改」在脚本压根没打开这个文件时也会绿
+          grep -qF '筛选：15 个镜像中排除 5 个' <<<"$out" \
+            || { printf '%s\n' "$out"; fail "夹具清单没被读进审计（15 个源没被解析出来）"; }
+          grep -qF '待审计镜像 10 个' <<<"$out" \
+            || { printf '%s\n' "$out"; fail "排除 5 个后应有 10 个参与审计（待审计镜像数不对）"; }
+
+          # ① 正文有且仅有「落后 + 缺失」的源引用：条数、内容、顺序全部等值。
+          #    组间按清单首次出现的顺序（stale 系在前）；mock-a.local/miss 的三个
+          #    tag 合成一组，组内版本序 v1 v2 v10——清单里故意乱序放（v10 v2 v1），
+          #    照抄清单顺序的实现、按字典序排（v1 v10 v2）的实现，在这里都红
+          [[ -f "$pending" ]] || fail "--write-pending 没有写出文件：${pending}"
+          lines="$(grep -vcE '^[[:space:]]*(#|$)' "$pending" || true)"
+          [[ "$lines" -eq 5 ]] \
+            || fail "正文应有 5 行（落后 2 + 缺失 3），实际 ${lines}——漏掉 missing 或混入 unknown / excluded 都会变这个数"
+          [[ "$(grep -cxF '# mock-a.local/miss' "$pending")" -eq 1 ]] \
+            || fail "同一仓库的三个缺失 tag 应合成一组（分组注释恰好一次）"
+          got_body="$(grep -vE '^[[:space:]]*(#|$)' "$pending")"
+          want_body="$(printf '%s\n' \
+            'mock-a.local/stale0:v1' \
+            'mock-a.local/stale1:v1' \
+            'mock-a.local/miss:v1' \
+            'mock-a.local/miss:v2' \
+            'mock-a.local/miss:v10')"
+          # 失败时的诊断只打实际内容，不接 diff：set -euo pipefail 下
+          # 「|| { diff | head; fail; }」里的 diff 以 1 退出会经 pipefail 触发
+          # errexit，fail 根本执行不到——断言退出码对、::error 却没打出来的
+          # 假象就是这么来的（变异验证时实测踩到）
+          [[ "$got_body" == "$want_body" ]] \
+            || { printf '实际正文：\n%s\n' "$got_body"; \
+                 fail "正文与「落后 + 缺失」的源引用不一致（顺序或内容）"; }
+          echo "✓ ① 正文 = 落后 2 + 缺失 3 共 5 行，逐行等值、同仓库合组、组内版本序升序"
+
+          # ② 头部报出「无法判定」的个数（4 个），且它们的引用不进正文。
+          #    只断头部时「正文也把它们列进去」照样绿，所以两条成对
+          grep -qF '另有 4 个「无法判定」未列入' "$pending" \
+            || { cat "$pending"; fail "头部应报出 4 个「无法判定」未列入"; }
+          if grep -qF 'unreach' "$pending"; then
+            cat "$pending"
+            fail "「无法判定」不该进正文：它是否需要同步无从得知，列进去是冒充「需要同步」"
+          fi
+          echo "✓ ② 头部报出 unknown 4，正文不含任何 unreach 引用"
+
+          # ③ excluded 不进正文：使用者有意排除的东西不该被重新建议同步
+          if grep -qF 'excl0' "$pending"; then
+            cat "$pending"
+            fail "被 --exclude 排除的镜像不该出现在正文里"
+          fi
+          echo "✓ ③ excluded 的 5 条不在正文里"
+
+          # ④ 红线：原清单字节不变，且 mtime 也没变（cmp 抓不到「原样重写」）。
+          #    时间戳钉到 2000 年：把参照与被测文件拆开 26 年，任何一次写入都必然
+          #    比参照新，判据不再依赖两次操作之间的时间戳粒度
+          if ! cmp -s "$manifest" "${work}/manifest.orig"; then
+            diff -u "${work}/manifest.orig" "$manifest" | head -20 || true
+            fail "原清单被改动了（--write-pending 只该写一个新文件）"
+          fi
+          [[ "$(wc -l < "$manifest")" -eq 15 ]] || fail "夹具清单行数不是 15，上面的 cmp 结论不成立"
+          touch -t 200001010000 "$manifest" "${work}/sentinel"
+          set +e
+          ./scripts/sync.sh --file "$manifest" --dest mock-b.local/x --exclude 'excl' \
+            --audit --write-pending "${work}/pending-rewrite.txt" >/dev/null 2>&1
+          rw_code=$?
+          set -e
+          [[ "$rw_code" -eq 2 ]] || fail "复跑的退出码应为 2，实际 ${rw_code}"
+          [[ -z "$(find "$manifest" -newer "${work}/sentinel")" ]] \
+            || fail "原清单的 mtime 变了：它被写过（cmp 抓不到「原样重写」这种写法）"
+          echo "✓ ④ 原清单字节不变（cmp 通过），mtime 也没变（没被打开写过）"
+
+          # ⑤ 日志报出的条数与文件一致（同源：都来自同一批 A_SRC / A_STATE）
+          logged="$(sed -n 's/.*已写入 .*（\([0-9][0-9]*\) 行）.*/\1/p' <<<"$out")"
+          [[ -n "$logged" ]] || { printf '%s\n' "$out"; fail "日志里没有「已写入 …（N 行）」"; }
+          [[ "$logged" -eq "$lines" ]] \
+            || fail "日志报 ${logged} 行，文件里是 ${lines} 行——两处口径必须一致"
+          echo "✓ ⑤ 日志「已写入 …（${logged} 行）」与文件一致"
+
+          # ⑥ 生成的文件能直接喂回 --file：断读出的镜像数（5），少解析几行照样
+          #    跑得动，所以必须断数
+          set +e
+          out2="$(./scripts/sync.sh --file "$pending" --dest mock-b.local/x --audit 2>&1)"
+          code2=$?
+          set -e
+          [[ "$code2" -eq 2 ]] || fail "喂回 --file 的审计期望退出码 2，实际 ${code2}"
+          grep -qF '待审计镜像 5 个' <<<"$out2" \
+            || { printf '%s\n' "$out2"; fail "生成的文件应被解析出 5 个镜像"; }
+          echo "✓ ⑥ 生成的文件可直接用作 --file（解析出全部 5 个源引用）"
+
+          # ⑦ 多目标去重：一个源 × 两个目标 = 两条记录，正文里只能出现一次。
+          #    只断「文件存在」时，去重漏掉的实现（写两行）照样绿，所以数行数
+          set +e
+          out3="$(./scripts/sync.sh --src mock-a.local/stale0:v1 \
+            --dest mock-b.local/g1 --dest mock-b.local/g2 \
+            --audit --write-pending "${work}/pending-multi.txt" 2>&1)"
+          code3=$?
+          set -e
+          [[ "$code3" -eq 2 ]] || fail "多目标审计期望退出码 2，实际 ${code3}"
+          grep -qF '落后 2' <<<"$out3" \
+            || { printf '%s\n' "$out3"; fail "一个源 × 两个目标应有 2 条落后记录"; }
+          multi_lines="$(grep -vcE '^[[:space:]]*(#|$)' "${work}/pending-multi.txt" || true)"
+          [[ "$multi_lines" -eq 1 ]] \
+            || fail "两个目标都是同一个源，正文应只出现 1 行，实际 ${multi_lines} 行（去重没做）"
+          grep -qxF 'mock-a.local/stale0:v1' "${work}/pending-multi.txt" \
+            || fail "正文应恰为 mock-a.local/stale0:v1"
+          echo "✓ ⑦ 一个源 × 两个目标：2 条记录，正文只出现 1 行"
+
+          # ⑧ 没有待同步项时仍写出文件并注明：「文件不存在」与「没有差距」不能
+          #    混成一种。unknown 非零时还**不能**说「清单与目标仓库一致」——
+          #    无从得知冒充正常，与 ⑦ 是同一个混淆的两副面孔，各断一次
+          covered="${work}/covered.lock.txt"
+          printf 'mock-a.local/cur0:v1\nmock-a.local/cur1:v1\n' > "$covered"
+          set +e
+          out4="$(./scripts/sync.sh --file "$covered" --dest mock-b.local/x \
+            --audit --write-pending "${work}/pending-empty.txt" 2>&1)"
+          code4=$?
+          set -e
+          [[ "$code4" -eq 0 ]] || { printf '%s\n' "$out4"; fail "全部最新时期望退出码 0，实际 ${code4}"; }
+          [[ -f "${work}/pending-empty.txt" ]] \
+            || { printf '%s\n' "$out4"; fail "没有待同步项时也必须写出文件"; }
+          grep -qF '本次没有需要同步的项：清单与目标仓库一致' "${work}/pending-empty.txt" \
+            || { cat "${work}/pending-empty.txt"; fail "头部应注明「清单与目标仓库一致」"; }
+          [[ "$(grep -vcE '^[[:space:]]*(#|$)' "${work}/pending-empty.txt" || true)" -eq 0 ]] \
+            || fail "没有待同步项时不该有数据行"
+          echo "✓ ⑧ 没有待同步项时仍写出文件并注明「清单与目标仓库一致」"
+
+          covered2="${work}/covered-unknown.lock.txt"
+          printf 'mock-a.local/cur0:v1\nmock-a.local/unreach0:v1\n' > "$covered2"
+          set +e
+          out5="$(./scripts/sync.sh --file "$covered2" --dest mock-b.local/x \
+            --audit --write-pending "${work}/pending-empty2.txt" 2>&1)"
+          code5=$?
+          set -e
+          [[ "$code5" -eq 2 ]] || { printf '%s\n' "$out5"; fail "有无法判定时期望退出码 2，实际 ${code5}"; }
+          [[ -f "${work}/pending-empty2.txt" ]] || { printf '%s\n' "$out5"; fail "有无法判定时也应写出文件"; }
+          grep -qF '另有 1 个「无法判定」未列入' "${work}/pending-empty2.txt" \
+            || { cat "${work}/pending-empty2.txt"; fail "头部应报出 1 个「无法判定」"; }
+          grep -qF '这不是「清单与目标仓库一致」' "${work}/pending-empty2.txt" \
+            || { cat "${work}/pending-empty2.txt"; fail "有无法判定时不能说「清单与目标仓库一致」"; }
+          echo "✓ ⑨ 有「无法判定」而无待同步项时：仍写出文件、不说「一致」、头部报出个数"
+
       - name: 验证 -h / --help 的退出码
         run: |
           #!/usr/bin/env bash
