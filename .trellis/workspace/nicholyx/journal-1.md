@@ -130,3 +130,26 @@ Trellis 初始化时把项目此前 8 个版本的迭代史与关键教训写入
 ### Status
 
 [OK] **Completed**
+
+
+## Session 5: fix: 空tag列表语义拍板（#172，PR #176）+ /next-feature 命令移植
+<!-- trellis-session: v=2 fp=008253d7aef40b23 -->
+
+**Date**: 2026-10-10
+**Task**: fix: 空tag列表语义拍板（#172，PR #176）+ /next-feature 命令移植
+**Branch**: `main`
+
+### Summary
+
+为 #172 第二条正式拍板：--check-updates 遇「上游返回空 tag 列表」算无法判定——汇总句（屏幕/Step Summary/报告/通知，四处同一拼接）单列一档、退出码 2、json summary 补 empty 字段、通知 attention 计入，但不并 failed 计数；与 --audit/--audit-lock 的 unknown 档对齐，推翻 sync.sh 两处旧注释的临时口径。CI：断言⑨随口径翻转（0→2）、assert_shape 键集补 empty、新增独立步骤三场景（单一空/三档分列/真覆盖回归）。modes.md 矩阵与铁律1、USAGE、CHANGELOG（标注行为变化）同步。本地 lint 8 项全绿，三场景+⑨等价物+分组回归在 bash 3.2.57 实测通过；PR #176 CI 12 项全绿 squash 合并，#172 随 Closes 关闭。另：自 cc-analyzer 移植 /next-feature 斜杠命令并适配本仓库（未提交，留在工作区）。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `0de7770` | fix: 「上游返回空 tag 列表」不再冒充「均已覆盖」，退出码如实返回 2 (#172) |
+| `09f9a82` | docs(spec): modes.md 同步 #172 拍板——空 tag 列表归入「无法判定」，计入退出码 2 |
+
+### Status
+
+[OK] **Completed**
