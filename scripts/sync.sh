@@ -2755,9 +2755,14 @@ check_updates_all() {
   # --write-updates 的收集区：body 是在循环里逐仓库攒下的**同一份** missing
   # （与报告、total_missing 同源，不重算），写出动作在循环之后。
   # upd_empty 单列：「上游返回了空 tag 列表」与「查询失败」都是「这次没拿到东西」，
-  # 但不能并进 failed——它不进退出码、报告里另有 empty 这个状态，措辞上也不该把
-  # 一次「查到了、但一个 tag 都没有」的空回答称作失败。头部只需知道它不为 0。
+  # 但不能并进 failed——措辞上不该把一次「查到了、但一个 tag 都没有」的空回答称作
+  # 失败，报告里也另有 empty 这个状态。但空列表回答不了「清单是否覆盖上游」（仓库
+  # 真空与匿名拉取被裁剪不可区分），属于无法判定：进退出码 2、计入通知的 attention，
+  # 与 --audit / --audit-lock 的 unknown 档同构（#172 拍板，2026-10-10 起生效）。
   local upd_body="" upd_written=0 upd_truncated="false" upd_tag upd_empty=0
+  # 汇总句的公共中段：屏幕 / Step Summary / 报告 / 通知四处同源，只有前缀与句号
+  # 不同——同一句话拼四份迟早漂移成两种口径
+  local upd_tail=""
 
   group_repos_from_manifest
 
@@ -2814,12 +2819,14 @@ check_updates_all() {
 
     upstream_sorted="$(printf '%s' "$raw" | jq -r '.Tags[]?' 2>/dev/null | grep -v '^$' | sort -u || true)"
     if [[ -z "$upstream_sorted" ]]; then
-      # 这一条不计入 failed（它是一次**成功**的空回答，退出码与报告状态都不变），
-      # 但 --write-updates 的头部要知道有几个仓库是这种形态：一份空片段被读成
-      # 「上游没有新版本」，与「已覆盖」是同一族的混淆
+      # 不计入 failed（它是一次**成功**的空回答，不该称作失败），但计入 upd_empty：
+      # 汇总行、退出码与通知都把它当「无法判定」对待——「查到了空列表」回答不了
+      # 「清单是否覆盖上游」，折进「已覆盖」正是 #172 要消除的冒充。#169 先修掉了
+      # --write-updates 片段头部那一侧，这里补齐屏幕汇总与退出码
       upd_empty=$((upd_empty + 1))
       printf '  %s上游没有返回任何 tag%s\n' "$C_YELLOW" "$C_RESET" >&2
       summary_rows+="| \`${repo}\` | ${known_tags:-—} | — | 上游返回空列表 |"$'\n'
+      notify_detail+="- \`${repo}\` **上游返回空 tag 列表**：是否已覆盖无法判定"$'\n'
       jq -n --arg repo "$repo" --arg known "${known_tags}" \
         --arg state "empty" --arg tags "" --arg note "上游没有返回任何 tag" \
         '{repo:$repo,in_manifest:$known,state:$state,latest_tags:$tags,note:$note}' >> "$upd_records"
@@ -2890,10 +2897,20 @@ check_updates_all() {
   done
 
   printf '\n' >&2
-  if [[ "$with_updates" -eq 0 && "$failed" -eq 0 ]]; then
+  # 汇总句的中段在这里拼一次：未收录 / 查询失败两档只在至少一档非零时出现
+  # （否则会出现「0 个…0 个」的空话），空 tag 列表档独立追加。三档全零才允许
+  # 说「均已覆盖」——upd_empty 不为零时的「已覆盖」正是 #172 拍掉的那种冒充
+  if [[ "$with_updates" -gt 0 || "$failed" -gt 0 ]]; then
+    upd_tail+="${with_updates} 个有未收录的 tag（共 ${total_missing} 个），${failed} 个查询失败"
+  fi
+  if [[ "$upd_empty" -gt 0 ]]; then
+    if [[ -n "$upd_tail" ]]; then upd_tail+="，"; fi
+    upd_tail+="${upd_empty} 个上游返回空 tag 列表（是否已覆盖无法判定）"
+  fi
+  if [[ -z "$upd_tail" ]]; then
     log_ok "检查完成：${checked} 个源仓库，清单均已覆盖上游现有 tag"
   else
-    log_info "检查完成：${checked} 个源仓库，${with_updates} 个有未收录的 tag（共 ${total_missing} 个），${failed} 个查询失败"
+    log_info "检查完成：${checked} 个源仓库，${upd_tail}"
   fi
   if [[ "$FILTERED_OUT_COUNT" -gt 0 ]]; then
     log_dim "另有 ${FILTERED_OUT_COUNT} 个镜像被 --filter / --exclude 排除，未参与检查"
@@ -2914,7 +2931,11 @@ check_updates_all() {
     {
       echo "## 上游版本检查"
       echo ""
-      echo "检查了 ${checked} 个源仓库：${with_updates} 个有未收录的 tag（共 ${total_missing} 个），${failed} 个查询失败。"
+      if [[ -n "$upd_tail" ]]; then
+        echo "检查了 ${checked} 个源仓库：${upd_tail}。"
+      else
+        echo "检查了 ${checked} 个源仓库：清单均已覆盖上游现有 tag。"
+      fi
       echo ""
       echo "| 源仓库 | 清单中 | 未收录 | 版本序最大的 ${limit} 个 |"
       echo "| --- | --- | :---: | --- |"
@@ -2924,23 +2945,34 @@ check_updates_all() {
 
   if [[ -n "$REPORT_DIR" ]]; then
     local upd_md="## 上游版本检查"$'\n\n'
-    upd_md+="检查了 ${checked} 个源仓库：${with_updates} 个有未收录的 tag（共 ${total_missing} 个），${failed} 个查询失败。"$'\n\n'
+    if [[ -n "$upd_tail" ]]; then
+      upd_md+="检查了 ${checked} 个源仓库：${upd_tail}。"$'\n\n'
+    else
+      upd_md+="检查了 ${checked} 个源仓库：清单均已覆盖上游现有 tag。"$'\n\n'
+    fi
     upd_md+="| 源仓库 | 清单中 | 未收录 | 版本序最大的 ${limit} 个 |"$'\n'
     upd_md+="| --- | --- | :---: | --- |"$'\n'
     upd_md+="${summary_rows}"
     write_check_report_files "check-updates" "上游版本检查" "$upd_md" \
-      "{\"checked\":${checked},\"with_updates\":${with_updates},\"failed\":${failed},\"total_missing\":${total_missing}}" \
+      "{\"checked\":${checked},\"with_updates\":${with_updates},\"failed\":${failed},\"empty\":${upd_empty},\"total_missing\":${total_missing}}" \
       "$upd_records"
   fi
 
+  local upd_notify_summary="检查了 **${checked}** 个源仓库："
+  if [[ -n "$upd_tail" ]]; then
+    upd_notify_summary+="${upd_tail}"
+  else
+    upd_notify_summary+="清单均已覆盖上游现有 tag"
+  fi
   send_check_notification "上游版本检查" \
-    "检查了 **${checked}** 个源仓库：${with_updates} 个有未收录的 tag（共 ${total_missing} 个），${failed} 个查询失败" \
+    "$upd_notify_summary" \
     "$notify_detail" \
-    "$((with_updates + failed))"
+    "$((with_updates + failed + upd_empty))"
 
-  # 与 --audit 同一套退出码约定：没查成与查出差异都返回 2，
-  # 让 CI 门禁不至于在检查本身没做完时报绿
-  if [[ "$with_updates" -gt 0 || "$failed" -gt 0 ]]; then
+  # 与 --audit 同一套退出码约定：没查成、查出差异、或上游给了无法判定的空回答
+  # 都返回 2，让 CI 门禁不至于在检查本身没答完时报绿（#172：空 tag 列表不再
+  # 冒充「均已覆盖」）
+  if [[ "$with_updates" -gt 0 || "$failed" -gt 0 || "$upd_empty" -gt 0 ]]; then
     return 2
   fi
   return 0

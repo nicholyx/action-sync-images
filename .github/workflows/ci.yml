@@ -2256,9 +2256,16 @@ jobs:
             --write-updates "$frag5" 2>&1)"
           code5=$?
           set -e
-          # 「成功但空」不进退出码（与逐仓库报告里的 empty 状态一致）：它的退出码
-          # 仍是 0，所以这条断言顺带钉住了「别把空回答升级成失败」这个既有口径
-          [[ "$code5" -eq 0 ]] || { printf '%s\n' "$out5"; fail "上游返回空 tag 列表时期望退出码 0（成功但空，不是失败），实际 ${code5}"; }
+          # 「成功但空」不升级成「失败」（failed 计数不动、头部措辞照旧），但按
+          # #172 的拍板它是「无法判定」：退出码 2，且屏幕汇总不再说「均已覆盖」——
+          # 空列表回答不了「清单是否覆盖上游」（仓库真空与匿名拉取被裁剪不可区分）
+          [[ "$code5" -eq 2 ]] || { printf '%s\n' "$out5"; fail "上游返回空 tag 列表时期望退出码 2（无法判定，#172），实际 ${code5}"; }
+          grep -qF '检查完成：2 个源仓库，2 个上游返回空 tag 列表（是否已覆盖无法判定）' <<<"$out5" \
+            || { printf '%s\n' "$out5"; fail "汇总行应单列空 tag 档并报出仓库数（2 个），不该冒充「已覆盖」"; }
+          if grep -qF '清单均已覆盖上游现有 tag' <<<"$out5"; then
+            printf '%s\n' "$out5"
+            fail "有空 tag 仓库时不能说「清单均已覆盖上游现有 tag」（无法判定冒充正常）"
+          fi
           [[ -f "$frag5" ]] || { printf '%s\n' "$out5"; fail "上游返回空 tag 列表时也应写出文件"; }
           grep -qF '本次有 2 个仓库的上游返回了空 tag 列表' "$frag5" \
             || { cat "$frag5"; fail "空 tag 列表这一形态应在头部单独说明，并报出仓库数（2 个）"; }
@@ -2266,7 +2273,104 @@ jobs:
             || { cat "$frag5"; fail "头部应点明「没有可写的 tag」不等于「上游没有新版本」"; }
           [[ "$(grep -vcE '^[[:space:]]*(#|$)' "$frag5" || true)" -eq 0 ]] \
             || fail "上游返回空 tag 列表时不该有数据行"
-          echo "✓ ⑨ 上游返回空 tag 列表时：仍写出文件、头部单独说明（2 个仓库），退出码仍是 0"
+          echo "✓ ⑨ 上游返回空 tag 列表时：仍写出文件、头部单独说明（2 个仓库），退出码 2 且汇总不冒充「已覆盖」"
+
+      - name: 验证空 tag 列表的汇总与退出码口径（stub skopeo）
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # #172 拍板后的口径：「上游返回空 tag 列表」是**无法判定**——退出码 2、
+          # 汇总行单列一档、计入通知 attention；但**不**并入 failed 计数（一次成功
+          # 的空回答不是失败）。它此前被折进「清单均已覆盖上游现有 tag」+ 退出码 0，
+          # 与 --audit / --audit-lock 把 unknown 计入退出码 2 的既有约定不一致。
+          #
+          # 三个场景一次钉住三个面：
+          #   A 单一空 tag 仓库（其余真覆盖）→ 汇总与退出码不再冒充「干净」；
+          #   B 空 + 查询失败 + 未收录三档混合 → 三档**分列**计数，empty 不并进 failed；
+          #   C 全部真覆盖（回归）→ 退出码 0 与「均已覆盖」句原样保留——拍板只影响
+          #     空列表这一形态，不能把真干净也误伤成 2。
+          fail() { echo "::error::$1"; exit 1; }
+
+          # 专用 stub：按 ref 分流——含 "empty" 的仓库成功返回空 Tags，含 "fail" 的
+          # 连不上，其余返回 v1 v2 v3。与主 stub（什么仓库都答 7 个 tag）分开，
+          # 免得别的用例在无意间撞上会分流的回答（与 ⑦⑨ 各自建 stub 的做法同源）
+          work="$(mktemp -d)"
+          mkdir -p "${work}/bin-mixed"
+          cat > "${work}/bin-mixed/skopeo" <<'STUB'
+          #!/usr/bin/env bash
+          sub="${1:-}"
+          ref=""
+          for a in "$@"; do
+            case "$a" in
+              docker://*) ref="$a" ;;
+            esac
+          done
+          ref="${ref#docker://}"
+          case "$sub" in
+            list-tags)
+              case "$ref" in
+                *empty*) printf '%s\n' '{"Name":"stub","Tags":[]}' ; exit 0 ;;
+                *fail*)  echo "connection refused" >&2            ; exit 1 ;;
+                *)       printf '%s\n' '{"Name":"stub","Tags":["v1","v2","v3"]}' ; exit 0 ;;
+              esac
+              ;;
+            *)
+              echo "stub skopeo: 未实现的子命令：${sub}" >&2
+              exit 1
+              ;;
+          esac
+          STUB
+          chmod +x "${work}/bin-mixed/skopeo"
+
+          # 场景 A：empty 仓库 + 真覆盖的 app 仓库。顺带要 json 报告——summary 的
+          # empty 字段是本轮新加的，机读消费方（趋势/告警）靠它区分「查不到」与「干净」
+          rep="${work}/reports"
+          set +e
+          outA="$(PATH="${work}/bin-mixed:$PATH" ./scripts/sync.sh \
+            --src "mock-mixed.local/empty:v1,mock-mixed.local/app:v1,mock-mixed.local/app:v2,mock-mixed.local/app:v3" \
+            --check-updates --report-dir "$rep" 2>&1)"
+          codeA=$?
+          set -e
+          [[ "$codeA" -eq 2 ]] || { printf '%s\n' "$outA"; fail "场景 A（单一空 tag 仓库）：期望退出码 2，实际 ${codeA}"; }
+          grep -qF '检查完成：2 个源仓库，1 个上游返回空 tag 列表（是否已覆盖无法判定）' <<<"$outA" \
+            || { printf '%s\n' "$outA"; fail "场景 A：汇总行应单列空 tag 档（1 个），且不带「0 个…0 个」的空话"; }
+          if grep -qF '清单均已覆盖上游现有 tag' <<<"$outA"; then
+            printf '%s\n' "$outA"
+            fail "场景 A：有空 tag 仓库时不能说「清单均已覆盖上游现有 tag」（无法判定冒充正常）"
+          fi
+          [[ -s "${rep}/check-updates-report.json" ]] || fail "场景 A：json 报告未落盘"
+          [[ "$(jq -r '.summary.empty' "${rep}/check-updates-report.json")" == "1" ]] \
+            || fail "场景 A：json summary.empty 应为 1，实际 $(jq -r '.summary.empty' "${rep}/check-updates-report.json")"
+          [[ "$(jq -r '.summary.failed' "${rep}/check-updates-report.json")" == "0" ]] \
+            || fail "场景 A：空 tag 不该并进 failed 计数（summary.failed 应为 0）"
+          echo "✓ 场景 A：单一空 tag 仓库 → 退出码 2、汇总单列、json empty=1 且 failed=0"
+
+          # 场景 B：三档混合。分列的意义：empty 若被并进 failed，汇总会说「2 个查询失败」，
+          # 使用者会去排查一个不存在的网络问题——「无法判定」与「失败」是两回事
+          set +e
+          outB="$(PATH="${work}/bin-mixed:$PATH" ./scripts/sync.sh \
+            --src "mock-mixed.local/app:v1,mock-mixed.local/empty:v1,mock-mixed.local/fail:v1" \
+            --check-updates 2>&1)"
+          codeB=$?
+          set -e
+          [[ "$codeB" -eq 2 ]] || { printf '%s\n' "$outB"; fail "场景 B（三档混合）：期望退出码 2，实际 ${codeB}"; }
+          grep -qF '检查完成：3 个源仓库，1 个有未收录的 tag（共 2 个），1 个查询失败，1 个上游返回空 tag 列表（是否已覆盖无法判定）' <<<"$outB" \
+            || { printf '%s\n' "$outB"; fail "场景 B：三档应分列（1 未收录 / 1 查询失败 / 1 空 tag），empty 不得并进 failed"; }
+          echo "✓ 场景 B：三档分列，empty 不并进 failed"
+
+          # 场景 C（回归）：全部真覆盖。#172 拍的是「空列表算无法判定」，不是「收紧
+          # 整个退出码」——真干净必须仍是 0 +「均已覆盖」，否则拍板把正常用户误伤了
+          set +e
+          outC="$(PATH="${work}/bin-mixed:$PATH" ./scripts/sync.sh \
+            --src "mock-mixed.local/app:v1,mock-mixed.local/app:v2,mock-mixed.local/app:v3" \
+            --check-updates 2>&1)"
+          codeC=$?
+          set -e
+          [[ "$codeC" -eq 0 ]] || { printf '%s\n' "$outC"; fail "场景 C（全部真覆盖，回归）：期望退出码 0，实际 ${codeC}"; }
+          grep -qF '检查完成：1 个源仓库，清单均已覆盖上游现有 tag' <<<"$outC" \
+            || { printf '%s\n' "$outC"; fail "场景 C：真覆盖的汇总句应原样保留「清单均已覆盖上游现有 tag」"; }
+          echo "✓ 场景 C：全部真覆盖仍是退出码 0 +「均已覆盖」（拍板不误伤真干净）"
 
       - name: 验证 --check-updates 按仓库分组去重（stub skopeo）
         run: |
@@ -2404,7 +2508,7 @@ jobs:
           }
 
           assert_shape "${rep}/check-updates-report.json" "check-updates" \
-            "checked,failed,total_missing,with_updates" 1
+            "checked,empty,failed,total_missing,with_updates" 1
           assert_shape "${rep}/lock-audit-report.json" "lock-audit" \
             "drift,marker,match,nodigest,unknown" 2
           echo "✓ check-updates / lock-audit 的报告都落盘，check 字段与模式名一致"
