@@ -153,3 +153,27 @@ Trellis 初始化时把项目此前 8 个版本的迭代史与关键教训写入
 ### Status
 
 [OK] **Completed**
+
+
+## Session 6: feat: --doctor 环境自检（#177，PR #178）
+<!-- trellis-session: v=2 fp=5aa48c852cf3b25f -->
+
+**Date**: 2026-10-10
+**Task**: feat: --doctor 环境自检（#177，PR #178）
+**Branch**: `main`
+
+### Summary
+
+立项并实现 --doctor 只读诊断模式（五组探测、每项独立失败、三分类 registry 探测、锚点指引、零副作用、退出码 0/1 不占用 2，jq 缺失按 --platforms 条件定档）。research/implement/check 三段式子代理：调研落 13 挂点行号表与 17 锚点对照表；实现 914 行；复查抓出 2 个 bash 3.2 空数组崩溃 bug 与 jq 误伤共 9 处修复。首推 CI 红暴露 farm 夹具新雷：ln -sf 造的 PATH 目录里 cp 覆盖跟随软链写穿 /usr/bin/skopeo（本机 skopeo 在 /opt/homebrew/bin 不在 farm 列表，故本地双跑全绿）——先 rm 再 cp 修复，教训沉淀 bash-rules（与全角假红同族：本地与 CI 不是同一台机器）。PR #178 二推 12 项全绿 squash 合并，#177 关闭。modes.md 加「矩阵之外」段，USAGE/TROUBLESHOOTING/README/CHANGELOG 同步。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `012377f` | feat: --doctor 环境自检——把被动排障文档变成主动体检 (#177) |
+| `0ddf6bb` | docs(spec): modes.md 补「矩阵之外：--doctor」段，ignored 列表点名第五个 |
+| `575e812` | fix: doctor 冒烟场景的 farm 目录先删 skopeo 软链再 cp——CI 上软链指向 /usr/bin/skopeo，cp 跟随写穿被拒 |
+
+### Status
+
+[OK] **Completed**

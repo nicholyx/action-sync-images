@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 5
+- **Total Sessions**: 6
 - **Last Active**: 2026-10-10
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~155 | Active |
+| `journal-1.md` | ~179 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 6 | 2026-10-10 | feat: --doctor 环境自检（#177，PR #178） | `012377f`, `0ddf6bb`, `575e812` | `main` |
 | 5 | 2026-10-10 | fix: 空tag列表语义拍板（#172，PR #176）+ /next-feature 命令移植 | `0de7770`, `09f9a82` | `main` |
 | 4 | 2026-09-16 | feat: 报告下载的批量重试（#97，v1.14.0）+ v1.13.0 发布 | `239b0cd` | `main` |
 | 3 | 2026-09-16 | docs: 架构设计记录补到 v1.11（#91，v1.12.0） | `4b8de49` | `main` |
