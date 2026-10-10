@@ -1,0 +1,6 @@
+{"file": ".trellis/tasks/10-10-doctor-env-check/prd.md", "reason": "六条拍板（退出码 1、不落盘不通知、独立失败、探测分类、互斥）与九条验收标准"}
+{"file": ".trellis/tasks/10-10-doctor-env-check/design.md", "reason": "函数结构、三分类判据表、ensure_* 语义分界、CI 断言策略"}
+{"file": ".trellis/tasks/10-10-doctor-env-check/research/findings.md", "reason": "13 处挂点行号表、probe_ref 判据、凭证三入口、TROUBLESHOOTING 17 锚点表、usage 结构"}
+{"file": ".trellis/spec/engine/bash-rules.md", "reason": "bash 3.2 硬规则——新增函数群与 CI 断言都要遵守"}
+{"file": ".trellis/spec/engine/modes.md", "reason": "四模式矩阵与互斥/ignored 列表惯例——doctor 是矩阵之外的新模式，对齐既有结构"}
+{"file": ".trellis/spec/maintenance/index.md", "reason": "一 Issue 一分支一 PR 的闭环流程"}
