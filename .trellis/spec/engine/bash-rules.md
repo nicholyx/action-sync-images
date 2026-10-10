@@ -86,6 +86,9 @@ CI 用 `sed -n "/^${fn}()/,/^}/p"` 把生产函数整段抽到独立上下文里
   **写法**：变量后紧跟非 ASCII 字符时一律加花括号——`"${v}中文"`。
   注意这一条与本节其余规则的方向**相反**：那些缺陷只在本地暴露、CI 看不出来；这条是**只在本地假红**。两者指向同一件事——**本地 bash 与 CI 不是同一个解释器，两边都要过一遍**
 
+- **farm 夹具目录（`ln -sf` 造 PATH）里覆盖文件，`cp` 会跟随软链写穿到系统路径**。farm 循环把 `/usr/bin` `/bin` `/usr/local/bin` 的每个条目软链进临时目录；CI runner 装了真 skopeo 时，`${mix}/skopeo` 是指向 `/usr/bin/skopeo`（root 所有）的软链，`cp stub ${mix}/skopeo` 跟随软链覆盖系统文件 → `Permission denied`。本机（Apple Silicon）skopeo 在 `/opt/homebrew/bin`、不在 farm 的三个目录里，软链根本不存在、cp 直接创建成功——**本地双跑全绿、CI 独有地红**，与上一条「只在本地假红」方向相反、同属「本地与 CI 不是同一台机器」。
+  **写法**：farm 目录内覆盖条目一律先 `rm -f`（只删软链本身，不碰目标）再写。（2026-10-10，#177 的冒烟断言首推时真实踩到，本地 bash 3.2/5 双跑都没暴露）
+
 ## printf 与字段分隔
 
 - `printf '%s'` **不输出结尾换行**，配 `while IFS= read -r` 会**丢掉最后一段**（read 遇 EOF 返回非零）。必须 `printf '%s\n'`。曾导致 regctl 路径静默丢平台（Issue #27）
