@@ -4,6 +4,9 @@
 
 如果这里没有覆盖你的情况，请[提 Issue](https://github.com/nicholyx/action-sync-images/issues/new/choose) —— 补进这份文档本身就是一种贡献。
 
+> **同步跑不起来、报错看不懂？先跑 `--doctor`。**
+> `./scripts/sync.sh --doctor [--src …] [--dest …]` 只读体检工具链、源/目标 registry 可达性、凭证与磁盘，逐项给出 `[OK] / [警告] / [失败]`，失败项直接指到本文档的对应条目——不用自己猜是凭证、网络、权限还是工具缺失。它不推送、不写任何文件。
+
 ---
 
 ## 快速定位

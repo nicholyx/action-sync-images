@@ -865,6 +865,46 @@ harbor.example.com/mirror/registry.k8s.io/pause:3.9                    ← 保�
 
 ---
 
+### 场景十七：跑不起来先别猜——环境自检（`--doctor`）
+
+同步或检查跑不起来、skopeo 的底层报错（`EOF` / `401` / `TLS` / DNS）看不懂时，问题可能在工具、网络、凭证、权限中的任何一层。[排错手册](TROUBLESHOOTING.md)是被动查阅的——你得先猜到该读哪一条。`--doctor` 把这一步变成主动体检：
+
+```bash
+./scripts/sync.sh --doctor --file images.lock.txt -d registry.cn-shenzhen.aliyuncs.com/nicholyx
+```
+
+```text
+[信息] 环境自检（--doctor）：3 个源镜像涉及的 registry、工具链、凭证与磁盘——只探测，不推送、不写文件
+[OK] skopeo 1.14.3
+[OK] jq 1.7.1
+[OK] 源 registry.k8s.io 应答正常
+[警告] 源 quay.io 应答但匿名探测被拒（unauthorized: authentication required）
+  └ registry 活着；同步若走匿名会失败——已配源凭证则本项无碍。…
+[OK] 临时目录 /tmp 可用约 128GB
+
+[信息] 诊断完成：4 项通过，1 项警告，0 项失败
+```
+
+逐项探测五组内容，**每项独立失败**（体检要看全貌，不是查到第一个病就停诊），失败项跟一行缩进的「怎么改」指引并指向排错手册的对应条目：
+
+| 探测组 | 内容 |
+| --- | --- |
+| 工具链 | skopeo、jq；jq 未装且未显式传 `--platforms` 时是失败（平台自动探测依赖它），显式传了则降为警告；regctl 仅在传了 `--strip-attestation` 时才检查（缺了它同步本来就会自动下载） |
+| 源侧 | 清单里出现的源 registry（按 host 去重）逐个探测，三分类：应答正常 / 应答但匿名被拒（警告）/ 连不上（失败） |
+| 目标侧 | 传了 `--dest` / `--dest-exact` 才探（同三分类）；没传则说明跳过，不算失败 |
+| 凭证 | `--src-credentials` 文件可读、host 覆盖（漏配的 host 列出来——它们会静默走匿名）；目标侧查 `docker login` 痕迹（提示级） |
+| 磁盘 | 临时目录可用空间绝对值；并发 >1 时给需求量估算提示 |
+
+几个设计取舍：
+
+- **只读、零副作用**：不推送任何镜像、不写任何文件、不下通知，也不自动下载 regctl——诊断不动手修，只报告「哪里坏了、怎么改」。`--report-dir` / 通知参数传入时会进「本次不生效」告警
+- **目标侧探测不推测试镜像**：对一个不存在的引用做 inspect，「manifest unknown」类应答同样证明 registry 活着且应答规范——不污染你的仓库
+- **`--src` / `--file` 也可不传**：只查工具链与磁盘同样是合法用法（源侧探测会说明跳过）
+- **与三种检查互斥**：`--doctor` × `--audit` / `--check-updates` / `--audit-lock` 直接报错，请分两次运行
+- **退出码只有 0 / 1**：全部通过 0；有任何失败 1（「环境没就绪」与参数错误同族）。不占用 2——那是「环境是好的、检查发现了差距」的检查家族
+
+---
+
 ## 验证同步结果
 
 ### 在 Actions 里看

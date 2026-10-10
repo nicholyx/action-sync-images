@@ -59,6 +59,11 @@ AUDIT="false"
 # 上游版本检查（--check-updates）：报告上游有、清单却未收录的 tag。
 # 同样是只读的——「检查」与「搬运」分开，这里连目标仓库都不需要。
 CHECK_UPDATES="false"
+# 环境自检（--doctor）：只读诊断模式——工具链、源/目标 registry 可达性、凭证
+# 与磁盘逐项探测，回答「环境与配置能不能跑、哪里坏了、怎么改」。不推送、
+# 不写文件、不下通知，也不自动下载 regctl（ensure_* 是「确保」语义，doctor
+# 是「报告」语义，两者的分界见 doctor_all 前的段注释）
+DOCTOR="false"
 # 每个源仓库最多展示几条未收录的 tag（取版本序最大的若干条）。
 # 上游仓库动辄几百个 tag，全列出来等于没有输出。
 UPDATES_LIMIT="5"
@@ -249,7 +254,7 @@ sync.sh —— 容器镜像同步引擎
   ./scripts/sync.sh --src <镜像> --dest <目标仓库前缀> [选项]
   ./scripts/sync.sh --file <镜像清单文件> --dest <目标仓库前缀> [选项]
 
-目标地址（必填其一；--check-updates 只查上游，不需要填）：
+目标地址（必填其一；--check-updates 只查上游、--doctor 体检环境，不需要填）：
   -d, --dest <前缀>        目标仓库前缀。最终目标为「前缀 + 源镜像路径（压平）」，
                            例如 registry.cn-shenzhen.aliyuncs.com/nicholyx
                            **可重复指定以同时推送到多个目标**
@@ -350,6 +355,18 @@ sync.sh —— 容器镜像同步引擎
                            会出现在报告里并标注类别，但不参与成败判定。
                            不需要目标地址；退出码 2 表示「有漂移或没查成」
 
+      --doctor            只读环境自检：逐项探测工具链（skopeo / jq，
+                           regctl 仅在 --strip-attestation 传入时）、源/目标
+                           registry 可达性、源凭证与磁盘空间，回答「环境与配置
+                           能不能跑、哪里坏了、怎么改」。不推送、不写文件、
+                           不下通知，也不自动下载 regctl；每项探测独立失败
+                           （体检要看全貌，不是查到第一个病就停诊），失败项给出
+                           修复指引与 TROUBLESHOOTING 锚点。
+                           可不带 --src / --file（只查工具链与磁盘），也可不带
+                           目标地址（跳过目标侧探测，不算失败）；与 --audit /
+                           --check-updates / --audit-lock 互斥，请分两次运行。
+                           退出码：全部通过 0，有任何失败 1（见下方退出码小节）
+
 源仓库凭证（同步私有镜像时使用）：
       --src-username <名>  源仓库的用户名，需与 --src-password 同时提供
       --src-password <密>  源仓库的密码或 Token
@@ -393,7 +410,8 @@ sync.sh —— 容器镜像同步引擎
                            --write-lock / --notify-webhook 本次不生效（会告警）
       --report-dir <目录>  把报告写入该目录（同时生成 .md 与 .json）。
                            同步与三种检查（--audit / --check-updates /
-                           --audit-lock）均支持，文件名可区分
+                           --audit-lock）均支持，文件名可区分；
+                           --doctor 不落盘（诊断结果是即时的），传入时告警
       --write-lock <路径>  把镜像与 digest 写成锁文件，可用于精确复现
       --regctl-version <v> 指定 regctl 版本，默认 v0.11.6
 
@@ -433,6 +451,12 @@ sync.sh —— 容器镜像同步引擎
   1  参数或环境错误
   2  有漂移（含上游已删除的 tag），或有无法判定的项
 
+--doctor 模式下的退出码：
+  0  全部探测通过（警告不影响——环境是好的，只是有需要注意的点）
+  1  有任何失败项（工具缺失、registry 连不上、凭证文件不可读……）。
+     「环境没就绪 / 跑不了」与参数错误同族；不占用 2——那是「环境是好的、
+     检查发现了差距」的检查家族
+
 示例：
   # 同步单个镜像
   ./scripts/sync.sh -s registry.k8s.io/pause:3.9 -d registry.cn-shenzhen.aliyuncs.com/nicholyx
@@ -460,6 +484,9 @@ sync.sh —— 容器镜像同步引擎
 
   # 校验锁文件的时效性：上游的 tag 还是我锁定的那份 digest 吗
   ./scripts/sync.sh --audit-lock sync-2026-09.lock
+
+  # 同步跑不起来或报错看不懂？先体检环境：工具链、registry 可达性、凭证、磁盘
+  ./scripts/sync.sh --doctor --file images.lock.txt -d registry.cn-shenzhen.aliyuncs.com/nicholyx
 
   # 一次推两个目标，各用各的命名规则：阿里云压平，自建 Harbor 保留路径
   ./scripts/sync.sh --file images.lock.txt \
@@ -506,6 +533,8 @@ parse_args() {
         VERIFY="true"; shift ;;
       --audit)
         AUDIT="true"; shift ;;
+      --doctor)
+        DOCTOR="true"; shift ;;
       --check-updates)
         CHECK_UPDATES="true"; shift ;;
       --updates-limit)
@@ -797,6 +826,10 @@ detect_platforms() {
   ' 2>/dev/null | sort -u | paste -sd, - || true
 }
 
+# skopeo 的安装指引 URL：ensure_skopeo 的 die 与 --doctor 的修复指引两处共用，
+# 提取成常量避免两处文案各自漂移
+readonly SKOPEO_INSTALL_URL="https://github.com/containers/skopeo/blob/main/install.md"
+
 ensure_skopeo() {
   if command -v skopeo >/dev/null 2>&1; then
     return 0
@@ -806,7 +839,7 @@ ensure_skopeo() {
     log_warn "未找到 skopeo（dry-run 模式，仅提示不中断）"
     return 0
   fi
-  die "未找到 skopeo，请先安装：https://github.com/containers/skopeo/blob/main/install.md"
+  die "未找到 skopeo，请先安装：${SKOPEO_INSTALL_URL}"
 }
 
 ensure_jq() {
@@ -2979,6 +3012,499 @@ check_updates_all() {
 }
 
 # ---------------------------------------------------------------------------
+# 环境自检（--doctor）
+#
+# 解决的问题：skopeo 的底层报错（EOF / 401 / TLS / DNS）使用者难以定位是
+# 凭证、网络、权限还是工具缺失；TROUBLESHOOTING.md 只能被动查阅，使用者
+# 往往不知道该读哪一条。doctor 把被动排障变成主动体检：逐项探测工具链、
+# 源/目标 registry 可达性、凭证与磁盘，失败项给出「怎么改」并指向
+# TROUBLESHOOTING.md 的对应锚点。不推送任何镜像、不写任何文件。
+#
+# 与 ensure_* 家族的分界（刻意不同）：ensure_skopeo / ensure_jq / ensure_regctl
+# 是「确保」语义——缺了就 die，regctl 缺了还会**自动下载**；doctor 是「报告」
+# 语义——缺了要说清影响与装法，绝不动手装。因此 doctor 的分发在 main 里放在
+# ensure_* 调用之前：诊断没通过时，使用者拿到的是全貌报告，不是第一个缺失
+# 工具的 die。
+#
+# 每项探测独立失败（体检要看全貌，不是查到第一个病就停诊），汇总行决定退出码：
+# 有任何失败返回 1——「环境没就绪 / 跑不了」与参数错误同族；不占用 2，那是
+# 「环境是好的、检查发现了差距」的检查家族（PRD 拍板 2）。
+# ---------------------------------------------------------------------------
+
+# 诊断计数（doctor_ok / doctor_warn / doctor_fail 维护，doctor_all 汇总）
+DOC_OK=0
+DOC_WARN=0
+DOC_FAIL=0
+# probe_registry_classify 的传出变量（不能用命令替换传——那是子 shell）
+DOC_PROBE_CLASS=""
+DOC_PROBE_REASON=""
+# doctor 用的源 / 目标 host 清单（doctor_src_hosts / doctor_dest_hosts 填充）
+declare -a DOC_SRC_HOSTS=()
+declare -a DOC_DEST_HOSTS=()
+
+doctor_ok()   { DOC_OK=$((DOC_OK + 1));     printf '%s[OK]%s %s\n'   "$C_GREEN"  "$C_RESET" "$*" >&2; }
+doctor_warn() { DOC_WARN=$((DOC_WARN + 1)); printf '%s[警告]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+doctor_fail() { DOC_FAIL=$((DOC_FAIL + 1)); printf '%s[失败]%s %s\n' "$C_RED"    "$C_RESET" "$*" >&2; }
+
+# 源 / 目标 host 清单的公共提取（按 host 去重）。源侧探测、目标侧探测与凭证
+# 覆盖判定三处都要同一份数据，各写一遍「提取 + sort -u 去重」必然漂移，收口到
+# 这里。去重用 sort -u + 循环回填（setup_src_auth 的既有范本），不用关联数组
+# ——兼容 macOS 自带的 bash 3.2；传出用全局数组——命令替换传数组是子 shell
+# （bash-rules 记过的坑）。按 host 去重而不是按镜像：同一 registry 的多个仓库
+# 探一次就够，诊断不是压测
+doctor_src_hosts() {
+  DOC_SRC_HOSTS=()
+  if [[ ${#SOURCE_IMAGES[@]} -eq 0 ]]; then
+    return 0
+  fi
+  local -a hosts=()
+  local img h
+  for img in "${SOURCE_IMAGES[@]}"; do
+    hosts+=("$(registry_host_of "$img")")
+  done
+  while IFS= read -r h; do
+    if [[ -n "$h" ]]; then
+      DOC_SRC_HOSTS+=("$h")
+    fi
+  done < <(printf '%s\n' "${hosts[@]}" | sort -u)
+  return 0
+}
+
+doctor_dest_hosts() {
+  DOC_DEST_HOSTS=()
+  local -a hosts=()
+  local d h
+  if [[ ${#DEST_REGISTRIES[@]} -gt 0 ]]; then
+    for d in "${DEST_REGISTRIES[@]}"; do
+      case "$d" in
+        # 带路径的目标取首段判 host；裸 host（没有仓库段）本身就是 host
+        */*) hosts+=("$(registry_host_of "$d")") ;;
+        *)   hosts+=("$d") ;;
+      esac
+    done
+  fi
+  if [[ -n "$DEST_EXACT" ]]; then
+    hosts+=("$(registry_host_of "$DEST_EXACT")")
+  fi
+  if [[ ${#hosts[@]} -eq 0 ]]; then
+    return 0
+  fi
+  while IFS= read -r h; do
+    if [[ -n "$h" ]]; then
+      DOC_DEST_HOSTS+=("$h")
+    fi
+  done < <(printf '%s\n' "${hosts[@]}" | sort -u)
+  return 0
+}
+
+# 对一个**不存在的引用**做 inspect，按 stderr 把 registry 的健康度分成三类，
+# 结果写入 DOC_PROBE_CLASS（ok / auth / unreachable）与 DOC_PROBE_REASON（首行错误）。
+#
+# 为什么探不存在的引用：manifest-unknown 类应答同样证明 registry 活着且应答
+# 规范——不用推任何测试镜像，不污染使用者的仓库（PRD 拍板 5）。
+#
+# 三分类是 probe_ref 的细化：那里 unauthorized 折进 unreachable（对「目标跟上
+# 没有」这个问题，两者的处置一样——都无法判定）；doctor 要回答的是「怎么修」，
+# 网络问题与凭证问题的修复动作完全不同，必须分开。
+#
+# TLS / authfile 语义与 skopeo_inspect_raw 保持一致，但不能直接复用那个函数：
+# 超时包装只能 exec 外部命令，包不住函数调用。（doctor 不装载凭证——不调
+# setup_src_auth——SRC_AUTHFILE 恒为空，探测走匿名，unauthorized 档的告警
+# 文案正是为此写的：已配凭证则本项无碍。）
+#
+# 超时 10 秒、不重试——诊断不是压测（PRD 约束），不给 registry 打重试风暴。
+probe_registry_classify() {
+  local host="$1"
+  local ref="${host}/doctor-probe-nonexistent"
+  DOC_PROBE_CLASS="unreachable"
+  DOC_PROBE_REASON=""
+
+  # 与 setup_timeout 同一层降级：timeout → gtimeout → perl alarm
+  local -a cmd=()
+  if command -v timeout >/dev/null 2>&1; then
+    cmd=(timeout 10)
+  elif command -v gtimeout >/dev/null 2>&1; then
+    cmd=(gtimeout 10)
+  elif command -v perl >/dev/null 2>&1; then
+    cmd=(perl -e 'alarm shift; exec @ARGV' 10)
+  fi
+  cmd+=(skopeo inspect --raw)
+  if [[ "$TLS_VERIFY" == "false" ]]; then
+    cmd+=(--tls-verify=false)
+  fi
+  if [[ -n "$SRC_AUTHFILE" ]]; then
+    cmd+=(--authfile "$SRC_AUTHFILE")
+  fi
+  cmd+=("docker://${ref}")
+
+  local err="" rc=0
+  # stderr 交给命令替换、stdout 丢弃；重定向顺序不能反（probe_ref 同款惯用法）
+  set +e
+  err="$("${cmd[@]}" 2>&1 >/dev/null)"
+  rc=$?
+  set -e
+
+  # 不存在的引用居然应答成功（某些前置代理会这样）——registry 是活的
+  if [[ "$rc" -eq 0 ]]; then
+    DOC_PROBE_CLASS="ok"
+    return 0
+  fi
+
+  # 首行提取与 probe_ref 同款：不按字节截断，以免切半多字节字符
+  DOC_PROBE_REASON="$(printf '%s' "$err" | tr -d '\r' | grep -v '^[[:space:]]*$' | head -n 1 || true)"
+
+  # registry 表达「manifest / 仓库不存在」的措辞（probe_ref 的 missing 名单）：
+  # 对不存在的引用给出这类应答 = registry 应答正常
+  if printf '%s\n' "$err" | grep -qiE 'manifest unknown|name unknown|repository name not known|not found|no such manifest'; then
+    DOC_PROBE_CLASS="ok"
+    return 0
+  fi
+
+  # 「活着但匿名被拒」单独成档（TROUBLESHOOTING 快速定位表同款判据）：
+  # 对不存在引用的 401 也证明 registry 应答了，但匿名被拒对「同步走匿名」的
+  # 使用者是真实风险，所以是 [警告] 而非 [OK]
+  if printf '%s\n' "$err" | grep -qiE 'unauthorized|authentication required'; then
+    DOC_PROBE_CLASS="auth"
+    return 0
+  fi
+
+  # 其余全部（connection refused / 超时 / DNS / no route……）= 连不上
+  DOC_PROBE_CLASS="unreachable"
+  return 0
+}
+
+# L1 工具链：skopeo / jq 存在性（带版本）；regctl 仅在真会走 regctl 路径时才检查。
+# regctl 挂在 regctl_path_active 同一条件上（该条件的第四个消费者）：
+# --doctor --strip-attestation 时它是真实依赖，值得探；不带时探它只会制造
+# 噪音——何况缺了它 ensure_regctl 本来就会自动下载，不构成失败
+doctor_tools() {
+  local regctl_active="${1:-false}"
+
+  if command -v skopeo >/dev/null 2>&1; then
+    local v=""
+    v="$(skopeo --version 2>/dev/null | head -n 1 | sed 's/^skopeo version //' || true)"
+    # --version 拿到的可能不是版本号（对子命令统一应答的包装器会给出别的
+    # 东西）——那不是版本，报「版本未知」而不是把原文当版本展示
+    if [[ "$v" == \{* ]]; then
+      v=""
+    fi
+    if [[ -n "$v" ]]; then
+      doctor_ok "skopeo ${v}"
+    else
+      doctor_ok "skopeo 已安装（版本未知）"
+    fi
+  else
+    doctor_fail "skopeo 未安装——同步与三种检查都依赖它"
+    log_dim "  └ 安装见 ${SKOPEO_INSTALL_URL}（macOS 可 brew install skopeo）；报错样例见 docs/TROUBLESHOOTING.md#错误skopeo-command-not-found「错误：\`skopeo: command not found\`」"
+  fi
+
+  # jq 的定档看 --platforms：平台没显式指定时自动探测靠 jq，缺了同步跑不了
+  # （ensure_jq 同一态度：warn 后让使用者「装 jq 或显式传 --platforms」）；
+  # 平台已显式指定时缺失无碍**本项**，但源凭证装载与报告生成仍依赖 jq——
+  # 如实报 [警告] 说明哪些场景会用到，不冒充「完全没影响」（doctor 的哲学
+  # 是「如实」，对环境明明能跑的配置报失败是误伤）
+  if command -v jq >/dev/null 2>&1; then
+    local jv=""
+    jv="$(jq --version 2>/dev/null | sed 's/^jq-//' || true)"
+    if [[ -n "$jv" ]]; then
+      doctor_ok "jq ${jv}"
+    else
+      doctor_ok "jq 已安装（版本未知）"
+    fi
+  elif [[ -z "$PLATFORMS" ]]; then
+    doctor_fail "jq 未安装且未显式指定 --platforms——平台自动探测依赖 jq"
+    log_dim "  └ 安装：macOS 可 brew install jq，Debian/Ubuntu 可 sudo apt-get install jq；或显式传 --platforms 跳过自动探测。其他排查手段见 docs/TROUBLESHOOTING.md#通用调试手段「通用调试手段」"
+  else
+    doctor_warn "jq 未安装——平台已由 --platforms 显式指定，本项无碍；但 --src-credentials 装载与报告生成仍依赖 jq"
+    log_dim "  └ 需要时装：macOS 可 brew install jq，Debian/Ubuntu 可 sudo apt-get install jq"
+  fi
+
+  if [[ "$regctl_active" != "true" ]]; then
+    # 未激活时一条 dim 说明，不算检查项（PRD：不检查也不告警）
+    if ! command -v regctl >/dev/null 2>&1; then
+      log_dim "regctl 未安装——本次未传 --strip-attestation，不影响运行；需要时脚本会自动下载"
+    fi
+  elif command -v regctl >/dev/null 2>&1; then
+    doctor_ok "regctl $(regctl version --format '{{.VCSTag}}' 2>/dev/null || echo unknown)"
+  else
+    doctor_warn "regctl 未安装——本次传了 --strip-attestation，同步时会自动下载；网络受限环境建议预装（https://github.com/regclient/regclient）"
+    log_dim "  └ 自动下载失败时的处置见 docs/TROUBLESHOOTING.md#错误regctl-下载失败已重试一次「错误：\`regctl 下载失败（已重试一次）\`」"
+  fi
+  return 0
+}
+
+# L2 源侧：清单里出现的源 registry（按 host 去重）逐个探测可达性
+doctor_sources() {
+  if [[ ${#SOURCE_IMAGES[@]} -eq 0 ]]; then
+    log_skip "未提供 --src / --file，跳过源侧可达性探测（只查工具链与磁盘也是合法用法）"
+    return 0
+  fi
+  if ! command -v skopeo >/dev/null 2>&1; then
+    log_skip "skopeo 未安装，源侧可达性无法探测（见上方工具链检查）"
+    return 0
+  fi
+
+  doctor_src_hosts
+
+  local uh
+  for uh in "${DOC_SRC_HOSTS[@]}"; do
+    probe_registry_classify "$uh"
+    case "$DOC_PROBE_CLASS" in
+      ok)
+        doctor_ok "源 ${uh} 应答正常"
+        ;;
+      auth)
+        doctor_warn "源 ${uh} 应答但匿名探测被拒（${DOC_PROBE_REASON}）"
+        log_dim "  └ registry 活着；同步若走匿名会失败——已配源凭证则本项无碍。配凭证见 --help 的源仓库凭证段；401 排查见 docs/TROUBLESHOOTING.md#错误unauthorized-authentication-required「错误：\`unauthorized: authentication required\`」"
+        ;;
+      *)
+        doctor_fail "源 ${uh} 连不上：${DOC_PROBE_REASON}"
+        log_dim "  └ 确认 registry 在跑、地址端口无误；网络排查见 docs/TROUBLESHOOTING.md#错误context-deadline-exceeded--timeout「错误：\`context deadline exceeded\` / \`timeout\`」"
+        ;;
+    esac
+  done
+  return 0
+}
+
+# L3 目标侧：传了目标地址才探，没传则说明跳过（不算失败——目标地址在 doctor
+# 下不强制，PRD 拍板 6）
+doctor_dest() {
+  doctor_dest_hosts
+
+  if [[ ${#DOC_DEST_HOSTS[@]} -eq 0 ]]; then
+    log_skip "未传目标地址，跳过目标侧探测（--dest / --dest-keep-path / --dest-exact 传了才探）"
+    return 0
+  fi
+  if ! command -v skopeo >/dev/null 2>&1; then
+    log_skip "skopeo 未安装，目标侧可达性无法探测（见上方工具链检查）"
+    return 0
+  fi
+
+  local uh
+  for uh in "${DOC_DEST_HOSTS[@]}"; do
+    probe_registry_classify "$uh"
+    case "$DOC_PROBE_CLASS" in
+      ok)
+        doctor_ok "目标 ${uh} 应答正常"
+        ;;
+      auth)
+        doctor_warn "目标 ${uh} 应答但匿名探测被拒（${DOC_PROBE_REASON}）"
+        log_dim "  └ registry 活着；推送凭证来自 docker login——确认已登录该仓库。401 排查见 docs/TROUBLESHOOTING.md#错误unauthorized-authentication-required「错误：\`unauthorized: authentication required\`」；自建 registry 密码正确仍被拒见 docs/TROUBLESHOOTING.md#自建-registry密码填对了却始终-unauthorized「自建 registry：密码填对了却始终 \`unauthorized\`」"
+        ;;
+      *)
+        doctor_fail "目标 ${uh} 连不上：${DOC_PROBE_REASON}"
+        log_dim "  └ 确认 registry 在跑、地址端口无误；网络排查见 docs/TROUBLESHOOTING.md#错误context-deadline-exceeded--timeout「错误：\`context deadline exceeded\` / \`timeout\`」"
+        ;;
+    esac
+  done
+  return 0
+}
+
+# L4 凭证：--src-credentials 只读解析 + host 覆盖；目标侧查 docker login 痕迹。
+# 只读解析、不装载（setup_src_auth 是「装载」语义：会 die / 会写 authfile），
+# 同类问题在这里报成 [失败] 行并继续——独立失败语义；正常运行路径的 die 仍由
+# setup_src_auth 自己负责
+doctor_credentials() {
+  # 源 host 清单（覆盖判定要用），与 doctor_sources 同一份数据（DOC_SRC_HOSTS
+  # 可能是空数组——没传 --src / --file 只查凭证配置也是合法用法——所以下面的
+  # 遍历与 [*] 展开都得先判长度：bash 3.2 + set -u 下空数组展开是 unbound
+  # variable，bash-rules 的铁律）
+  doctor_src_hosts
+
+  if [[ -n "$SRC_CREDENTIALS_FILE" ]]; then
+    if [[ ! -f "$SRC_CREDENTIALS_FILE" ]]; then
+      doctor_fail "--src-credentials 文件不存在：${SRC_CREDENTIALS_FILE}"
+      log_dim "  └ 确认路径无误（注意相对路径的工作目录）；文件格式见 --help 的 --src-credentials 段。没配凭证的 host 会 401，见 docs/TROUBLESHOOTING.md#错误unauthorized-authentication-required「错误：\`unauthorized: authentication required\`」"
+      return 0
+    fi
+    if [[ ! -r "$SRC_CREDENTIALS_FILE" ]]; then
+      doctor_fail "--src-credentials 文件不可读：${SRC_CREDENTIALS_FILE}"
+      log_dim "  └ 检查文件属主与权限（建议 600）"
+      return 0
+    fi
+
+    # 只读复刻 parse_src_credentials 的行解析（不能调它：格式错它会 die）。
+    # 同样绝不回显行内容——行里有密码
+    local -a cred_hosts=()
+    local lineno=0 line host user pass rest
+    local bad=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      lineno=$((lineno + 1))
+      line="${line#"${line%%[![:space:]]*}"}"
+      line="${line%"${line##*[![:space:]]}"}"
+      if [[ -z "$line" || "$line" == \#* ]]; then
+        continue
+      fi
+      host="${line%%[[:space:]]*}"
+      rest="${line#"$host"}"
+      rest="${rest#"${rest%%[![:space:]]*}"}"
+      user="${rest%%[[:space:]]*}"
+      rest="${rest#"$user"}"
+      rest="${rest#"${rest%%[![:space:]]*}"}"
+      pass="${rest%%[[:space:]]*}"
+      rest="${rest#"$pass"}"
+      rest="${rest#"${rest%%[![:space:]]*}"}"
+      if [[ -z "$user" || -z "$pass" || -n "$rest" ]]; then
+        bad="第 ${lineno} 行格式错误（应为 3 个字段：host 用户名 密码，空白分隔）"
+        break
+      fi
+      host="${host#docker://}"
+      host="${host%/}"
+      cred_hosts+=("$host")
+    done < "$SRC_CREDENTIALS_FILE"
+
+    if [[ -n "$bad" ]]; then
+      doctor_fail "--src-credentials ${SRC_CREDENTIALS_FILE} ${bad}"
+      log_dim "  └ 按行号修正该行（错误信息刻意不含行内容——行里有密码）；格式见 --help 的 --src-credentials 段"
+    elif [[ ${#cred_hosts[@]} -eq 0 ]]; then
+      doctor_fail "--src-credentials ${SRC_CREDENTIALS_FILE} 中没有任何有效条目（是否全为注释或空行？）"
+      log_dim "  └ 每行一个「host 用户名 密码」，# 开头为注释"
+    else
+      # 覆盖判定：漏配的 host 会静默走匿名（usage 自认的既有缺口），列出来
+      local -a missing=()
+      local uh
+      if [[ ${#DOC_SRC_HOSTS[@]} -gt 0 ]]; then
+        for uh in "${DOC_SRC_HOSTS[@]}"; do
+          if ! printf '%s\n' "${cred_hosts[@]}" | grep -qxF "$uh"; then
+            missing+=("$uh")
+          fi
+        done
+      fi
+      if [[ ${#missing[@]} -gt 0 ]]; then
+        doctor_warn "--src-credentials 未覆盖 host：${missing[*]}（这些 host 将走匿名访问）"
+        log_dim "  └ 给这些 host 各补一行「host 用户名 密码」；匿名拉私有仓库会 401，见 docs/TROUBLESHOOTING.md#错误unauthorized-authentication-required「错误：\`unauthorized: authentication required\`」"
+      elif [[ ${#DOC_SRC_HOSTS[@]} -eq 0 ]]; then
+        doctor_ok "--src-credentials 可读，解析出 ${#cred_hosts[@]} 个条目（没传源清单，无从对照覆盖）"
+      else
+        doctor_ok "--src-credentials 可读，覆盖全部 ${#DOC_SRC_HOSTS[@]} 个源 host"
+      fi
+    fi
+  elif [[ -n "$SRC_USERNAME" || -n "$SRC_PASSWORD" || -n "$SRC_REGISTRY" ]]; then
+    # 单套凭证模式：只报告 setup_src_auth 会 die 的两类硬错误与多 host 告警
+    if [[ -n "$SRC_REGISTRY" && -z "$SRC_USERNAME" ]]; then
+      doctor_fail "--src-registry 需要与 --src-username / --src-password 一起使用"
+    elif [[ -z "$SRC_USERNAME" || -z "$SRC_PASSWORD" ]]; then
+      doctor_fail "--src-username 与 --src-password 必须同时提供（当前只给了一个）"
+    elif [[ -z "$SRC_REGISTRY" && ${#DOC_SRC_HOSTS[@]} -gt 1 ]]; then
+      doctor_warn "单套源凭证将应用到 ${#DOC_SRC_HOSTS[@]} 个源 host：${DOC_SRC_HOSTS[*]}"
+      log_dim "  └ 若非本意，用 --src-registry 指定其中之一，或改用 --src-credentials 按仓库映射"
+    else
+      if [[ -n "$SRC_REGISTRY" ]]; then
+        doctor_ok "源凭证已提供（将应用于 ${SRC_REGISTRY}）"
+      elif [[ ${#DOC_SRC_HOSTS[@]} -eq 0 ]]; then
+        doctor_ok "源凭证已提供（没传源清单，将应用于全部源 host）"
+      else
+        doctor_ok "源凭证已提供（将应用于 ${DOC_SRC_HOSTS[*]})"
+      fi
+    fi
+  elif [[ ${#DOC_SRC_HOSTS[@]} -gt 0 ]]; then
+    # 不算检查项：公开源本就无需凭证，需要凭证的场景由上面的 host 探测警告
+    log_dim "未配置源凭证（公开源无需；私有源会 401）"
+  fi
+
+  # ---- 目标侧：docker login 痕迹（提示级，不判失败——凭证也可能在 skopeo 侧
+  # 的其它 authfile 里，脚本对目标凭证本就不管）----
+  doctor_dest_hosts
+  if [[ ${#DOC_DEST_HOSTS[@]} -eq 0 ]]; then
+    return 0
+  fi
+  local -a uniq_dest_hosts=("${DOC_DEST_HOSTS[@]}")
+
+  if ! command -v jq >/dev/null 2>&1; then
+    log_skip "jq 未安装，docker login 凭证无法检查"
+    return 0
+  fi
+  local dcfg="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
+  if [[ ! -f "$dcfg" ]]; then
+    log_skip "未找到 docker 配置（${dcfg}），跳过 docker login 凭证检查——推送前需 docker login"
+    return 0
+  fi
+  # 判「是不是 JSON 对象」而不是「能不能解析」（prepare_regctl_cred_dir 同款判据）
+  if ! jq -e 'type == "object"' "$dcfg" >/dev/null 2>&1; then
+    log_skip "docker 配置不可解析（${dcfg} 不是 JSON 对象），跳过 docker login 凭证检查"
+    return 0
+  fi
+
+  # 同一份 config.json 只解析一次，循环里只做字符串对照
+  local keys=""
+  keys="$(jq -r '.auths // {} | keys[]' "$dcfg" 2>/dev/null || true)"
+  local -a logged=() unlogged=()
+  local dh
+  for dh in "${uniq_dest_hosts[@]}"; do
+    if printf '%s\n' "$keys" | grep -qF "$dh"; then
+      logged+=("$dh")
+    else
+      unlogged+=("$dh")
+    fi
+  done
+  if [[ ${#unlogged[@]} -eq 0 ]]; then
+    doctor_ok "检测到 docker login 凭证（覆盖全部 ${#uniq_dest_hosts[@]} 个目标 host）"
+  else
+    doctor_warn "未检测到 docker login 凭证（${dcfg} 无这些目标条目：${unlogged[*]}）——推送前需 docker login"
+    log_dim "  └ 对目标 registry 执行 docker login；401 排查见 docs/TROUBLESHOOTING.md#错误unauthorized-authentication-required「错误：\`unauthorized: authentication required\`」"
+  fi
+  return 0
+}
+
+# L5 磁盘：报告临时目录的可用空间绝对值；并发 >1 时给需求量提示。
+# 不做网络 inspect 估算（estimate_image_bytes 要对每个镜像做 inspect，那是同步
+# 路径的事；诊断保持轻量——公式借鉴 prepare_oci_staging 的 ×1.2 并发放大）
+doctor_disk() {
+  local tmpdir="${TMPDIR:-/tmp}"
+  tmpdir="${tmpdir%/}"
+  local avail=""
+  avail="$(df -Pk "$tmpdir" 2>/dev/null | awk 'NR==2 {print $4 * 1024}' || true)"
+  if [[ -z "$avail" ]]; then
+    doctor_warn "无法读取临时目录 ${tmpdir} 的可用空间（df 失败）"
+    return 0
+  fi
+  if [[ "$avail" -lt 2147483648 ]]; then
+    doctor_warn "临时目录 ${tmpdir} 可用空间偏低（约 $((avail / 1073741824))GB）——大镜像同步可能写满磁盘"
+    log_dim "  └ 清理临时目录，或把 TMPDIR 指向更大的分区"
+  else
+    doctor_ok "临时目录 ${tmpdir} 可用约 $((avail / 1073741824))GB"
+  fi
+  if [[ "$CONCURRENCY" -gt 1 ]]; then
+    log_dim "  并发 ${CONCURRENCY} 路时空间需求约为「镜像层数据估算 × ${CONCURRENCY} × 1.2 + 100MB」（与同步预检同一公式），大镜像并发前请确认余量"
+  fi
+  return 0
+}
+
+# 入口：顺序跑五组（每组独立失败），汇总行 + 退出码。
+# 各组是**裸调用**：不能写成 doctor_tools || … 之类——`cmd || handler` 会关掉
+# errexit 对 cmd 的约束（.trellis/spec/engine/bash-rules.md 记过的故障形态），
+# 函数内部先炸了调用方也看不出来。各 doctor_* 函数自己保证正常返回
+doctor_all() {
+  local regctl_active="${1:-false}"
+  DOC_OK=0
+  DOC_WARN=0
+  DOC_FAIL=0
+
+  if [[ ${#SOURCE_IMAGES[@]} -gt 0 ]]; then
+    log_info "环境自检（--doctor）：${#SOURCE_IMAGES[@]} 个源镜像涉及的 registry、工具链、凭证与磁盘——只探测，不推送、不写文件"
+  else
+    log_info "环境自检（--doctor）：工具链与磁盘——只探测，不推送、不写文件"
+  fi
+
+  doctor_tools "$regctl_active"
+  doctor_sources
+  doctor_dest
+  doctor_credentials
+  doctor_disk
+
+  if [[ "$DOC_FAIL" -gt 0 ]]; then
+    log_info "诊断完成：${DOC_OK} 项通过，${DOC_WARN} 项警告，${DOC_FAIL} 项失败"
+    return 1
+  fi
+  if [[ "$DOC_WARN" -gt 0 ]]; then
+    log_info "诊断完成：${DOC_OK} 项通过，${DOC_WARN} 项警告，0 项失败"
+  else
+    log_ok "诊断完成：${DOC_OK} 项通过，0 项警告，0 项失败"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # 锁文件时效性校验（--audit-lock）
 #
 # --write-lock 的卖点是「digest 不会变，锁下来就能精确复现」。但这只完成了
@@ -4378,8 +4904,9 @@ main() {
     SRC_CREDENTIALS_TMPFILE="$SRC_CREDENTIALS_FILE"
   fi
 
-  # --check-updates / --audit-lock 不碰目标仓库，因此不需要目标地址
-  if [[ ${#DEST_REGISTRIES[@]} -eq 0 && -z "$DEST_EXACT" && "$CHECK_UPDATES" != "true" && -z "$AUDIT_LOCK_FILE" ]]; then
+  # --check-updates / --audit-lock 不碰目标仓库，因此不需要目标地址；
+  # --doctor 体检环境，目标地址可选（传了才探目标侧）
+  if [[ ${#DEST_REGISTRIES[@]} -eq 0 && -z "$DEST_EXACT" && "$CHECK_UPDATES" != "true" && -z "$AUDIT_LOCK_FILE" && "$DOCTOR" != "true" ]]; then
     # 三种模式都要列全：漏掉 --dest-keep-path 会把「想保留路径」的人引向
     # --dest（压平，正是他不想要的）或 --dest-exact（只接受单个源镜像）。
     # 措辞与下面 --dest-exact 互斥那条保持一致
@@ -4443,7 +4970,7 @@ main() {
   # 它有自己的列表、没有并进下面的 dry_noop：那条告警的条件是 --dry-run，而
   # --write-updates 在同步模式下**无论有没有 --dry-run 都不生效**。并进去会让
   # 「不带 --dry-run 的同步」少一次告警，而漏告警正是这条例外要堵的东西。
-  if [[ "$AUDIT" != "true" && "$CHECK_UPDATES" != "true" && -z "$AUDIT_LOCK_FILE" ]]; then
+  if [[ "$AUDIT" != "true" && "$CHECK_UPDATES" != "true" && -z "$AUDIT_LOCK_FILE" && "$DOCTOR" != "true" ]]; then
     local -a sync_ignored=()
     if [[ -n "$WRITE_UPDATES" ]]; then sync_ignored+=("--write-updates"); fi
     if [[ -n "$WRITE_PENDING" ]]; then sync_ignored+=("--write-pending"); fi
@@ -4463,6 +4990,18 @@ main() {
   fi
   if [[ -n "$AUDIT_LOCK_FILE" && "$AUDIT" == "true" ]]; then
     die "--audit-lock 与 --audit 不能同时使用：前者以锁文件为基准查上游，后者以源镜像为基准查目标仓库，请分两次运行"
+  fi
+
+  # doctor 与三种检查互斥：前者体检**运行环境**，后者检查**镜像数据**——维度
+  # 不同，但仍是「一次做一件事」，与上面三条两两互斥同一惯例
+  if [[ "$DOCTOR" == "true" && "$AUDIT" == "true" ]]; then
+    die "--doctor 与 --audit 不能同时使用：前者体检运行环境，后者检查目标仓库与清单的差距，请分两次运行"
+  fi
+  if [[ "$DOCTOR" == "true" && "$CHECK_UPDATES" == "true" ]]; then
+    die "--doctor 与 --check-updates 不能同时使用：前者体检运行环境，后者检查上游 tag 与清单的差距，请分两次运行"
+  fi
+  if [[ "$DOCTOR" == "true" && -n "$AUDIT_LOCK_FILE" ]]; then
+    die "--doctor 与 --audit-lock 不能同时使用：前者体检运行环境，后者校验锁文件时效，请分两次运行"
   fi
 
   # --audit-lock 自带条目来源，不允许再混入 --src / --file，否则「校验哪些」
@@ -4551,17 +5090,66 @@ main() {
     fi
   fi
 
+  # ---- 环境自检的参数约束 ----
+  # 诊断是即时的：结果只进本次输出，历史无聚合价值；用户主动跑的模式也没有
+  # 「失败了要打扰谁」的场景。因此不落盘、不通知（PRD 拍板 3），
+  # 显式传入必须说出来
+  if [[ "$DOCTOR" == "true" ]]; then
+    local -a doctor_ignored=()
+    if [[ "$DRY_RUN" == "true" ]]; then doctor_ignored+=("--dry-run"); fi
+    if [[ -n "$REPORT_DIR" ]]; then doctor_ignored+=("--report-dir"); fi
+    if [[ -n "$WRITE_LOCK" ]]; then doctor_ignored+=("--write-lock"); fi
+    if [[ -n "$WRITE_UPDATES" ]]; then doctor_ignored+=("--write-updates"); fi
+    if [[ -n "$WRITE_PENDING" ]]; then doctor_ignored+=("--write-pending"); fi
+    if [[ -n "$NOTIFY_WEBHOOK" ]]; then doctor_ignored+=("--notify-webhook"); fi
+    if [[ "$NOTIFY_AFTER_FAILURES_EXPLICIT" == "true" ]]; then
+      doctor_ignored+=("--notify-after-failures")
+    fi
+    # 同步专属的两个开关（同步后校验 / 跳过已存在）在只读诊断下没有对象，
+    # 与 lock_ignored 同一口径点名——「参数被接受却不生效」比报错更危险
+    if [[ "$VERIFY" == "true" ]]; then doctor_ignored+=("--verify"); fi
+    if [[ "$SKIP_EXISTING" == "true" ]]; then doctor_ignored+=("--skip-existing"); fi
+    if [[ ${#doctor_ignored[@]} -gt 0 ]]; then
+      log_warn "--doctor 是只读诊断，以下参数本次不生效：${doctor_ignored[*]}（不落盘、不发通知）"
+    fi
+  fi
+
   # 本次运行会不会**真的走** regctl 路径：--check-updates 与 --audit-lock 都只读
   # 上游 / 锁文件，各自的不生效列表里已经列出 --strip-attestation，它们根本不经过
   # sync_via_regctl（--audit 与 --strip-attestation 互斥，上面已 die，不在此列）。
   #
-  # 挂在这个条件上的有三处：下面「要不要下载 regctl」、后面的明文 HTTP 告警、
-  # 以及 regctl 专属的失效参数告警。三处必须同源——先说「--strip-attestation
-  # 本次不生效」、紧接着又说「regctl 路径下……映射为明文 HTTP」，等于自相矛盾；
-  # 而各写一遍条件就是「改一处漏一处」的温床，那是本项目记过的典型故障。
+  # 挂在这个条件上的有四处：下面「要不要下载 regctl」、后面的明文 HTTP 告警、
+  # regctl 专属的失效参数告警，以及 --doctor 里「要不要探 regctl」。四处必须同源
+  # ——先说「--strip-attestation 本次不生效」、紧接着又说「regctl 路径下……映射为
+  # 明文 HTTP」，等于自相矛盾；而各写一遍条件就是「改一处漏一处」的温床，那是
+  # 本项目记过的典型故障。
   local regctl_path_active="false"
   if [[ "$STRIP_ATTESTATION" == "true" && "$CHECK_UPDATES" != "true" && -z "$AUDIT_LOCK_FILE" ]]; then
     regctl_path_active="true"
+  fi
+
+  # --doctor 在 ensure_* 之前分发：诊断没通过时，使用者拿到的是全貌报告，不是
+  # 第一个缺失工具的 die（ensure_* 是「确保」语义，doctor 是「报告」语义）。
+  # 也因此 doctor 绝不会触发 ensure_regctl 的自动下载——尽管 regctl_path_active
+  # 在 --doctor --strip-attestation 下为真，它在这里只用来告诉 doctor_tools
+  # 「regctl 本次是真实依赖，值得探」
+  if [[ "$DOCTOR" == "true" ]]; then
+    # 源 host 从 SOURCE_IMAGES 提取；不带 --src / --file 也合法（只查工具链与
+    # 磁盘，doctor_sources 会说明跳过），collect_images 的「没有提供任何源镜像」
+    # die 不适用于诊断
+    if [[ ${#SOURCE_IMAGES[@]} -gt 0 || ${#SOURCE_FILES[@]} -gt 0 ]]; then
+      collect_images
+      apply_filters
+    fi
+    # WORK_DIR 与 trap 照建照挂：doctor 不写任何用户文件，但 SYNC_SRC_CREDENTIALS
+    # 落盘的临时凭证文件依赖 cleanup 清理（main 前段对所有模式一视同仁地落了盘）
+    WORK_DIR="$(mktemp -d)"
+    trap cleanup EXIT
+    set +e
+    doctor_all "$regctl_path_active"
+    local doc_rc=$?
+    set -e
+    exit "$doc_rc"
   fi
 
   ensure_skopeo
