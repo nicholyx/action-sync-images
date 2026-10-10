@@ -2782,6 +2782,267 @@ jobs:
             || { cat "${work}/pending-empty2.txt"; fail "有无法判定时不能说「清单与目标仓库一致」"; }
           echo "✓ ⑨ 有「无法判定」而无待同步项时：仍写出文件、不说「一致」、头部报出个数"
 
+      - name: 验证 --doctor 环境自检（stub skopeo）
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # --doctor 的核心语义（PRD 验收标准逐条对应）：
+          #   ① 三分类探测（应答正常 / 匿名被拒=警告 / 连不上=失败），匿名被拒
+          #      不冒充正常也不算失败；② 每项探测独立失败（查全貌，不是查到
+          #   第一个病就停诊），退出码由汇总决定；③ 互斥 die；④ 不落盘、不通知、
+          #   不自动下载 regctl 的零副作用；⑤ 锚点必须指向真实存在的标题。
+          #
+          # 断言写法约束（.trellis/spec/engine/bash-rules.md）：一律 `|| fail "..."`，
+          # 不用 `|| { 诊断; fail; }`（块内第一条失败命令会终止 shell，fail 轮不到
+          # 执行——哑弹）；反断言（if grep … fail）与正断言成对出现。
+          fail() { echo "::error::$1"; exit 1; }
+
+          # doctor 专用 stub：按 **host** 分三类应答。与「准备 stub skopeo 夹具」
+          # 那个分开——它按仓库名答题（curN/staleN），服务的断言不同，混在一起
+          # 两边都要迁就。探测引用是「不存在的镜像」，对它的 manifest-unknown
+          # 应答恰好证明 registry 活着且应答规范
+          mkdir -p /tmp/doctor-stub
+          cat > /tmp/doctor-stub/skopeo <<'STUB'
+          #!/usr/bin/env bash
+          sub="${1:-}"
+          ref=""
+          for a in "$@"; do
+            case "$a" in
+              docker://*) ref="$a" ;;
+            esac
+          done
+          ref="${ref#docker://}"
+          case "$sub" in
+            --version)
+              echo "skopeo version 1.14.3-stub"
+              exit 0
+              ;;
+          esac
+          case "$ref" in
+            ok-reg.test/*)
+              echo "manifest unknown" >&2
+              exit 1
+              ;;
+            auth-reg.test/*)
+              echo "unauthorized: authentication required" >&2
+              exit 1
+              ;;
+            down-reg.test/*)
+              echo "dial tcp: connect: connection refused" >&2
+              exit 1
+              ;;
+            *)
+              printf '%s\n' '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}'
+              exit 0
+              ;;
+          esac
+          STUB
+          chmod +x /tmp/doctor-stub/skopeo
+
+          # ---- ⑤ 锚点有效性：doctor 输出里的每个锚点都在同一行给出标题原文，
+          # 标题原文必须能在 TROUBLESHOOTING.md 里 grep 到标题行。不在 bash 里
+          # 复刻 GitHub 的中文 slug 规则——那套规则（标点删、空格转连字符、
+          # 连续标点留连续空段）靠肉眼或脚本推演几乎必错，用标题原文做等价断言
+          # 标题原文含反引号，写在双引号里转义（单引号会触发 shellcheck SC2016）
+          anchors=(
+            "错误skopeo-command-not-found|错误：\`skopeo: command not found\`"
+            "错误unauthorized-authentication-required|错误：\`unauthorized: authentication required\`"
+            "错误context-deadline-exceeded--timeout|错误：\`context deadline exceeded\` / \`timeout\`"
+            "错误regctl-下载失败已重试一次|错误：\`regctl 下载失败（已重试一次）\`"
+            "自建-registry密码填对了却始终-unauthorized|自建 registry：密码填对了却始终 \`unauthorized\`"
+            "通用调试手段|通用调试手段"
+          )
+          for pair in "${anchors[@]}"; do
+            title="${pair#*|}"
+            grep -qF "## ${title}" docs/TROUBLESHOOTING.md \
+              || fail "锚点标题不存在于 docs/TROUBLESHOOTING.md：${title}"
+          done
+          echo "✓ 全部 6 个 TROUBLESHOOTING 锚点的标题真实存在"
+
+          # ---- ① 全过场景：三分类全正常 → 退出码 0、汇总「0 项失败」
+          PATH="/tmp/doctor-stub:$PATH"
+          export PATH
+          set +e
+          out="$(./scripts/sync.sh --doctor --src ok-reg.test/app:v1 --dest ok-reg.test/mirror 2>&1)"
+          code=$?
+          set -e
+          printf '%s\n' "$out"
+          [[ "$code" -eq 0 ]] || fail "全过场景期望退出码 0，实际 ${code}"
+          grep -qF '[OK] 源 ok-reg.test 应答正常' <<<"$out" \
+            || fail "全过场景应报「源 ok-reg.test 应答正常」"
+          grep -qF '[OK] 目标 ok-reg.test 应答正常' <<<"$out" \
+            || fail "全过场景应报「目标 ok-reg.test 应答正常」"
+          grep -qF '0 项失败' <<<"$out" \
+            || fail "全过场景汇总应为「0 项失败」"
+          echo "✓ 全过场景：退出码 0，汇总 0 项失败"
+
+          # ---- ①b 匿名被拒 = 警告档（不冒充正常、不算失败）；未传 --dest 时
+          #      目标侧跳过且明说，退出码不受影响
+          set +e
+          out="$(./scripts/sync.sh --doctor --src auth-reg.test/app:v1 2>&1)"
+          code=$?
+          set -e
+          printf '%s\n' "$out"
+          [[ "$code" -eq 0 ]] || fail "匿名被拒是警告档，期望退出码 0，实际 ${code}"
+          grep -qF '[警告] 源 auth-reg.test 应答但匿名探测被拒' <<<"$out" \
+            || fail "匿名被拒应报「应答但匿名探测被拒」的警告档"
+          if grep -qF '[失败]' <<<"$out"; then
+            fail "匿名被拒不该出现任何失败项（警���档，与连不上不同）"
+          fi
+          grep -qF '跳过目标侧探测' <<<"$out" \
+            || fail "未传 --dest 应说明跳过目标侧探测"
+          grep -qF '0 项失败' <<<"$out" \
+            || fail "跳过目标侧不算失败，汇总应仍为 0 项失败"
+          echo "✓ 匿名被拒：警告档；未传 --dest：跳过且不算失败"
+
+          # ---- regctl 的条件性：未传 --strip-attestation 时不进检查项（不检查
+          #      也不告警）；传了才探，缺失是警告（会自动下载，不构成失败）���
+          #      且 doctor 绝不自己动手下载
+          set +e
+          out="$(./scripts/sync.sh --doctor --src ok-reg.test/app:v1 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 0 ]] || fail "常规 doctor 期望退出码 0，实际 ${code}"
+          if grep -qE '^\[(OK|警告|失败)\] regctl' <<<"$out"; then
+            fail "未传 --strip-attestation 时 regctl 不应成为检查项"
+          fi
+          set +e
+          out="$(./scripts/sync.sh --doctor --src ok-reg.test/app:v1 --strip-attestation 2>&1)"
+          code=$?
+          set -e
+          printf '%s\n' "$out"
+          [[ "$code" -eq 0 ]] || fail "regctl 缺失是警告档（会自动下载），期望退出码 0，实际 ${code}"
+          grep -qF '[警告] regctl 未安装' <<<"$out" \
+            || fail "传了 --strip-attestation 时应报出 regctl 警告"
+          if grep -qF '下载 regctl' <<<"$out"; then
+            fail "doctor 是「报告」语义，不应触发 regctl 自动下载"
+          fi
+          echo "✓ regctl 条件性：未激活不检查；激活时警告档；不自动下载"
+
+          # ---- ③ 互斥：与三种检查模式 die，措辞含「分两次运行」
+          set +e
+          out="$(./scripts/sync.sh --doctor --src ok-reg.test/app:v1 --audit 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 1 ]] || fail "--doctor × --audit 应 die（退出码 1），实际 ${code}"
+          grep -qF '请分两次运行' <<<"$out" \
+            || fail "--doctor × --audit 的互斥措辞应含「分两次运行」"
+          set +e
+          out="$(./scripts/sync.sh --doctor --src ok-reg.test/app:v1 --check-updates 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 1 ]] || fail "--doctor × --check-updates 应 die（退出码 1），实际 ${code}"
+          grep -qF '请分两次运行' <<<"$out" \
+            || fail "--doctor × --check-updates 的互斥措辞应含「分两次运行」"
+          set +e
+          out="$(./scripts/sync.sh --doctor --src ok-reg.test/app:v1 --audit-lock /tmp/doctor-nonexist.lock 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 1 ]] || fail "--doctor × --audit-lock 应 die（退出码 1），实际 ${code}"
+          grep -qF '请分两次运行' <<<"$out" \
+            || fail "--doctor × --audit-lock 的互斥措辞应含「分两次运行」"
+          echo "✓ 互斥：--doctor × 三种检查全部 die 且措辞一致"
+
+          # ---- ④ 不生效告警 + 零副作用：--report-dir / 通知参数进「本次不生效」，
+          #      且目录保持为空（不落盘）
+          rep="$(mktemp -d)"
+          set +e
+          out="$(./scripts/sync.sh --doctor --src ok-reg.test/app:v1 \
+            --report-dir "$rep" --notify-webhook https://example.com/hook 2>&1)"
+          code=$?
+          set -e
+          [[ "$code" -eq 0 ]] || fail "不生效参数只是告警，期望退出码 0，实际 ${code}"
+          grep -qF -- '--doctor 是只读诊断，以下参数本次不生效：--report-dir --notify-webhook' <<<"$out" \
+            || fail "--report-dir / --notify-webhook 应进「本次不生效」告警"
+          rep_count="$(find "$rep" -mindepth 1 | wc -l | tr -d ' ')"
+          [[ "$rep_count" -eq 0 ]] \
+            || fail "doctor 不落盘，报告目录应为空，实际 ${rep_count} 个条目"
+          echo "✓ 不生效告警与零副作用：不落盘"
+
+          # ---- ② 混合失败：jq 缺失 + 源连不上 + 目标未授权 + 凭证文件不存在
+          #      同时存在——四类问题各自报出、互不中断（独立失败语义），退出码 1。
+          #      「工具缺失」用 jq 模拟：把系统工具软链进一个独立目录后摘掉 jq，
+          #      skopeo 仍可用（stub），这样源/目标探测才有机会各自给出判定
+          mix="$(mktemp -d)"
+          for d in /usr/bin /bin /usr/local/bin; do
+            for f in "$d"/*; do
+              ln -sf "$f" "${mix}/$(basename "$f")" 2>/dev/null || true
+            done
+          done
+          rm -f "${mix}/jq"
+          cp /tmp/doctor-stub/skopeo "${mix}/skopeo"
+          set +e
+          out="$(PATH="${mix}" ./scripts/sync.sh --doctor \
+            --src down-reg.test/app:v1 --dest auth-reg.test/mirror \
+            --src-credentials /tmp/doctor-nonexist-creds 2>&1)"
+          code=$?
+          set -e
+          printf '%s\n' "$out"
+          [[ "$code" -eq 1 ]] || fail "混合失败场景期望退出码 1，实际 ${code}"
+          grep -qF '[失败] jq 未安装且未显式指定 --platforms' <<<"$out" \
+            || fail "工具缺失（jq 且未显式指定平台）应作为独立失败项报出"
+          grep -qF '[失败] 源 down-reg.test 连不上：dial tcp: connect: connection refused' <<<"$out" \
+            || fail "源连不上应作为独立失败项报出（含首行错误）"
+          grep -qF '[警告] 目标 auth-reg.test 应答但匿名探测被拒' <<<"$out" \
+            || fail "目标未授权应作为独立项报出（警告档）"
+          grep -qF '[失败] --src-credentials 文件不存在：/tmp/doctor-nonexist-creds' <<<"$out" \
+            || fail "凭证文件缺失应作为独立失败项报出"
+          grep -qF '3 项失败' <<<"$out" \
+            || fail "混合失败场景汇总应为 3 项失败（jq / 源连不上 / 凭证缺失）"
+          grep -qF 'docs/TROUBLESHOOTING.md#错误context-deadline-exceeded--timeout' <<<"$out" \
+            || fail "连不上失败项的指引应带网络类锚点"
+          grep -qF 'docs/TROUBLESHOOTING.md#错误unauthorized-authentication-required' <<<"$out" \
+            || fail "匿名被拒与凭证缺失的指引应带认证类锚点"
+          echo "✓ 混合失败：四类问题各自报出，退出码 1，失败项带锚点指引"
+
+          # ---- ②a jq 缺失的定档看 --platforms：显式指定平台时 jq 对平台探测
+          #      无碍（ensure_jq 同一态度），报警告而非失败——对环境明明能跑的
+          #      配置报失败 + 退出码 1 是误伤；但 --src-credentials 装载与报告
+          #      生成仍依赖 jq，警告文案要如实点名这些场景
+          set +e
+          out="$(PATH="${mix}" ./scripts/sync.sh --doctor \
+            --src ok-reg.test/app:v1 --platforms linux/amd64 2>&1)"
+          code=$?
+          set -e
+          printf '%s\n' "$out"
+          [[ "$code" -eq 0 ]] || fail "jq 缺失但已显式传 --platforms，期望退出码 0，实际 ${code}"
+          grep -qF '[警告] jq 未安装——平台已由 --platforms 显式指定' <<<"$out" \
+            || fail "jq 缺失且显式传 --platforms 应报警告档（非失败）"
+          grep -qF '报告生成仍依赖 jq' <<<"$out" \
+            || fail "警告文案应如实说明仍依赖 jq 的场景"
+          if grep -qF '[失败] jq' <<<"$out"; then
+            fail "显式传 --platforms 时 jq 缺失不该报失败"
+          fi
+          echo "✓ jq 条件定档：未传 --platforms 失败档；显式传了警告档"
+
+          # ---- ②b skopeo 本身缺失：源/目标探测**说明跳过**而不是把
+          #      「command not found」误报成「连不上」——查全貌不等于拿不到
+          #      的数据也硬给结论
+          farm2="$(mktemp -d)"
+          for d in /usr/bin /bin /usr/local/bin; do
+            for f in "$d"/*; do
+              ln -sf "$f" "${farm2}/$(basename "$f")" 2>/dev/null || true
+            done
+          done
+          rm -f "${farm2}/skopeo"
+          set +e
+          out="$(PATH="${farm2}" ./scripts/sync.sh --doctor --src down-reg.test/app:v1 2>&1)"
+          code=$?
+          set -e
+          printf '%s\n' "$out"
+          [[ "$code" -eq 1 ]] || fail "skopeo 缺失期望退出码 1，实际 ${code}"
+          grep -qF '[失败] skopeo 未安装' <<<"$out" \
+            || fail "skopeo 缺失应报失败"
+          grep -qF 'docs/TROUBLESHOOTING.md#错误skopeo-command-not-found' <<<"$out" \
+            || fail "skopeo 缺失的指引应带对应锚点"
+          grep -qF '源侧可达性无法探测' <<<"$out" \
+            || fail "skopeo 缺失时源侧应说明无法探测（而不是误报连不上）"
+          if grep -qF '源 down-reg.test 连不上' <<<"$out"; then
+            fail "skopeo 都没了，不该把「command not found」报成「源连不上」"
+          fi
+          echo "✓ skopeo 缺失：报失败 + 锚点；探测侧如实说明无法探测"
+
       - name: 验证 -h / --help 的退出码
         run: |
           #!/usr/bin/env bash
