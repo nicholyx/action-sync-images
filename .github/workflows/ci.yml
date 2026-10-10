@@ -2970,7 +2970,11 @@ jobs:
               ln -sf "$f" "${mix}/$(basename "$f")" 2>/dev/null || true
             done
           done
-          rm -f "${mix}/jq"
+          # 先 rm 再 cp：farm 目录里已有指向 /usr/bin/skopeo 的软链（CI runner 装了
+          # 真 skopeo），cp 会**跟随软链**写穿到 /usr/bin/skopeo（root 所有）→
+          # Permission denied。rm 只删软链本身。本机 skopeo 在 /opt/homebrew/bin、
+          # 不在 farm 的三个目录里，所以这个雷只在 CI 上炸——本地绿不代表没问题
+          rm -f "${mix}/jq" "${mix}/skopeo"
           cp /tmp/doctor-stub/skopeo "${mix}/skopeo"
           set +e
           out="$(PATH="${mix}" ./scripts/sync.sh --doctor \
